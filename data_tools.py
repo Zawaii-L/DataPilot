@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 def set_chinese_font():
     """
-    设置 Matplotlib 中文字体，避免中文图表出现乱码。
+    设置 Matplotlib 中文字体，避免中文图表乱码。
     Windows 优先使用微软雅黑。
     """
     plt.rcParams["font.sans-serif"] = [
@@ -99,7 +99,6 @@ def check_data_quality(df):
         numeric_columns
         abnormal_values
     """
-
     if not isinstance(df, pd.DataFrame):
         raise TypeError(
             "check_data_quality() 要求传入 pandas.DataFrame"
@@ -133,14 +132,14 @@ def check_data_quality(df):
         series = df[column]
 
         abnormal_count = int(
-            ((series == float("inf")) |
-             (series == float("-inf"))).sum()
+            (
+                (series == float("inf"))
+                | (series == float("-inf"))
+            ).sum()
         )
 
         if abnormal_count > 0:
-            abnormal_values[column] = (
-                abnormal_count
-            )
+            abnormal_values[column] = abnormal_count
 
     result = {
         "rows": int(df.shape[0]),
@@ -168,15 +167,14 @@ def clean_data(df):
     """
     自动清洗数据：
 
-    1. 删除完全重复行
-    2. 数值列使用中位数填充缺失值
-    3. 非数值列使用众数填充缺失值
-    4. 删除无效的正负无穷值
+    1. 将正负无穷值替换为缺失值
+    2. 删除完全重复行
+    3. 数值列使用中位数填充缺失值
+    4. 非数值列使用众数填充缺失值
 
     返回：
         cleaned_df, cleaning_result
     """
-
     if not isinstance(df, pd.DataFrame):
         raise TypeError(
             "clean_data() 要求传入 pandas.DataFrame"
@@ -188,7 +186,7 @@ def clean_data(df):
         cleaned_df.shape[0]
     )
 
-    # 将正负无穷替换成缺失值
+    # 将正负无穷值替换成缺失值
     cleaned_df = cleaned_df.replace(
         [float("inf"), float("-inf")],
         pd.NA,
@@ -203,7 +201,6 @@ def clean_data(df):
         before_duplicate - len(cleaned_df)
     )
 
-    # 统计填充数量
     numeric_filled = 0
     non_numeric_filled = 0
 
@@ -221,7 +218,7 @@ def clean_data(df):
         if column not in numeric_columns
     ]
 
-    # 数值列：中位数填充
+    # 数值列：使用中位数填充
     for column in numeric_columns:
         missing_count = int(
             cleaned_df[column].isnull().sum()
@@ -242,7 +239,7 @@ def clean_data(df):
 
             numeric_filled += missing_count
 
-    # 非数值列：众数填充
+    # 非数值列：使用众数填充
     for column in non_numeric_columns:
         missing_count = int(
             cleaned_df[column].isnull().sum()
@@ -301,12 +298,11 @@ def clean_dataset(df):
 
 def calculate_statistics(df):
     """
-    计算数值列的描述性统计。
+    计算所有数值列的描述性统计。
 
     返回：
         pandas.DataFrame
     """
-
     if not isinstance(df, pd.DataFrame):
         raise TypeError(
             "calculate_statistics() 要求传入 pandas.DataFrame"
@@ -343,36 +339,18 @@ def calculate_stats(df):
 
 
 # ============================================================
-# 5. 生成趋势图
+# 5. 数据字段识别
 # ============================================================
 
-def plot_trend(
-    df,
-    output_dir="outputs",
-):
+def detect_column_types(df):
     """
-    为数值列生成趋势图。
-
-    优先使用第一列作为横坐标；
-    如果第一列不是数值列，则使用行号作为横坐标。
+    自动识别数据中的字段类型。
 
     返回：
-        生成的 PNG 文件路径
+        numeric_columns
+        categorical_columns
+        datetime_columns
     """
-
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError(
-            "plot_trend() 要求传入 pandas.DataFrame"
-        )
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    set_chinese_font()
-
     numeric_columns = (
         df.select_dtypes(
             include="number"
@@ -381,43 +359,300 @@ def plot_trend(
         .tolist()
     )
 
+    datetime_columns = []
+
+    categorical_columns = []
+
+    for column in df.columns:
+        if column in numeric_columns:
+            continue
+
+        series = df[column]
+
+        # 已经是 datetime 类型
+        if pd.api.types.is_datetime64_any_dtype(series):
+            datetime_columns.append(column)
+            continue
+
+        # 尝试识别日期时间字符串
+        if series.dtype == "object":
+            non_null_series = series.dropna()
+
+            if len(non_null_series) > 0:
+                sample = non_null_series.head(50)
+
+                try:
+                    converted = pd.to_datetime(
+                        sample,
+                        errors="coerce",
+                    )
+
+                    success_ratio = (
+                        converted.notna().sum()
+                        / len(sample)
+                    )
+
+                    if success_ratio >= 0.8:
+                        datetime_columns.append(column)
+                        continue
+
+                except Exception:
+                    pass
+
+        categorical_columns.append(column)
+
+    return {
+        "numeric_columns": numeric_columns,
+        "categorical_columns": categorical_columns,
+        "datetime_columns": datetime_columns,
+    }
+
+
+# ============================================================
+# 6. 通用数据自动可视化
+# ============================================================
+
+def plot_trend(
+    df,
+    output_dir="outputs",
+):
+    """
+    根据数据结构自动选择合理的可视化方式。
+
+    规则：
+
+    1. 有日期列 + 数值列：
+       生成时间趋势图
+
+    2. 有低基数分类列 + 数值列：
+       按分类计算数值平均值，生成柱状图
+
+    3. 有多个数值列：
+       生成数值特征均值柱状图
+
+    4. 只有一个数值列：
+       生成该列的数据趋势图
+
+    为兼容现有 Agent，函数名继续保留为 plot_trend()。
+
+    返回：
+        PNG 文件路径
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(
+            "plot_trend() 要求传入 pandas.DataFrame"
+        )
+
+    output_dir = Path(output_dir)
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    set_chinese_font()
+
+    column_types = detect_column_types(df)
+
+    numeric_columns = column_types[
+        "numeric_columns"
+    ]
+
+    categorical_columns = column_types[
+        "categorical_columns"
+    ]
+
+    datetime_columns = column_types[
+        "datetime_columns"
+    ]
+
     if len(numeric_columns) == 0:
         raise ValueError(
             "数据中没有可用于绘图的数值列。"
         )
 
-    # 第一列作为横坐标
-    first_column = df.columns[0]
-
-    if pd.api.types.is_numeric_dtype(
-        df[first_column]
-    ):
-        x_values = df[first_column]
-        x_label = str(first_column)
-    else:
-        x_values = range(len(df))
-        x_label = "数据行号"
+    # 最多绘制前 6 个数值字段，避免图表过于拥挤
+    selected_numeric_columns = (
+        numeric_columns[:6]
+    )
 
     plt.figure(
         figsize=(10, 6)
     )
 
-    for column in numeric_columns:
-        plt.plot(
-            x_values,
-            df[column],
-            marker="o",
-            label=str(column),
+    chart_title = "DataPilot 数据分析图"
+
+    # ========================================================
+    # 情况 1：日期时间 + 数值字段
+    # ========================================================
+
+    if datetime_columns:
+        datetime_column = datetime_columns[0]
+
+        temp_df = df.copy()
+
+        temp_df[datetime_column] = pd.to_datetime(
+            temp_df[datetime_column],
+            errors="coerce",
         )
 
-    plt.title("数据趋势图")
-    plt.xlabel(x_label)
-    plt.ylabel("数值")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+        temp_df = (
+            temp_df
+            .dropna(
+                subset=[datetime_column]
+            )
+            .sort_values(
+                datetime_column
+            )
+        )
+
+        if not temp_df.empty:
+            for column in selected_numeric_columns:
+                plt.plot(
+                    temp_df[datetime_column],
+                    temp_df[column],
+                    label=str(column),
+                )
+
+            chart_title = "时间序列趋势图"
+
+            plt.xlabel(
+                str(datetime_column)
+            )
+
+            plt.ylabel("数值")
+
+            plt.legend()
+
+        else:
+            # 日期解析后为空时，退回通用图
+            means = (
+                df[selected_numeric_columns]
+                .mean()
+            )
+
+            means.plot(
+                kind="bar"
+            )
+
+            chart_title = "数值特征平均值"
+
+            plt.xlabel("数值字段")
+            plt.ylabel("平均值")
+
+    # ========================================================
+    # 情况 2：分类字段 + 数值字段
+    # ========================================================
+
+    else:
+        suitable_category = None
+
+        for column in categorical_columns:
+            unique_count = (
+                df[column]
+                .nunique(
+                    dropna=True
+                )
+            )
+
+            if (
+                unique_count >= 2
+                and unique_count <= 20
+            ):
+                suitable_category = column
+                break
+
+        if suitable_category is not None:
+            selected_column = (
+                selected_numeric_columns[0]
+            )
+
+            grouped = (
+                df.groupby(
+                    suitable_category,
+                    dropna=False,
+                )[selected_column]
+                .mean()
+                .sort_values(
+                    ascending=False
+                )
+            )
+
+            grouped.plot(
+                kind="bar"
+            )
+
+            chart_title = (
+                f"{selected_column} "
+                f"按 {suitable_category} 分类平均值"
+            )
+
+            plt.xlabel(
+                str(suitable_category)
+            )
+
+            plt.ylabel(
+                f"{selected_column} 平均值"
+            )
+
+        # ====================================================
+        # 情况 3：多个数值字段
+        # ====================================================
+
+        elif len(selected_numeric_columns) >= 2:
+            means = (
+                df[selected_numeric_columns]
+                .mean()
+            )
+
+            means.plot(
+                kind="bar"
+            )
+
+            chart_title = (
+                "数值特征平均值对比"
+            )
+
+            plt.xlabel("数值字段")
+            plt.ylabel("平均值")
+
+        # ====================================================
+        # 情况 4：只有一个数值字段
+        # ====================================================
+
+        else:
+            column = selected_numeric_columns[0]
+
+            plt.plot(
+                range(len(df)),
+                df[column],
+            )
+
+            chart_title = (
+                f"{column} 数据趋势图"
+            )
+
+            plt.xlabel("数据行号")
+            plt.ylabel(str(column))
+
+    plt.title(chart_title)
+
+    plt.grid(
+        True,
+        alpha=0.3,
+    )
+
+    plt.xticks(
+        rotation=30,
+        ha="right",
+    )
+
     plt.tight_layout()
 
-    plot_path = output_dir / "平均温度_变化图.png"
+    plot_path = (
+        output_dir
+        / "DataPilot_数据分析图.png"
+    )
 
     plt.savefig(
         plot_path,
@@ -442,7 +677,7 @@ def generate_trend_plot(
 
 
 # ============================================================
-# 6. 导出 Excel
+# 7. 导出 Excel
 # ============================================================
 
 def export_to_excel(
@@ -453,21 +688,22 @@ def export_to_excel(
     output_dir="outputs",
 ):
     """
-    将清洗数据、质量检查、清洗记录和统计结果导出到 Excel。
+    将清洗数据、质量检查、清洗记录和统计结果
+    导出到 Excel。
 
     返回：
         Excel 文件路径
     """
-
     output_dir = Path(output_dir)
+
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     excel_path = (
-        output_dir /
-        "DataPilot_数据分析结果.xlsx"
+        output_dir
+        / "DataPilot_数据分析结果.xlsx"
     )
 
     quality_rows = []
@@ -538,6 +774,7 @@ def export_to_excel(
                 writer,
                 sheet_name="统计分析",
             )
+
         else:
             statistics_df = pd.DataFrame(
                 statistics_result
@@ -570,7 +807,7 @@ def save_excel(
 
 
 # ============================================================
-# 7. 统一数据处理流程
+# 8. 统一数据处理流程
 # ============================================================
 
 def run_data_pipeline(
@@ -581,21 +818,21 @@ def run_data_pipeline(
     """
     执行完整的数据处理流程。
 
-    兼容以下调用方式：
+    同时兼容：
 
         run_data_pipeline(
             file_path="test_weather.csv",
             output_dir="outputs"
         )
 
-    或：
+    和：
 
         run_data_pipeline(
             file_path="test_weather.csv",
             output_directory="outputs"
         )
 
-    返回结果同时兼容测试文件和 Agent：
+    返回字段继续兼容现有 Agent：
 
         before_quality
         after_quality
@@ -604,7 +841,6 @@ def run_data_pipeline(
         chart_path
         plot_path
         excel_path
-
         original_df
         cleaned_df
         quality_result
@@ -643,7 +879,7 @@ def run_data_pipeline(
     )
 
     # ========================================================
-    # 3. 自动清洗数据
+    # 3. 自动清洗
     # ========================================================
 
     cleaned_df, cleaning_log = clean_data(
@@ -667,7 +903,7 @@ def run_data_pipeline(
     )
 
     # ========================================================
-    # 6. 生成趋势图
+    # 6. 自动生成通用数据图表
     # ========================================================
 
     plot_path = plot_trend(
@@ -692,19 +928,17 @@ def run_data_pipeline(
     # ========================================================
 
     result = {
-        # 测试文件使用的字段
         "before_quality": before_quality,
         "after_quality": after_quality,
         "cleaning_log": cleaning_log,
         "statistics": statistics,
 
-        # 图表路径同时提供两个名字
+        # 保持两个键，避免破坏 agent.py
         "chart_path": plot_path,
         "plot_path": plot_path,
 
         "excel_path": excel_path,
 
-        # Agent 使用的字段
         "original_df": original_df,
         "cleaned_df": cleaned_df,
         "quality_result": before_quality,
@@ -716,7 +950,7 @@ def run_data_pipeline(
 
 
 # ============================================================
-# 8. 兼容性测试
+# 9. 兼容性测试
 # ============================================================
 
 if __name__ == "__main__":

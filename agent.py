@@ -12,6 +12,20 @@ from data_tools import run_data_pipeline
 from report_generator import generate_word_report
 from web_data_tools import download_data_file
 
+from office_data_tools import (
+    read_office_data,
+    merge_data_files,
+    apply_filters,
+    filter_data,
+    sort_data,
+    select_columns,
+    group_statistics,
+    drop_columns,
+    rename_columns,
+    export_office_result,
+    get_data_info,
+)
+
 
 load_dotenv()
 
@@ -32,22 +46,31 @@ class DataPilotAgent:
     9. Excel 导出
     10. Word 报告生成
     11. 执行进度回调
+    12. 自然语言办公数据处理
+    13. 多文件合并
+    14. 条件筛选
+    15. 排序
+    16. 字段选择
+    17. 字段删除
+    18. 字段重命名
+    19. 分组统计
+    20. 多步骤工具连续执行
     """
 
     def __init__(
         self,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
     ):
         self.api_key = os.getenv("OPENAI_API_KEY")
 
         self.base_url = os.getenv(
             "OPENAI_BASE_URL",
-            "https://api.deepseek.com"
+            "https://api.deepseek.com",
         )
 
         self.model = os.getenv(
             "OPENAI_MODEL",
-            "deepseek-chat"
+            "deepseek-chat",
         )
 
         self.progress_callback = progress_callback
@@ -59,7 +82,7 @@ class DataPilotAgent:
 
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
         )
 
     # ============================================================
@@ -69,32 +92,41 @@ class DataPilotAgent:
     def report_progress(self, message: str):
         """
         向命令行和 GUI 发送执行进度。
-
-        如果没有传入 progress_callback，
-        则只在命令行中打印。
         """
+
         print(message)
 
         if self.progress_callback:
             try:
-                self.progress_callback(str(message))
+                self.progress_callback(
+                    str(message)
+                )
             except Exception as error:
-                print(f"进度回调执行失败：{error}")
+                print(
+                    f"进度回调执行失败：{error}"
+                )
 
     # ============================================================
-    # 基础工具
+    # URL 提取
     # ============================================================
 
-    def extract_urls(self, text: str) -> List[str]:
+    def extract_urls(
+        self,
+        text: str,
+    ) -> List[str]:
         """
         从用户任务中提取 URL。
         """
+
         if not text:
             return []
 
         pattern = r"https?://[^\s，。；;、]+"
 
-        urls = re.findall(pattern, text)
+        urls = re.findall(
+            pattern,
+            text,
+        )
 
         cleaned_urls = []
 
@@ -104,14 +136,20 @@ class DataPilotAgent:
             )
 
             if url not in cleaned_urls:
-                cleaned_urls.append(url)
+                cleaned_urls.append(
+                    url
+                )
 
         return cleaned_urls
+
+    # ============================================================
+    # 输入路径整理
+    # ============================================================
 
     def normalize_input_paths(
         self,
         input_paths=None,
-        file_path=None
+        file_path=None,
     ) -> List[str]:
         """
         统一整理输入路径。
@@ -123,21 +161,34 @@ class DataPilotAgent:
         - Path 列表
         - file_path 旧参数
         """
+
         paths = []
 
         if input_paths:
-            if isinstance(input_paths, (str, Path)):
-                paths.append(str(input_paths))
+            if isinstance(
+                input_paths,
+                (str, Path),
+            ):
+                paths.append(
+                    str(input_paths)
+                )
             else:
                 paths.extend(
-                    [str(item) for item in input_paths]
+                    [
+                        str(item)
+                        for item in input_paths
+                    ]
                 )
 
         if file_path:
-            file_path = str(file_path)
+            file_path = str(
+                file_path
+            )
 
             if file_path not in paths:
-                paths.append(file_path)
+                paths.append(
+                    file_path
+                )
 
         normalized_paths = []
         seen = set()
@@ -146,26 +197,105 @@ class DataPilotAgent:
             if not item:
                 continue
 
-            path = Path(item)
+            path = Path(
+                item
+            )
 
             try:
-                resolved_path = str(path.resolve())
+                resolved_path = str(
+                    path.resolve()
+                )
             except Exception:
-                resolved_path = str(path)
+                resolved_path = str(
+                    path
+                )
 
             if resolved_path not in seen:
-                seen.add(resolved_path)
-                normalized_paths.append(resolved_path)
+                seen.add(
+                    resolved_path
+                )
+
+                normalized_paths.append(
+                    resolved_path
+                )
 
         return normalized_paths
 
+    # ============================================================
+    # 从自然语言提取本地文件
+    # ============================================================
+
+    def extract_local_files(
+        self,
+        user_task: str,
+    ) -> List[str]:
+        """
+        从自然语言中提取 CSV / Excel 文件名。
+
+        例如：
+        请合并 office_test_1.xlsx 和 office_test_2.xlsx
+        """
+
+        extracted_paths = []
+
+        file_patterns = re.findall(
+            r'(?<![\w./\\-])'
+            r'([^\s，。,；;、"“”\'‘’<>（）()\[\]{}]+'
+            r'\.(?:csv|xlsx|xls))'
+            r'(?![\w])',
+            user_task,
+            flags=re.IGNORECASE,
+        )
+
+        for item in file_patterns:
+            cleaned_item = (
+                item
+                .strip()
+                .strip(
+                    '，。,；;、"“”\'‘’<>（）()[]{}'
+                )
+            )
+
+            if not cleaned_item:
+                continue
+
+            candidate_path = Path(
+                cleaned_item
+            )
+
+            if not candidate_path.is_absolute():
+                candidate_path = (
+                    Path.cwd()
+                    / candidate_path
+                )
+
+            if (
+                candidate_path.exists()
+                and candidate_path.is_file()
+            ):
+                resolved_path = str(
+                    candidate_path.resolve()
+                )
+
+                if resolved_path not in extracted_paths:
+                    extracted_paths.append(
+                        resolved_path
+                    )
+
+        return extracted_paths
+
+    # ============================================================
+    # 文件夹判断
+    # ============================================================
+
     def contains_directory(
         self,
-        input_paths: List[str]
+        input_paths: List[str],
     ) -> bool:
         """
         判断输入路径中是否包含文件夹。
         """
+
         for item in input_paths:
             try:
                 if Path(item).is_dir():
@@ -175,20 +305,75 @@ class DataPilotAgent:
 
         return False
 
+    # ============================================================
+    # 是否批量输入
+    # ============================================================
+
     def is_batch_input(
         self,
-        input_paths: List[str]
+        input_paths: List[str],
     ) -> bool:
         """
         判断是否应该使用批量处理流程。
         """
+
         if len(input_paths) > 1:
             return True
 
-        if self.contains_directory(input_paths):
+        if self.contains_directory(
+            input_paths
+        ):
             return True
 
         return False
+
+    # ============================================================
+    # 是否可能为办公操作任务
+    # ============================================================
+
+    def looks_like_office_task(
+        self,
+        user_task: str,
+    ) -> bool:
+        """
+        使用本地关键词辅助判断是否属于办公数据操作任务。
+
+        注意：
+        最终仍以大模型生成的 task_type / operations 为主要依据。
+        """
+
+        text = user_task.lower()
+
+        keywords = [
+            "合并",
+            "筛选",
+            "过滤",
+            "只保留",
+            "删除列",
+            "删除字段",
+            "去掉列",
+            "去掉字段",
+            "重命名",
+            "改名",
+            "排序",
+            "升序",
+            "降序",
+            "按城市",
+            "按地区",
+            "按部门",
+            "分组",
+            "group",
+            "平均",
+            "均值",
+            "合计",
+            "求和",
+            "中位数",
+        ]
+
+        return any(
+            keyword in text
+            for keyword in keywords
+        )
 
     # ============================================================
     # 大模型任务规划
@@ -196,19 +381,39 @@ class DataPilotAgent:
 
     def ask_llm(
         self,
-        user_task: str
+        user_task: str,
     ) -> Dict[str, Any]:
         """
-        调用大模型，将自然语言任务转换为结构化任务计划。
+        调用大模型，将自然语言任务转换为结构化执行计划。
         """
+
         system_prompt = """
 你是 DataPilot 智能数据办公 Agent 的任务规划模块。
 
-你的职责是把用户的自然语言任务转换成 JSON 格式的执行计划。
+你的任务是把用户的自然语言要求转换成严格的 JSON 执行计划。
 
-只允许返回合法 JSON，不要返回 Markdown，不要添加解释。
+只允许返回合法 JSON。
+不要返回 Markdown。
+不要返回 ```json。
+不要添加任何解释。
 
-JSON 格式如下：
+DataPilot 当前支持两类任务：
+
+============================================================
+第一类：普通数据分析任务
+============================================================
+
+例如：
+
+- 检查数据质量
+- 清洗数据
+- 统计分析
+- 生成图表
+- 生成 Word 报告
+- 从 URL 下载 CSV / Excel
+- 批量分析多个文件
+
+普通分析任务 JSON：
 
 {
   "task_type": "data_analysis",
@@ -220,93 +425,330 @@ JSON 格式如下：
   "need_quality_check": true,
   "need_cleaning": true,
   "need_statistics": true,
-  "description": "任务执行说明"
+  "description": "任务执行说明",
+  "operations": []
 }
 
-字段说明：
+task_type 可使用：
 
-- task_type:
-  - data_analysis：数据分析任务
-  - data_cleaning：数据清洗任务
-  - data_quality：数据质量检查任务
-  - report_generation：报告生成任务
-  - general：其他任务
+- data_analysis
+- data_cleaning
+- data_quality
+- report_generation
+- general
 
-- need_download：
-  如果用户要求从 URL、网页或网络地址下载数据，则为 true。
+============================================================
+第二类：办公数据操作任务
+============================================================
 
-- need_batch_pipeline：
-  如果用户提到批量、多个文件、多份文件、文件夹、目录等，则为 true。
+当用户要求：
 
-- need_word_report：
-  如果用户要求 Word 报告、分析报告、正式报告，则为 true。
+- 合并多个 Excel / CSV
+- 根据条件筛选
+- 只保留满足条件的数据
+- 排序
+- 选择字段
+- 删除字段
+- 重命名字段
+- 按字段分组
+- 求平均值
+- 求和
+- 计数
+- 最大值
+- 最小值
+- 中位数
+- 最后导出 Excel
 
-- need_excel：
-  如果用户要求 Excel、表格或导出数据，则为 true。
+则：
 
-- need_chart：
-  如果用户要求统计图、趋势图、可视化或图表，则为 true。
+task_type 必须为：
 
-- need_quality_check：
-  如果用户要求检查缺失值、重复值、异常值或数据质量，则为 true。
+office_data_task
 
-- need_cleaning：
-  如果用户要求清洗、整理、修复数据，则为 true。
+并生成 operations 数组。
 
-- need_statistics：
-  如果用户要求统计、平均值、最大值、最小值或分析数据，则为 true。
+支持的 action：
 
-判断规则：
+1. merge
 
-1. 用户说“批量”“多个文件”“文件夹”“目录”时，
-   need_batch_pipeline 必须为 true。
-2. 用户要求生成 Word 分析报告时，
-   need_word_report 必须为 true。
-3. 用户要求检查缺失值和重复值时，
-   need_quality_check 必须为 true。
-4. 用户要求清洗数据时，
-   need_cleaning 必须为 true。
-5. 用户要求生成统计图时，
-   need_chart 必须为 true。
-6. 用户要求导出统计结果文件时，
-   need_statistics 和 need_excel 必须为 true。
-7. 只返回 JSON。
+{
+  "action": "merge"
+}
+
+2. filter
+
+{
+  "action": "filter",
+  "column": "城市",
+  "operator": "in",
+  "value": ["珠海", "澳门"]
+}
+
+operator 只允许：
+
+>
+>=
+<
+<=
+==
+!=
+contains
+in
+
+例如：
+
+温度大于30：
+
+{
+  "action": "filter",
+  "column": "温度",
+  "operator": ">",
+  "value": 30
+}
+
+只保留珠海和澳门：
+
+{
+  "action": "filter",
+  "column": "城市",
+  "operator": "in",
+  "value": ["珠海", "澳门"]
+}
+
+3. sort
+
+{
+  "action": "sort",
+  "column": "温度",
+  "ascending": false
+}
+
+升序：
+ascending = true
+
+降序：
+ascending = false
+
+4. select_columns
+
+{
+  "action": "select_columns",
+  "columns": ["城市", "温度"]
+}
+
+5. drop_columns
+
+{
+  "action": "drop_columns",
+  "columns": ["备注", "编号"]
+}
+
+6. rename_columns
+
+{
+  "action": "rename_columns",
+  "rename_map": {
+    "temp": "温度",
+    "city": "城市"
+  }
+}
+
+7. group_statistics
+
+{
+  "action": "group_statistics",
+  "group_by": "城市",
+  "target_column": "温度",
+  "operation": "mean"
+}
+
+operation 只允许：
+
+mean
+sum
+count
+max
+min
+median
+
+8. export_excel
+
+{
+  "action": "export_excel"
+}
+
+============================================================
+办公任务完整示例
+============================================================
+
+用户：
+
+把两个 Excel 合并，只保留珠海和澳门，
+筛选温度大于30的数据，
+按城市计算平均温度，
+最后导出 Excel。
+
+必须生成类似：
+
+{
+  "task_type": "office_data_task",
+  "need_download": false,
+  "need_batch_pipeline": false,
+  "need_word_report": false,
+  "need_excel": true,
+  "need_chart": false,
+  "need_quality_check": false,
+  "need_cleaning": false,
+  "need_statistics": true,
+  "description": "合并文件并执行筛选和分组统计",
+  "operations": [
+    {
+      "action": "merge"
+    },
+    {
+      "action": "filter",
+      "column": "城市",
+      "operator": "in",
+      "value": ["珠海", "澳门"]
+    },
+    {
+      "action": "filter",
+      "column": "温度",
+      "operator": ">",
+      "value": 30
+    },
+    {
+      "action": "group_statistics",
+      "group_by": "城市",
+      "target_column": "温度",
+      "operation": "mean"
+    },
+    {
+      "action": "export_excel"
+    }
+  ]
+}
+
+============================================================
+重要判断规则
+============================================================
+
+1. 用户只是说“分析数据”“检查质量”“清洗数据”
+   不属于 office_data_task。
+
+2. 用户明确要求合并、筛选、排序、字段操作、
+   分组统计等具体表格操作时，
+   优先使用 office_data_task。
+
+3. 用户要求多个文件进行普通质量检查和分析，
+   使用 need_batch_pipeline = true，
+   不一定属于 office_data_task。
+
+4. office_data_task 中如果有多个文件需要合并，
+   operations 第一项应该是 merge。
+
+5. 用户说“只保留某些值”，通常使用 filter + in。
+
+6. 用户说“大于、小于、至少、不超过”等，
+   转换成对应比较 operator。
+
+7. 用户说“平均值”使用 mean。
+
+8. 用户说“总和”“合计”使用 sum。
+
+9. 用户说“数量”“计数”使用 count。
+
+10. 用户说“最大值”使用 max。
+
+11. 用户说“最小值”使用 min。
+
+12. 用户说“中位数”使用 median。
+
+13. 用户要求最终生成 Excel，
+    operations 最后一项应包含 export_excel。
+
+14. 如果用户提供 URL，
+    need_download = true。
+
+15. 如果用户要求 Word 报告，
+    need_word_report = true。
+
+16. 如果用户要求图表，
+    need_chart = true。
+
+17. 所有任务必须返回 operations 字段。
+    普通分析任务没有办公操作时使用空数组 []。
+
+18. 不要猜测不存在的列名。
+    列名必须尽量严格按照用户描述填写。
+
+19. 只返回 JSON。
 """
 
         try:
-            self.report_progress("正在调用大模型分析任务……")
-
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": user_task
-                    }
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"}
+            self.report_progress(
+                "正在调用大模型分析任务……"
             )
 
-            content = response.choices[0].message.content
+            response = (
+                self.client
+                .chat
+                .completions
+                .create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_task,
+                        },
+                    ],
+                    temperature=0.1,
+                    response_format={
+                        "type": "json_object"
+                    },
+                )
+            )
+
+            content = (
+                response
+                .choices[0]
+                .message
+                .content
+            )
 
             if not content:
                 raise ValueError(
                     "大模型没有返回任务计划。"
                 )
 
-            plan = json.loads(content)
+            plan = json.loads(
+                content
+            )
 
-            if not isinstance(plan, dict):
+            if not isinstance(
+                plan,
+                dict,
+            ):
                 raise ValueError(
                     "大模型返回的任务计划不是 JSON 对象。"
                 )
 
-            self.report_progress("任务规划完成。")
+            if "operations" not in plan:
+                plan["operations"] = []
+
+            if not isinstance(
+                plan.get("operations"),
+                list,
+            ):
+                plan["operations"] = []
+
+            self.report_progress(
+                "任务规划完成。"
+            )
 
             return plan
 
@@ -315,15 +757,26 @@ JSON 格式如下：
                 f"任务规划失败，使用本地规则兜底：{error}"
             )
 
-            return self.fallback_plan(user_task)
+            return self.fallback_plan(
+                user_task
+            )
+
+    # ============================================================
+    # 本地规划兜底
+    # ============================================================
 
     def fallback_plan(
         self,
-        user_task: str
+        user_task: str,
     ) -> Dict[str, Any]:
         """
-        当大模型调用失败时，使用关键词进行本地任务规划。
+        当大模型调用失败时，使用关键词进行基础任务规划。
+
+        注意：
+        复杂办公任务依赖 LLM 正确理解，
+        本地规则主要用于普通分析任务兜底。
         """
+
         text = user_task.lower()
 
         need_batch_pipeline = any(
@@ -333,7 +786,7 @@ JSON 格式如下：
                 "多个文件",
                 "多文件",
                 "文件夹",
-                "目录"
+                "目录",
             ]
         )
 
@@ -343,7 +796,7 @@ JSON 格式如下：
                 "word",
                 "报告",
                 "分析报告",
-                "文档"
+                "文档",
             ]
         )
 
@@ -354,7 +807,7 @@ JSON 格式如下：
                 "统计图",
                 "趋势图",
                 "可视化",
-                "绘图"
+                "绘图",
             ]
         )
 
@@ -365,7 +818,7 @@ JSON 格式如下：
                 "缺失值",
                 "重复值",
                 "异常值",
-                "检查"
+                "检查",
             ]
         )
 
@@ -375,7 +828,7 @@ JSON 格式如下：
                 "清洗",
                 "整理",
                 "修复",
-                "处理"
+                "处理",
             ]
         )
 
@@ -387,7 +840,10 @@ JSON 格式如下：
                 "平均",
                 "最大值",
                 "最小值",
-                "分析"
+                "分析",
+                "合计",
+                "求和",
+                "中位数",
             ]
         )
 
@@ -397,23 +853,43 @@ JSON 格式如下：
                 "excel",
                 "表格",
                 "导出",
-                "文件"
+                "文件",
             ]
         )
 
+        task_type = "data_analysis"
+
+        if self.looks_like_office_task(
+            user_task
+        ):
+            task_type = "office_data_task"
+
         return {
-            "task_type": "data_analysis",
+            "task_type": task_type,
             "need_download": bool(
-                self.extract_urls(user_task)
+                self.extract_urls(
+                    user_task
+                )
             ),
-            "need_batch_pipeline": need_batch_pipeline,
-            "need_word_report": need_word_report,
+            "need_batch_pipeline": (
+                need_batch_pipeline
+            ),
+            "need_word_report": (
+                need_word_report
+            ),
             "need_excel": need_excel,
             "need_chart": need_chart,
-            "need_quality_check": need_quality_check,
+            "need_quality_check": (
+                need_quality_check
+            ),
             "need_cleaning": need_cleaning,
-            "need_statistics": need_statistics,
-            "description": "使用本地规则生成的任务计划"
+            "need_statistics": (
+                need_statistics
+            ),
+            "description": (
+                "使用本地规则生成的任务计划"
+            ),
+            "operations": [],
         }
 
     # ============================================================
@@ -423,18 +899,21 @@ JSON 格式如下：
     def download_input_file(
         self,
         url: str,
-        output_dir="outputs/downloads"
+        output_dir="outputs/downloads",
     ) -> str:
         """
         下载 URL 对应的数据文件。
         """
+
         self.report_progress(
             f"正在下载网络数据：{url}"
         )
 
-        downloaded_path = download_data_file(
-            url=url,
-            output_dir=output_dir
+        downloaded_path = (
+            download_data_file(
+                url=url,
+                output_dir=output_dir,
+            )
         )
 
         if not downloaded_path:
@@ -446,10 +925,12 @@ JSON 格式如下：
             f"网络数据下载完成：{downloaded_path}"
         )
 
-        return str(downloaded_path)
+        return str(
+            downloaded_path
+        )
 
     # ============================================================
-    # 单文件任务
+    # 单文件普通分析任务
     # ============================================================
 
     def execute_single_task(
@@ -457,15 +938,19 @@ JSON 格式如下：
         user_task: str,
         file_path: str,
         output_dir="outputs",
-        plan=None
+        plan=None,
     ) -> Dict[str, Any]:
         """
         执行单文件数据处理任务。
         """
-        output_dir = Path(output_dir)
+
+        output_dir = Path(
+            output_dir
+        )
+
         output_dir.mkdir(
             parents=True,
-            exist_ok=True
+            exist_ok=True,
         )
 
         self.report_progress(
@@ -478,10 +963,15 @@ JSON 格式如下：
 
         result = run_data_pipeline(
             file_path=file_path,
-            output_dir=str(output_dir)
+            output_dir=str(
+                output_dir
+            ),
         )
 
-        if not isinstance(result, dict):
+        if not isinstance(
+            result,
+            dict,
+        ):
             raise TypeError(
                 "run_data_pipeline() 返回结果不是字典。"
             )
@@ -497,7 +987,7 @@ JSON 格式如下：
 
         need_word_report = plan.get(
             "need_word_report",
-            True
+            True,
         )
 
         if need_word_report:
@@ -505,23 +995,36 @@ JSON 格式如下：
                 "正在生成 Word 分析报告……"
             )
 
-            word_path = output_dir / "data_analysis_report.docx"
+            word_path = (
+                output_dir
+                / "data_analysis_report.docx"
+            )
 
             try:
-                generated_word_path = generate_word_report(
-                    result=result,
-                    output_path=str(word_path)
+                generated_word_path = (
+                    generate_word_report(
+                        result=result,
+                        output_path=str(
+                            word_path
+                        ),
+                    )
                 )
 
-                word_path = generated_word_path
+                word_path = (
+                    generated_word_path
+                )
 
             except TypeError:
-                generated_word_path = generate_word_report(
-                    result,
-                    str(word_path)
+                generated_word_path = (
+                    generate_word_report(
+                        result,
+                        str(word_path),
+                    )
                 )
 
-                word_path = generated_word_path
+                word_path = (
+                    generated_word_path
+                )
 
             self.report_progress(
                 f"Word 分析报告生成完成：{word_path}"
@@ -532,54 +1035,81 @@ JSON 格式如下：
             "task": user_task,
             "plan": plan,
             "is_batch": False,
+            "is_office_task": False,
 
             "source_files": [
-                str(Path(file_path).resolve())
+                str(
+                    Path(file_path).resolve()
+                )
             ],
+
             "file_count": 1,
 
             "before_quality": result.get(
                 "before_quality",
-                result.get("quality_before", {})
+                result.get(
+                    "quality_before",
+                    {},
+                ),
             ),
+
             "after_quality": result.get(
                 "after_quality",
-                result.get("quality_after", {})
+                result.get(
+                    "quality_after",
+                    {},
+                ),
             ),
+
             "cleaning_log": result.get(
                 "cleaning_log",
-                result.get("cleaning_result", [])
+                result.get(
+                    "cleaning_result",
+                    [],
+                ),
             ),
+
             "statistics": result.get(
                 "statistics",
-                result.get("statistics_result", {})
+                result.get(
+                    "statistics_result",
+                    {},
+                ),
             ),
 
             "chart_path": result.get(
                 "chart_path",
-                result.get("plot_path")
+                result.get(
+                    "plot_path"
+                ),
             ),
+
             "plot_path": result.get(
                 "plot_path",
-                result.get("chart_path")
+                result.get(
+                    "chart_path"
+                ),
             ),
 
             "excel_path": result.get(
                 "excel_path"
             ),
+
             "statistics_path": result.get(
                 "statistics_path"
             ),
+
             "word_path": word_path,
 
             "output_dir": str(
                 output_dir.resolve()
             ),
-            "raw_result": result
+
+            "raw_result": result,
         }
 
     # ============================================================
-    # 批量任务
+    # 批量普通分析任务
     # ============================================================
 
     def execute_batch_task(
@@ -587,15 +1117,19 @@ JSON 格式如下：
         user_task: str,
         input_paths,
         output_dir="outputs",
-        plan=None
+        plan=None,
     ) -> Dict[str, Any]:
         """
         执行批量数据处理任务。
         """
-        output_dir = Path(output_dir)
+
+        output_dir = Path(
+            output_dir
+        )
+
         output_dir.mkdir(
             parents=True,
-            exist_ok=True
+            exist_ok=True,
         )
 
         self.report_progress(
@@ -616,11 +1150,16 @@ JSON 格式如下：
 
         result = run_batch_pipeline(
             input_paths=input_paths,
-            output_dir=str(output_dir),
-            task=user_task
+            output_dir=str(
+                output_dir
+            ),
+            task=user_task,
         )
 
-        if not isinstance(result, dict):
+        if not isinstance(
+            result,
+            dict,
+        ):
             raise TypeError(
                 "run_batch_pipeline() 返回结果不是字典。"
             )
@@ -631,7 +1170,7 @@ JSON 格式如下：
 
         source_files = result.get(
             "input_paths",
-            []
+            [],
         )
 
         if not source_files:
@@ -639,25 +1178,31 @@ JSON 格式如下：
 
             for item in result.get(
                 "file_info",
-                []
+                [],
             ):
-                if isinstance(item, dict):
-                    file_path = item.get(
+                if isinstance(
+                    item,
+                    dict,
+                ):
+                    source_file = item.get(
                         "file_path"
                     )
 
-                    if file_path:
+                    if source_file:
                         source_files.append(
-                            str(file_path)
+                            str(source_file)
                         )
 
         if not source_files:
             old_files = result.get(
                 "files",
-                []
+                [],
             )
 
-            if isinstance(old_files, list):
+            if isinstance(
+                old_files,
+                list,
+            ):
                 source_files = [
                     str(item)
                     for item in old_files
@@ -681,54 +1226,727 @@ JSON 格式如下：
             "task": user_task,
             "plan": plan or {},
             "is_batch": True,
+            "is_office_task": False,
 
-            "source_files": source_files,
+            "source_files": (
+                source_files
+            ),
+
             "file_info": result.get(
                 "file_info",
-                []
+                [],
             ),
+
             "file_count": result.get(
                 "file_count",
-                len(source_files)
+                len(source_files),
             ),
 
             "before_quality": result.get(
                 "before_quality",
-                {}
+                {},
             ),
+
             "after_quality": result.get(
                 "after_quality",
-                {}
+                {},
             ),
+
             "cleaning_log": result.get(
                 "cleaning_log",
-                []
+                [],
             ),
+
             "statistics": result.get(
                 "statistics",
-                {}
+                {},
             ),
 
             "chart_path": result.get(
                 "chart_path"
             ),
+
             "plot_path": result.get(
                 "plot_path",
-                result.get("chart_path")
+                result.get(
+                    "chart_path"
+                ),
             ),
 
             "excel_path": result.get(
                 "excel_path"
             ),
+
             "statistics_path": result.get(
                 "statistics_path"
             ),
+
             "word_path": word_path,
 
             "output_dir": str(
                 output_dir.resolve()
             ),
-            "raw_result": result
+
+            "raw_result": result,
+        }
+
+    # ============================================================
+    # Office 任务：读取初始数据
+    # ============================================================
+
+    def prepare_office_dataframe(
+        self,
+        input_paths: List[str],
+        operations: List[Dict[str, Any]],
+    ):
+        """
+        根据输入文件和操作计划准备初始 DataFrame。
+
+        多文件：
+        默认合并。
+
+        单文件：
+        直接读取。
+        """
+
+        valid_files = []
+
+        for item in input_paths:
+            path = Path(
+                item
+            )
+
+            if (
+                path.exists()
+                and path.is_file()
+                and path.suffix.lower()
+                in [".csv", ".xlsx", ".xls"]
+            ):
+                valid_files.append(
+                    str(path)
+                )
+
+        if not valid_files:
+            raise ValueError(
+                "办公任务没有找到可读取的 CSV / Excel 文件。"
+            )
+
+        merge_requested = any(
+            isinstance(operation, dict)
+            and operation.get("action") == "merge"
+            for operation in operations
+        )
+
+        if (
+            len(valid_files) > 1
+            or merge_requested
+        ):
+            self.report_progress(
+                f"正在合并 {len(valid_files)} 个数据文件……"
+            )
+
+            dataframe = merge_data_files(
+                valid_files
+            )
+
+            self.report_progress(
+                f"文件合并完成，共 {len(dataframe)} 行数据。"
+            )
+
+            return dataframe, valid_files
+
+        self.report_progress(
+            f"正在读取数据文件：{valid_files[0]}"
+        )
+
+        dataframe = read_office_data(
+            valid_files[0]
+        )
+
+        self.report_progress(
+            f"数据读取完成，共 {len(dataframe)} 行数据。"
+        )
+
+        return dataframe, valid_files
+
+    # ============================================================
+    # Office 任务：执行单个操作
+    # ============================================================
+
+    def execute_office_operation(
+        self,
+        dataframe,
+        operation: Dict[str, Any],
+        output_dir: Path,
+        operation_index: int,
+    ):
+        """
+        执行一个 Office 操作。
+
+        返回：
+        dataframe,
+        optional_output_path
+        """
+
+        if not isinstance(
+            operation,
+            dict,
+        ):
+            raise ValueError(
+                f"第 {operation_index} 个办公操作格式错误。"
+            )
+
+        action = operation.get(
+            "action"
+        )
+
+        if not action:
+            raise ValueError(
+                f"第 {operation_index} 个操作缺少 action。"
+            )
+
+        # --------------------------------------------------------
+        # merge
+        # --------------------------------------------------------
+
+        if action == "merge":
+            # 文件在 prepare_office_dataframe 中已经合并。
+            self.report_progress(
+                f"[{operation_index}] 合并文件：已完成"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # filter
+        # --------------------------------------------------------
+
+        if action == "filter":
+            column = operation.get(
+                "column"
+            )
+
+            operator = operation.get(
+                "operator"
+            )
+
+            value = operation.get(
+                "value"
+            )
+
+            if not column:
+                raise ValueError(
+                    "filter 操作缺少 column。"
+                )
+
+            if not operator:
+                raise ValueError(
+                    "filter 操作缺少 operator。"
+                )
+
+            before_rows = len(
+                dataframe
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在筛选："
+                f"{column} {operator} {value}"
+            )
+
+            dataframe = filter_data(
+                df=dataframe,
+                column=column,
+                operator=operator,
+                value=value,
+            )
+
+            after_rows = len(
+                dataframe
+            )
+
+            self.report_progress(
+                f"筛选完成：{before_rows} 行 → {after_rows} 行"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # apply_filters
+        # --------------------------------------------------------
+
+        if action == "apply_filters":
+            filters = operation.get(
+                "filters",
+                [],
+            )
+
+            before_rows = len(
+                dataframe
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在执行多条件筛选……"
+            )
+
+            dataframe = apply_filters(
+                dataframe,
+                filters,
+            )
+
+            after_rows = len(
+                dataframe
+            )
+
+            self.report_progress(
+                f"多条件筛选完成：{before_rows} 行 → {after_rows} 行"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # sort
+        # --------------------------------------------------------
+
+        if action == "sort":
+            column = operation.get(
+                "column"
+            )
+
+            ascending = operation.get(
+                "ascending",
+                True,
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在按 {column} 排序……"
+            )
+
+            dataframe = sort_data(
+                df=dataframe,
+                column=column,
+                ascending=bool(
+                    ascending
+                ),
+            )
+
+            self.report_progress(
+                "排序完成。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # select_columns
+        # --------------------------------------------------------
+
+        if action == "select_columns":
+            columns = operation.get(
+                "columns",
+                [],
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在选择字段：{columns}"
+            )
+
+            dataframe = select_columns(
+                df=dataframe,
+                columns=columns,
+            )
+
+            self.report_progress(
+                "字段选择完成。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # drop_columns
+        # --------------------------------------------------------
+
+        if action == "drop_columns":
+            columns = operation.get(
+                "columns",
+                [],
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在删除字段：{columns}"
+            )
+
+            dataframe = drop_columns(
+                df=dataframe,
+                columns=columns,
+            )
+
+            self.report_progress(
+                "字段删除完成。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # rename_columns
+        # --------------------------------------------------------
+
+        if action == "rename_columns":
+            rename_map = operation.get(
+                "rename_map",
+                {},
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在重命名字段：{rename_map}"
+            )
+
+            dataframe = rename_columns(
+                df=dataframe,
+                rename_map=rename_map,
+            )
+
+            self.report_progress(
+                "字段重命名完成。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # group_statistics
+        # --------------------------------------------------------
+
+        if action == "group_statistics":
+            group_by = operation.get(
+                "group_by"
+            )
+
+            target_column = operation.get(
+                "target_column"
+            )
+
+            statistic_operation = (
+                operation.get(
+                    "operation",
+                    "mean",
+                )
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在分组统计："
+                f"按 {group_by} 对 {target_column} "
+                f"执行 {statistic_operation}"
+            )
+
+            dataframe = group_statistics(
+                df=dataframe,
+                group_by=group_by,
+                target_column=target_column,
+                operation=statistic_operation,
+            )
+
+            self.report_progress(
+                f"分组统计完成，共 {len(dataframe)} 行结果。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # export_excel
+        # --------------------------------------------------------
+
+        if action == "export_excel":
+            output_path = (
+                output_dir
+                / "DataPilot_办公处理结果.xlsx"
+            )
+
+            sheet_name = operation.get(
+                "sheet_name",
+                "处理结果",
+            )
+
+            self.report_progress(
+                f"[{operation_index}] 正在导出 Excel……"
+            )
+
+            generated_path = (
+                export_office_result(
+                    dataframe,
+                    output_path=str(
+                        output_path
+                    ),
+                    sheet_name=sheet_name,
+                )
+            )
+
+            self.report_progress(
+                f"Excel 导出完成：{generated_path}"
+            )
+
+            return (
+                dataframe,
+                str(generated_path),
+            )
+
+        raise ValueError(
+            f"暂不支持的办公操作：{action}"
+        )
+
+    # ============================================================
+    # Office 多步骤任务执行
+    # ============================================================
+
+    def execute_office_task(
+        self,
+        user_task: str,
+        input_paths: List[str],
+        output_dir="outputs",
+        plan=None,
+    ) -> Dict[str, Any]:
+        """
+        根据 LLM 生成的 operations 顺序调用办公工具。
+        """
+
+        output_dir = Path(
+            output_dir
+        )
+
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        if plan is None:
+            plan = {}
+
+        operations = plan.get(
+            "operations",
+            [],
+        )
+
+        if not isinstance(
+            operations,
+            list,
+        ):
+            raise ValueError(
+                "办公任务 operations 必须是列表。"
+            )
+
+        if not operations:
+            raise ValueError(
+                "大模型识别为办公任务，但没有生成可执行的 operations。"
+                "请重新描述具体操作，例如：合并、筛选、分组统计、导出 Excel。"
+            )
+
+        self.report_progress(
+            "已识别为自然语言办公数据任务。"
+        )
+
+        self.report_progress(
+            f"办公操作步骤数量：{len(operations)}"
+        )
+
+        dataframe, source_files = (
+            self.prepare_office_dataframe(
+                input_paths=input_paths,
+                operations=operations,
+            )
+        )
+
+        initial_info = get_data_info(
+            dataframe
+        )
+
+        self.report_progress(
+            "初始数据："
+            f"{initial_info['rows']} 行，"
+            f"{initial_info['columns']} 列。"
+        )
+
+        self.report_progress(
+            f"字段：{initial_info['column_names']}"
+        )
+
+        excel_path = None
+
+        execution_log = []
+
+        for index, operation in enumerate(
+            operations,
+            start=1,
+        ):
+            action = operation.get(
+                "action",
+                "unknown",
+            )
+
+            dataframe, generated_path = (
+                self.execute_office_operation(
+                    dataframe=dataframe,
+                    operation=operation,
+                    output_dir=output_dir,
+                    operation_index=index,
+                )
+            )
+
+            execution_log.append(
+                {
+                    "step": index,
+                    "action": action,
+                    "operation": operation,
+                    "rows_after": int(
+                        len(dataframe)
+                    ),
+                    "columns_after": int(
+                        len(dataframe.columns)
+                    ),
+                }
+            )
+
+            if generated_path:
+                excel_path = (
+                    generated_path
+                )
+
+        # --------------------------------------------------------
+        # 如果用户要求 Excel，但 LLM 忘记生成 export_excel，
+        # 自动兜底导出。
+        # --------------------------------------------------------
+
+        need_excel = plan.get(
+            "need_excel",
+            False,
+        )
+
+        has_export_operation = any(
+            isinstance(operation, dict)
+            and operation.get("action")
+            == "export_excel"
+            for operation in operations
+        )
+
+        if (
+            need_excel
+            and not has_export_operation
+        ):
+            self.report_progress(
+                "任务要求 Excel，但计划中没有导出步骤，正在自动补充导出……"
+            )
+
+            excel_path = (
+                export_office_result(
+                    dataframe,
+                    output_path=str(
+                        output_dir
+                        / "DataPilot_办公处理结果.xlsx"
+                    ),
+                    sheet_name="处理结果",
+                )
+            )
+
+            self.report_progress(
+                f"Excel 导出完成：{excel_path}"
+            )
+
+        # --------------------------------------------------------
+        # 即使用户没有明确说“导出”，办公任务也生成一个结果文件，
+        # 方便 GUI 交付结果。
+        # --------------------------------------------------------
+
+        if not excel_path:
+            self.report_progress(
+                "正在保存办公任务最终结果……"
+            )
+
+            excel_path = (
+                export_office_result(
+                    dataframe,
+                    output_path=str(
+                        output_dir
+                        / "DataPilot_办公处理结果.xlsx"
+                    ),
+                    sheet_name="处理结果",
+                )
+            )
+
+            self.report_progress(
+                f"办公任务结果已保存：{excel_path}"
+            )
+
+        final_info = get_data_info(
+            dataframe
+        )
+
+        self.report_progress(
+            "办公任务执行完成。"
+        )
+
+        self.report_progress(
+            "最终结果："
+            f"{final_info['rows']} 行，"
+            f"{final_info['columns']} 列。"
+        )
+
+        return {
+            "success": True,
+            "task": user_task,
+            "plan": plan,
+
+            "is_batch": (
+                len(source_files) > 1
+            ),
+
+            "is_office_task": True,
+
+            "source_files": source_files,
+
+            "file_count": len(
+                source_files
+            ),
+
+            "excel_path": str(
+                excel_path
+            ),
+
+            "statistics_path": None,
+
+            "chart_path": None,
+
+            "plot_path": None,
+
+            "word_path": None,
+
+            "before_quality": {},
+
+            "after_quality": {},
+
+            "cleaning_log": (
+                execution_log
+            ),
+
+            "statistics": {},
+
+            "office_execution_log": (
+                execution_log
+            ),
+
+            "office_initial_info": (
+                initial_info
+            ),
+
+            "office_final_info": (
+                final_info
+            ),
+
+            "output_dir": str(
+                output_dir.resolve()
+            ),
+
+            "raw_result": {
+                "final_dataframe": dataframe,
+                "execution_log": (
+                    execution_log
+                ),
+            },
         }
 
     # ============================================================
@@ -740,40 +1958,40 @@ JSON 格式如下：
         user_task: str,
         file_path: Optional[str] = None,
         output_dir="outputs",
-        input_paths=None
+        input_paths=None,
     ) -> Dict[str, Any]:
         """
-        执行用户任务。
-
-        参数：
-            user_task：
-                用户自然语言任务。
-
-            file_path：
-                兼容旧版的单文件参数。
-
-            output_dir：
-                输出目录。
-
-            input_paths：
-                支持单个文件、多个文件或文件夹。
+        执行用户自然语言任务。
         """
-        if not user_task or not user_task.strip():
+
+        if (
+            not user_task
+            or not user_task.strip()
+        ):
             raise ValueError(
                 "任务内容不能为空。"
             )
 
-        output_dir = Path(output_dir)
+        output_dir = Path(
+            output_dir
+        )
+
         output_dir.mkdir(
             parents=True,
-            exist_ok=True
+            exist_ok=True,
         )
 
         self.report_progress(
             "正在分析任务，请稍候……"
         )
 
-        plan = self.plan_task(user_task)
+        # --------------------------------------------------------
+        # 1. LLM 生成任务计划
+        # --------------------------------------------------------
+
+        plan = self.plan_task(
+            user_task
+        )
 
         self.report_progress(
             "任务计划如下："
@@ -783,88 +2001,132 @@ JSON 格式如下：
             json.dumps(
                 plan,
                 ensure_ascii=False,
-                indent=2
+                indent=2,
             )
         )
 
-        # ========================================================
-        # 自动从自然语言任务中提取 CSV / Excel 文件名
-        # ========================================================
-        extracted_paths = []
+        # --------------------------------------------------------
+        # 2. 整理本地输入文件
+        # --------------------------------------------------------
 
-        # 只有在调用方没有明确传入 input_paths 时，
-        # 才从用户自然语言中自动提取文件名。
-        if not input_paths:
-            file_patterns = re.findall(
-                r'(?<![\w./\\-])'
-                r'([^\s，。,；;、"“”\'‘’<>（）()\[\]{}]+'
-                r'\.(?:csv|xlsx|xls))'
-                r'(?![\w])',
-                user_task,
-                flags=re.IGNORECASE
-            )
-
-            for item in file_patterns:
-                cleaned_item = item.strip().strip(
-                    '，。,；;、"“”\'‘’<>（）()[]{}'
-                )
-
-                if not cleaned_item:
-                    continue
-
-                candidate_path = Path(cleaned_item)
-
-                # 相对路径默认相对于当前项目目录
-                if not candidate_path.is_absolute():
-                    candidate_path = Path.cwd() / candidate_path
-
-                if candidate_path.exists() and candidate_path.is_file():
-                    extracted_paths.append(str(candidate_path.resolve()))
-
-        # 显式传入的 input_paths 优先；
-        # 如果没有 input_paths，则使用自动提取的文件列表。
         if input_paths:
-            normalized_paths = self.normalize_input_paths(
-                input_paths=input_paths,
-                file_path=file_path
-            )
-        else:
-            normalized_paths = self.normalize_input_paths(
-                input_paths=extracted_paths,
-                file_path=file_path
+            normalized_paths = (
+                self.normalize_input_paths(
+                    input_paths=input_paths,
+                    file_path=file_path,
+                )
             )
 
-        # 去重，同时保持文件出现顺序
+        else:
+            extracted_paths = (
+                self.extract_local_files(
+                    user_task
+                )
+            )
+
+            normalized_paths = (
+                self.normalize_input_paths(
+                    input_paths=extracted_paths,
+                    file_path=file_path,
+                )
+            )
+
+        # --------------------------------------------------------
+        # 3. 去重
+        # --------------------------------------------------------
+
         unique_paths = []
         seen_paths = set()
 
         for item in normalized_paths:
-            resolved_item = str(Path(item).resolve())
+            resolved_item = str(
+                Path(item).resolve()
+            )
 
-            if resolved_item not in seen_paths:
-                seen_paths.add(resolved_item)
-                unique_paths.append(resolved_item)
+            normalized_key = (
+                os.path.normcase(
+                    resolved_item
+                )
+            )
 
-        normalized_paths = unique_paths
+            if normalized_key in seen_paths:
+                continue
 
-        urls = self.extract_urls(user_task)
+            seen_paths.add(
+                normalized_key
+            )
+
+            unique_paths.append(
+                resolved_item
+            )
+
+        normalized_paths = (
+            unique_paths
+        )
+
+        # --------------------------------------------------------
+        # 4. 下载网络文件
+        # --------------------------------------------------------
+
+        urls = self.extract_urls(
+            user_task
+        )
+
         downloaded_files = []
 
         for url in urls:
-            downloaded_file = self.download_input_file(
-                url=url,
-                output_dir=output_dir / "downloads"
+            downloaded_file = (
+                self.download_input_file(
+                    url=url,
+                    output_dir=(
+                        output_dir
+                        / "downloads"
+                    ),
+                )
             )
 
             downloaded_files.append(
                 downloaded_file
             )
 
-        for downloaded_file in downloaded_files:
-            if downloaded_file not in normalized_paths:
-                normalized_paths.append(
-                    downloaded_file
+        # --------------------------------------------------------
+        # 5. 将下载文件加入输入列表
+        # --------------------------------------------------------
+
+        existing_keys = {
+            os.path.normcase(
+                str(
+                    Path(item).resolve()
                 )
+            )
+            for item in normalized_paths
+        }
+
+        for downloaded_file in downloaded_files:
+            resolved_downloaded = str(
+                Path(
+                    downloaded_file
+                ).resolve()
+            )
+
+            normalized_key = (
+                os.path.normcase(
+                    resolved_downloaded
+                )
+            )
+
+            if normalized_key not in existing_keys:
+                normalized_paths.append(
+                    resolved_downloaded
+                )
+
+                existing_keys.add(
+                    normalized_key
+                )
+
+        # --------------------------------------------------------
+        # 6. 检查输入
+        # --------------------------------------------------------
 
         if not normalized_paths:
             raise ValueError(
@@ -877,41 +2139,94 @@ JSON 格式如下：
             f"共识别到 {len(normalized_paths)} 个输入路径。"
         )
 
-        use_batch_pipeline = (
-            plan.get(
-                "need_batch_pipeline",
-                False
-            )
-            or self.is_batch_input(
-                normalized_paths
-            )
+        # --------------------------------------------------------
+        # 7. 判断是否为 Office 多步骤任务
+        # --------------------------------------------------------
+
+        task_type = plan.get(
+            "task_type",
+            "data_analysis",
         )
 
-        if use_batch_pipeline:
-            self.report_progress(
-                "已识别为批量数据处理任务。"
+        operations = plan.get(
+            "operations",
+            [],
+        )
+
+        use_office_task = (
+            task_type
+            == "office_data_task"
+            and isinstance(
+                operations,
+                list,
+            )
+            and len(operations) > 0
+        )
+
+        if use_office_task:
+            result = (
+                self.execute_office_task(
+                    user_task=user_task,
+                    input_paths=normalized_paths,
+                    output_dir=output_dir,
+                    plan=plan,
+                )
             )
 
-            result = self.execute_batch_task(
-                user_task=user_task,
-                input_paths=normalized_paths,
-                output_dir=output_dir,
-                plan=plan
-            )
         else:
-            self.report_progress(
-                "已识别为单文件数据处理任务。"
+            # ----------------------------------------------------
+            # 8. 原来的普通分析流程
+            # ----------------------------------------------------
+
+            use_batch_pipeline = (
+                plan.get(
+                    "need_batch_pipeline",
+                    False,
+                )
+                or self.is_batch_input(
+                    normalized_paths
+                )
             )
 
-            result = self.execute_single_task(
-                user_task=user_task,
-                file_path=normalized_paths[0],
-                output_dir=output_dir,
-                plan=plan
-            )
+            if use_batch_pipeline:
+                self.report_progress(
+                    "已识别为批量数据处理任务。"
+                )
 
-        result["downloaded_files"] = downloaded_files
-        result["input_paths"] = normalized_paths
+                result = (
+                    self.execute_batch_task(
+                        user_task=user_task,
+                        input_paths=normalized_paths,
+                        output_dir=output_dir,
+                        plan=plan,
+                    )
+                )
+
+            else:
+                self.report_progress(
+                    "已识别为单文件数据处理任务。"
+                )
+
+                result = (
+                    self.execute_single_task(
+                        user_task=user_task,
+                        file_path=normalized_paths[0],
+                        output_dir=output_dir,
+                        plan=plan,
+                    )
+                )
+
+        # --------------------------------------------------------
+        # 9. 补充统一结果
+        # --------------------------------------------------------
+
+        result["downloaded_files"] = (
+            downloaded_files
+        )
+
+        result["input_paths"] = (
+            normalized_paths
+        )
 
         self.report_progress(
             "任务执行完成。"
@@ -925,120 +2240,228 @@ JSON 格式如下：
 
     def plan_task(
         self,
-        user_task: str
+        user_task: str,
     ) -> Dict[str, Any]:
         """
         对外提供任务规划接口。
         """
-        return self.ask_llm(user_task)
+
+        return self.ask_llm(
+            user_task
+        )
 
 
-def print_result(result: Dict[str, Any]):
+# ================================================================
+# 命令行结果显示
+# ================================================================
+
+def print_result(
+    result: Dict[str, Any],
+):
     """
     在命令行中打印任务结果。
     """
-    print("\n" + "=" * 60)
-    print("任务执行完成")
-    print("=" * 60)
 
-    task_type = (
-        "批量任务"
-        if result.get("is_batch")
-        else "单文件任务"
+    print(
+        "\n" + "=" * 60
     )
+
+    print(
+        "任务执行完成"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    if result.get(
+        "is_office_task"
+    ):
+        task_type = (
+            "办公多步骤任务"
+        )
+
+    elif result.get(
+        "is_batch"
+    ):
+        task_type = (
+            "批量数据分析任务"
+        )
+
+    else:
+        task_type = (
+            "单文件数据分析任务"
+        )
 
     print(
         f"任务类型：{task_type}"
     )
 
     print(
-        f"处理文件数量：{result.get('file_count', 0)}"
+        f"处理文件数量："
+        f"{result.get('file_count', 0)}"
     )
 
     source_files = result.get(
         "source_files",
-        []
+        [],
     )
 
     if source_files:
-        print("\n处理文件：")
+        print(
+            "\n处理文件："
+        )
 
-        for file_path in source_files:
-            print(f"  - {file_path}")
+        for source_file in source_files:
+            print(
+                f"  - {source_file}"
+            )
 
     downloaded_files = result.get(
         "downloaded_files",
-        []
+        [],
     )
 
     if downloaded_files:
-        print("\n下载文件：")
+        print(
+            "\n下载文件："
+        )
 
-        for file_path in downloaded_files:
-            print(f"  - {file_path}")
+        for downloaded_file in downloaded_files:
+            print(
+                f"  - {downloaded_file}"
+            )
+
+    if result.get(
+        "is_office_task"
+    ):
+        execution_log = result.get(
+            "office_execution_log",
+            [],
+        )
+
+        if execution_log:
+            print(
+                "\n办公任务执行步骤："
+            )
+
+            for item in execution_log:
+                print(
+                    f"  {item.get('step')}. "
+                    f"{item.get('action')} "
+                    f"→ {item.get('rows_after')} 行"
+                )
 
     output_items = [
         (
-            "清洗后 Excel",
-            result.get("excel_path")
+            "Excel",
+            result.get(
+                "excel_path"
+            ),
         ),
         (
             "统计结果 Excel",
-            result.get("statistics_path")
+            result.get(
+                "statistics_path"
+            ),
         ),
         (
             "图表",
-            result.get("chart_path")
-            or result.get("plot_path")
+            result.get(
+                "chart_path"
+            )
+            or result.get(
+                "plot_path"
+            ),
         ),
         (
             "Word 报告",
-            result.get("word_path")
-        )
+            result.get(
+                "word_path"
+            ),
+        ),
     ]
 
-    print("\n输出文件：")
+    print(
+        "\n输出文件："
+    )
+
+    shown_paths = set()
 
     for label, file_path in output_items:
-        if file_path:
-            print(
-                f"{label}：{file_path}"
-            )
-        else:
-            print(
-                f"{label}：未生成"
-            )
+        if not file_path:
+            continue
 
-    print("=" * 60)
+        normalized_path = (
+            os.path.normcase(
+                os.path.abspath(
+                    str(file_path)
+                )
+            )
+        )
 
+        if normalized_path in shown_paths:
+            continue
+
+        shown_paths.add(
+            normalized_path
+        )
+
+        print(
+            f"{label}：{file_path}"
+        )
+
+    print(
+        "=" * 60
+    )
+
+
+# ================================================================
+# 命令行测试入口
+# ================================================================
 
 if __name__ == "__main__":
-    print("DataPilot Agent 命令行测试")
-    print("=" * 60)
+    print(
+        "DataPilot Agent 命令行测试"
+    )
+
+    print(
+        "=" * 60
+    )
 
     try:
         task = input(
-            "请输入任务，例如："
-            "请分析 test_weather.csv 并生成报告：\n"
+            "请输入任务：\n"
         ).strip()
 
         if not task:
-            print("任务不能为空。")
-            raise SystemExit(1)
+            print(
+                "任务不能为空。"
+            )
+
+            raise SystemExit(
+                1
+            )
 
         agent = DataPilotAgent()
 
+        # 这里不再固定传入 test_weather.csv。
+        # Agent 会从自然语言中识别文件名。
         result = agent.execute_task(
             user_task=task,
-            file_path="test_weather.csv",
-            output_dir="outputs"
+            output_dir="outputs",
         )
 
-        print_result(result)
+        print_result(
+            result
+        )
 
     except Exception as error:
-        print("\n任务执行失败：")
+        print(
+            "\n任务执行失败："
+        )
+
         print(
             type(error).__name__,
-            error
+            error,
         )
