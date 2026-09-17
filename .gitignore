@@ -10,14 +10,18 @@ env/
 
 # Environment variables
 .env
-.env.*
 
 # Generated outputs
 outputs/
-*.png
+
+# Generated data files
+*.csv
 *.xlsx
 *.xls
 *.docx
+*.png
+*.jpg
+*.jpeg
 
 # IDE
 .vscode/

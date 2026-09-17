@@ -1,41 +1,54 @@
 from pathlib import Path
-from datetime import datetime
+
+import pandas as pd
 
 from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.shared import Inches, Pt
 
 
-def set_cell_text(cell, text, bold=False):
+# ============================================================
+# Word 基础格式
+# ============================================================
+
+def set_run_font(
+    run,
+    font_name="Microsoft YaHei",
+    font_size=10,
+    bold=False,
+):
     """
-    设置 Word 表格单元格文字。
+    设置 Word 中英文统一字体。
     """
-    cell.text = ""
-
-    paragraph = cell.paragraphs[0]
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-    run = paragraph.add_run(str(text))
+    run.font.name = font_name
+    run.font.size = Pt(font_size)
     run.bold = bold
-    run.font.size = Pt(9)
-    run.font.name = "Microsoft YaHei"
 
-    # 设置中文字体
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    r_pr = run._element.get_or_add_rPr()
+    r_fonts = r_pr.rFonts
 
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    if r_fonts is None:
+        r_fonts = OxmlElement("w:rFonts")
+        r_pr.append(r_fonts)
+
+    r_fonts.set(qn("w:ascii"), font_name)
+    r_fonts.set(qn("w:hAnsi"), font_name)
+    r_fonts.set(qn("w:eastAsia"), font_name)
+    r_fonts.set(qn("w:cs"), font_name)
 
 
-def set_cell_shading(cell, fill):
+def set_cell_shading(cell, fill="D9EAF7"):
     """
-    设置表格单元格背景颜色。
+    设置表格单元格背景色。
     """
     tc_pr = cell._tc.get_or_add_tcPr()
 
     shd = tc_pr.find(qn("w:shd"))
+
     if shd is None:
         shd = OxmlElement("w:shd")
         tc_pr.append(shd)
@@ -43,509 +56,639 @@ def set_cell_shading(cell, fill):
     shd.set(qn("w:fill"), fill)
 
 
-def set_table_borders(table):
+def set_cell_border(cell, color="B7C9D6", size="4"):
     """
-    设置 Word 表格边框。
+    设置表格边框。
     """
-    tbl = table._tbl
-    tbl_pr = tbl.tblPr
+    tc = cell._tc
+    tc_pr = tc.get_or_add_tcPr()
 
-    borders = tbl_pr.first_child_found_in("w:tblBorders")
+    tc_borders = tc_pr.first_child_found_in("w:tcBorders")
 
-    if borders is None:
-        borders = OxmlElement("w:tblBorders")
-        tbl_pr.append(borders)
+    if tc_borders is None:
+        tc_borders = OxmlElement("w:tcBorders")
+        tc_pr.append(tc_borders)
 
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+    for edge in (
+        "top",
+        "left",
+        "bottom",
+        "right",
+        "insideH",
+        "insideV",
+    ):
         tag = "w:" + edge
-        element = borders.find(qn(tag))
+        element = tc_borders.find(qn(tag))
 
         if element is None:
             element = OxmlElement(tag)
-            borders.append(element)
+            tc_borders.append(element)
 
         element.set(qn("w:val"), "single")
-        element.set(qn("w:sz"), "4")
+        element.set(qn("w:sz"), size)
         element.set(qn("w:space"), "0")
-        element.set(qn("w:color"), "B7B7B7")
+        element.set(qn("w:color"), color)
 
 
-def set_document_default_font(document):
+def set_cell_text(
+    cell,
+    text,
+    font_size=9,
+    bold=False,
+    alignment=WD_ALIGN_PARAGRAPH.CENTER,
+):
     """
-    设置 Word 文档默认字体。
+    设置单元格文字。
     """
-    styles = document.styles
+    cell.text = ""
 
-    normal_style = styles["Normal"]
-    normal_style.font.name = "Microsoft YaHei"
-    normal_style.font.size = Pt(10)
+    paragraph = cell.paragraphs[0]
+    paragraph.alignment = alignment
 
-    normal_style._element.rPr.rFonts.set(
-        qn("w:eastAsia"),
-        "Microsoft YaHei"
+    run = paragraph.add_run(str(text))
+
+    set_run_font(
+        run,
+        font_size=font_size,
+        bold=bold,
     )
+
+    cell.vertical_alignment = (
+        WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    )
+
+
+def set_table_fixed_layout(table):
+    """
+    设置表格固定布局。
+    """
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+
+    tbl_pr = table._tbl.tblPr
+    tbl_layout = tbl_pr.find(qn("w:tblLayout"))
+
+    if tbl_layout is None:
+        tbl_layout = OxmlElement("w:tblLayout")
+        tbl_pr.append(tbl_layout)
+
+    tbl_layout.set(qn("w:type"), "fixed")
 
 
 def add_heading(document, text, level=1):
     """
-    添加标题并设置中文字体。
+    添加标题。
     """
     paragraph = document.add_heading(level=level)
-    run = paragraph.add_run(text)
-    run.font.name = "Microsoft YaHei"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
-    return paragraph
-
-
-def add_body_paragraph(document, text, bold=False):
-    """
-    添加普通正文段落。
-    """
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_after = Pt(6)
 
     run = paragraph.add_run(str(text))
-    run.bold = bold
-    run.font.name = "Microsoft YaHei"
-    run.font.size = Pt(10)
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+
+    font_size = 16 if level == 1 else 13 if level == 2 else 11
+
+    set_run_font(
+        run,
+        font_size=font_size,
+        bold=True,
+    )
 
     return paragraph
 
 
-def add_key_value_table(document, rows):
+def add_body_paragraph(document, text):
     """
-    添加两列表格。
-    rows 格式：
-    [
-        ("项目", "内容"),
-        ...
-    ]
+    添加正文。
     """
-    table = document.add_table(rows=1, cols=2)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
+    paragraph = document.add_paragraph()
+
+    run = paragraph.add_run(str(text))
+
+    set_run_font(
+        run,
+        font_size=10,
+    )
+
+    paragraph.paragraph_format.space_after = Pt(5)
+
+    return paragraph
+
+
+def add_bullet(document, text):
+    """
+    添加项目符号。
+    """
+    paragraph = document.add_paragraph()
+
+    paragraph.paragraph_format.left_indent = Inches(0.25)
+
+    run = paragraph.add_run("• " + str(text))
+
+    set_run_font(
+        run,
+        font_size=10,
+    )
+
+    return paragraph
+
+
+# ============================================================
+# 通用数据表
+# ============================================================
+
+def add_key_value_table(
+    document,
+    title,
+    data,
+):
+    """
+    将字典生成两列表格。
+    """
+    add_heading(
+        document,
+        title,
+        level=2,
+    )
+
+    if not isinstance(data, dict):
+        data = {}
+
+    table = document.add_table(
+        rows=1,
+        cols=2,
+    )
+
+    set_table_fixed_layout(table)
+
+    table.columns[0].width = Inches(2.5)
+    table.columns[1].width = Inches(4.3)
 
     header_cells = table.rows[0].cells
-    set_cell_text(header_cells[0], "项目", bold=True)
-    set_cell_text(header_cells[1], "内容", bold=True)
 
-    set_cell_shading(header_cells[0], "D9EAF7")
-    set_cell_shading(header_cells[1], "D9EAF7")
+    set_cell_text(
+        header_cells[0],
+        "项目",
+        font_size=9,
+        bold=True,
+    )
 
-    for key, value in rows:
+    set_cell_text(
+        header_cells[1],
+        "结果",
+        font_size=9,
+        bold=True,
+    )
+
+    for cell in header_cells:
+        set_cell_shading(cell)
+        set_cell_border(cell)
+
+    if not data:
         cells = table.add_row().cells
-        set_cell_text(cells[0], key)
-        set_cell_text(cells[1], value)
 
-    set_table_borders(table)
-    document.add_paragraph()
+        set_cell_text(
+            cells[0],
+            "记录",
+            font_size=9,
+        )
 
-    return table
+        set_cell_text(
+            cells[1],
+            "没有记录",
+            font_size=9,
+        )
 
+        for cell in cells:
+            set_cell_border(cell)
 
-def add_list_table(document, title, items):
-    """
-    添加列表表格。
-    """
-    add_heading(document, title, level=2)
-
-    if not items:
-        add_body_paragraph(document, "暂无记录。")
-        return
-
-    table = document.add_table(rows=1, cols=2)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
-
-    headers = table.rows[0].cells
-    set_cell_text(headers[0], "序号", bold=True)
-    set_cell_text(headers[1], "内容", bold=True)
-
-    set_cell_shading(headers[0], "D9EAF7")
-    set_cell_shading(headers[1], "D9EAF7")
-
-    for index, item in enumerate(items, start=1):
-        cells = table.add_row().cells
-        set_cell_text(cells[0], index)
-        set_cell_text(cells[1], item)
-
-    set_table_borders(table)
-    document.add_paragraph()
-
-
-def add_quality_table(document, title, quality_result):
-    """
-    添加数据质量检查结果表格。
-    """
-    add_heading(document, title, level=2)
-
-    if not isinstance(quality_result, dict) or not quality_result:
-        add_body_paragraph(document, "暂无质量检查结果。")
-        return
-
-    rows = []
-
-    for key, value in quality_result.items():
-        if isinstance(value, (dict, list, tuple)):
-            value = str(value)
-
-        rows.append((key, value))
-
-    add_key_value_table(document, rows)
-
-
-def add_statistics_table(document, statistics):
-    """
-    添加统计分析结果。
-    支持嵌套字典。
-    """
-    add_heading(document, "统计分析结果", level=2)
-
-    if not isinstance(statistics, dict) or not statistics:
-        add_body_paragraph(document, "暂无统计分析结果。")
-        return
-
-    table = document.add_table(rows=1, cols=3)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
-
-    headers = table.rows[0].cells
-    set_cell_text(headers[0], "字段", bold=True)
-    set_cell_text(headers[1], "统计项目", bold=True)
-    set_cell_text(headers[2], "结果", bold=True)
-
-    for cell in headers:
-        set_cell_shading(cell, "D9EAF7")
-
-    for field_name, field_result in statistics.items():
-        if isinstance(field_result, dict):
-            for stat_name, stat_value in field_result.items():
-                cells = table.add_row().cells
-                set_cell_text(cells[0], field_name)
-                set_cell_text(cells[1], stat_name)
-                set_cell_text(cells[2], stat_value)
-        else:
+    else:
+        for key, value in data.items():
             cells = table.add_row().cells
-            set_cell_text(cells[0], field_name)
-            set_cell_text(cells[1], "结果")
-            set_cell_text(cells[2], field_result)
 
-    set_table_borders(table)
+            if isinstance(value, dict):
+                value = str(value)
+
+            if isinstance(value, list):
+                value = ", ".join(str(item) for item in value)
+
+            set_cell_text(
+                cells[0],
+                key,
+                font_size=9,
+            )
+
+            set_cell_text(
+                cells[1],
+                value,
+                font_size=9,
+            )
+
+            for cell in cells:
+                set_cell_border(cell)
+
     document.add_paragraph()
 
 
-def add_file_list_table(document, file_paths):
+def add_dataframe_table(
+    document,
+    title,
+    dataframe,
+):
     """
-    添加处理文件列表。
+    将 DataFrame 生成 Word 表格。
     """
-    add_heading(document, "本次处理的文件", level=2)
+    add_heading(
+        document,
+        title,
+        level=2,
+    )
 
-    if not file_paths:
-        add_body_paragraph(document, "没有记录到输入文件。")
+    if dataframe is None:
+        add_body_paragraph(
+            document,
+            "没有可用的数据。",
+        )
         return
 
-    table = document.add_table(rows=1, cols=3)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
+    if not isinstance(dataframe, pd.DataFrame):
+        try:
+            dataframe = pd.DataFrame(dataframe)
+        except Exception:
+            add_body_paragraph(
+                document,
+                "数据格式无法转换为表格。",
+            )
+            return
 
-    headers = table.rows[0].cells
-    set_cell_text(headers[0], "序号", bold=True)
-    set_cell_text(headers[1], "文件名", bold=True)
-    set_cell_text(headers[2], "完整路径", bold=True)
-
-    for cell in headers:
-        set_cell_shading(cell, "D9EAF7")
-
-    for index, file_path in enumerate(file_paths, start=1):
-        path = Path(str(file_path))
-
-        cells = table.add_row().cells
-        set_cell_text(cells[0], index)
-        set_cell_text(cells[1], path.name)
-        set_cell_text(cells[2], str(path))
-
-    set_table_borders(table)
-    document.add_paragraph()
-
-
-def add_output_files_table(document, output_files):
-    """
-    添加输出文件清单。
-    """
-    add_heading(document, "输出文件清单", level=2)
-
-    if not output_files:
-        add_body_paragraph(document, "暂无输出文件记录。")
+    if dataframe.empty:
+        add_body_paragraph(
+            document,
+            "数据表为空。",
+        )
         return
 
-    table = document.add_table(rows=1, cols=3)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
+    display_df = dataframe.copy()
 
-    headers = table.rows[0].cells
-    set_cell_text(headers[0], "序号", bold=True)
-    set_cell_text(headers[1], "文件类型", bold=True)
-    set_cell_text(headers[2], "文件路径", bold=True)
+    # 防止表格过宽，最多展示前 12 列
+    if len(display_df.columns) > 12:
+        display_df = display_df.iloc[:, :12]
 
-    for cell in headers:
-        set_cell_shading(cell, "D9EAF7")
+    table = document.add_table(
+        rows=1,
+        cols=len(display_df.columns),
+    )
 
-    for index, item in enumerate(output_files, start=1):
-        if isinstance(item, tuple) and len(item) == 2:
-            file_type, file_path = item
-        else:
-            file_type = "输出文件"
-            file_path = item
+    set_table_fixed_layout(table)
 
+    total_width = 6.8
+    column_width = total_width / len(display_df.columns)
+
+    for column in table.columns:
+        column.width = Inches(column_width)
+
+    header_cells = table.rows[0].cells
+
+    for index, column_name in enumerate(display_df.columns):
+        set_cell_text(
+            header_cells[index],
+            column_name,
+            font_size=8,
+            bold=True,
+        )
+
+        set_cell_shading(
+            header_cells[index],
+            "D9EAF7",
+        )
+
+        set_cell_border(header_cells[index])
+
+    for _, row in display_df.iterrows():
         cells = table.add_row().cells
-        set_cell_text(cells[0], index)
-        set_cell_text(cells[1], file_type)
-        set_cell_text(cells[2], file_path)
 
-    set_table_borders(table)
+        for index, value in enumerate(row):
+            if isinstance(value, float):
+                value = round(value, 4)
+
+            set_cell_text(
+                cells[index],
+                value,
+                font_size=8,
+            )
+
+            set_cell_border(cells[index])
+
     document.add_paragraph()
 
 
-def normalize_file_paths(file_paths):
-    """
-    统一处理文件路径列表。
-    """
-    if file_paths is None:
-        return []
-
-    if isinstance(file_paths, (str, Path)):
-        return [str(file_paths)]
-
-    return [str(item) for item in file_paths]
-
+# ============================================================
+# 批量 Word 报告主函数
+# ============================================================
 
 def generate_batch_word_report(
     task,
     result,
-    output_path="outputs/batch_report.docx"
+    output_path="outputs/batch_report.docx",
 ):
     """
     根据批量数据处理结果生成 Word 报告。
 
     参数：
         task:
-            用户输入的自然语言任务。
+            用户任务描述。
 
         result:
             run_batch_pipeline() 返回的结果字典。
 
         output_path:
             Word 报告保存路径。
-
-    返回：
-        Word 报告的完整路径字符串。
     """
+
+    if not isinstance(result, dict):
+        raise TypeError(
+            "generate_batch_word_report() 的 result 必须是字典。"
+        )
+
     output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     document = Document()
-    set_document_default_font(document)
 
-    # 设置页面边距
+    # ========================================================
+    # 页面设置
+    # ========================================================
+
     section = document.sections[0]
-    section.top_margin = Inches(0.7)
-    section.bottom_margin = Inches(0.7)
-    section.left_margin = Inches(0.8)
-    section.right_margin = Inches(0.8)
 
-    # 标题
-    title = document.add_paragraph()
+    section.orientation = WD_ORIENT.LANDSCAPE
+
+    section.page_width = Inches(11.69)
+    section.page_height = Inches(8.27)
+
+    section.top_margin = Inches(0.55)
+    section.bottom_margin = Inches(0.55)
+    section.left_margin = Inches(0.55)
+    section.right_margin = Inches(0.55)
+
+    # ========================================================
+    # 报告标题
+    # ========================================================
+
+    title = document.add_heading(level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    title_run = title.add_run("DataPilot 批量数据分析报告")
-    title_run.bold = True
-    title_run.font.name = "Microsoft YaHei"
-    title_run.font.size = Pt(20)
-    title_run._element.rPr.rFonts.set(
-        qn("w:eastAsia"),
-        "Microsoft YaHei"
+    title_run = title.add_run(
+        "DataPilot 批量数据分析报告"
     )
 
-    subtitle = document.add_paragraph()
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    subtitle_run = subtitle.add_run(
-        "智能数据办公 Agent 自动生成"
-    )
-    subtitle_run.font.name = "Microsoft YaHei"
-    subtitle_run.font.size = Pt(10)
-    subtitle_run._element.rPr.rFonts.set(
-        qn("w:eastAsia"),
-        "Microsoft YaHei"
+    set_run_font(
+        title_run,
+        font_size=20,
+        bold=True,
     )
 
-    document.add_paragraph()
+    # ========================================================
+    # 一、任务概述
+    # ========================================================
 
-    # 基本信息
-    add_heading(document, "一、任务概况", level=1)
-
-    task_text = task if task else "未提供任务说明"
-
-    input_paths = normalize_file_paths(
-        result.get("input_paths")
-        or result.get("file_paths")
-        or result.get("processed_files")
-        or []
+    add_heading(
+        document,
+        "一、任务概述",
+        level=1,
     )
 
-    output_files = []
+    add_body_paragraph(
+        document,
+        task or "未提供任务描述。",
+    )
 
-    excel_path = result.get("excel_path")
-    statistics_path = result.get("statistics_path")
-    chart_path = result.get("chart_path") or result.get("plot_path")
-    word_path = result.get("word_path")
+    # ========================================================
+    # 二、输入文件
+    # ========================================================
 
-    if excel_path:
-        output_files.append(("清洗后 Excel", str(excel_path)))
+    add_heading(
+        document,
+        "二、输入文件",
+        level=1,
+    )
 
-    if statistics_path:
-        output_files.append(("统计结果 Excel", str(statistics_path)))
+    input_paths = result.get(
+        "input_paths",
+        result.get("file_paths", []),
+    )
 
-    if chart_path:
-        output_files.append(("数据图表", str(chart_path)))
+    if isinstance(input_paths, str):
+        input_paths = [input_paths]
 
-    if word_path:
-        output_files.append(("Word 报告", str(word_path)))
+    if input_paths:
+        for file_path in input_paths:
+            add_bullet(
+                document,
+                str(file_path),
+            )
+    else:
+        add_body_paragraph(
+            document,
+            "没有记录输入文件。",
+        )
+
+    # ========================================================
+    # 三、数据基本情况
+    # ========================================================
+
+    add_heading(
+        document,
+        "三、数据基本情况",
+        level=1,
+    )
 
     original_df = result.get("original_df")
     cleaned_df = result.get("cleaned_df")
 
-    original_rows = ""
-    cleaned_rows = ""
-    original_columns = ""
-    cleaned_columns = ""
-
-    if original_df is not None:
-        try:
-            original_rows = len(original_df)
-            original_columns = len(original_df.columns)
-        except Exception:
-            original_rows = "未知"
-            original_columns = "未知"
-
-    if cleaned_df is not None:
-        try:
-            cleaned_rows = len(cleaned_df)
-            cleaned_columns = len(cleaned_df.columns)
-        except Exception:
-            cleaned_rows = "未知"
-            cleaned_columns = "未知"
-
-    overview_rows = [
-        ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("用户任务", task_text),
-        ("处理文件数量", len(input_paths)),
-        ("清洗前数据行数", original_rows if original_rows != "" else "未知"),
-        ("清洗后数据行数", cleaned_rows if cleaned_rows != "" else "未知"),
-        ("清洗前字段数量", original_columns if original_columns != "" else "未知"),
-        ("清洗后字段数量", cleaned_columns if cleaned_columns != "" else "未知"),
-    ]
-
-    add_key_value_table(document, overview_rows)
-
-    # 文件列表
-    add_heading(document, "二、输入文件", level=1)
-    add_file_list_table(document, input_paths)
-
-    # 清洗前质量
-    add_heading(document, "三、数据质量检查", level=1)
-
-    before_quality = result.get("before_quality")
-    after_quality = result.get("after_quality")
-
-    add_quality_table(
-        document,
-        "清洗前数据质量",
-        before_quality
-    )
-
-    add_quality_table(
-        document,
-        "清洗后数据质量",
-        after_quality
-    )
-
-    # 清洗记录
-    cleaning_log = result.get("cleaning_log")
-
-    if cleaning_log:
-        if isinstance(cleaning_log, dict):
-            cleaning_items = [
-                f"{key}: {value}"
-                for key, value in cleaning_log.items()
-            ]
-        elif isinstance(cleaning_log, list):
-            cleaning_items = [str(item) for item in cleaning_log]
-        else:
-            cleaning_items = [str(cleaning_log)]
-
-        add_list_table(
+    if isinstance(original_df, pd.DataFrame):
+        add_body_paragraph(
             document,
-            "数据清洗记录",
-            cleaning_items
+            (
+                f"合并后的原始数据包含 "
+                f"{original_df.shape[0]} 行、"
+                f"{original_df.shape[1]} 列。"
+            ),
         )
 
-    # 统计结果
-    statistics = result.get("statistics")
-    add_heading(document, "四、统计分析", level=1)
-    add_statistics_table(document, statistics)
+    if isinstance(cleaned_df, pd.DataFrame):
+        add_body_paragraph(
+            document,
+            (
+                f"清洗后的数据包含 "
+                f"{cleaned_df.shape[0]} 行、"
+                f"{cleaned_df.shape[1]} 列。"
+            ),
+        )
 
-    # 图表
+    # ========================================================
+    # 四、数据质量
+    # ========================================================
+
+    add_heading(
+        document,
+        "四、数据质量检查",
+        level=1,
+    )
+
+    before_quality = result.get(
+        "before_quality",
+        result.get("quality_result", {}),
+    )
+
+    after_quality = result.get(
+        "after_quality",
+        {},
+    )
+
+    add_key_value_table(
+        document,
+        "清洗前数据质量",
+        before_quality,
+    )
+
+    add_key_value_table(
+        document,
+        "清洗后数据质量",
+        after_quality,
+    )
+
+    # ========================================================
+    # 五、清洗记录
+    # ========================================================
+
+    add_heading(
+        document,
+        "五、数据清洗过程",
+        level=1,
+    )
+
+    cleaning_log = result.get(
+        "cleaning_log",
+        result.get("cleaning_result", {}),
+    )
+
+    add_key_value_table(
+        document,
+        "清洗记录",
+        cleaning_log,
+    )
+
+    # ========================================================
+    # 六、统计分析
+    # ========================================================
+
+    add_heading(
+        document,
+        "六、统计分析",
+        level=1,
+    )
+
+    statistics = result.get(
+        "statistics",
+        result.get("statistics_result"),
+    )
+
+    add_dataframe_table(
+        document,
+        "统计结果",
+        statistics,
+    )
+
+    # ========================================================
+    # 七、趋势图
+    # ========================================================
+
+    add_heading(
+        document,
+        "七、趋势图",
+        level=1,
+    )
+
+    chart_path = result.get(
+        "chart_path",
+        result.get("plot_path"),
+    )
+
     if chart_path:
         chart_file = Path(str(chart_path))
 
         if chart_file.exists():
-            add_heading(document, "五、数据可视化", level=1)
-
-            paragraph = document.add_paragraph()
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-            run = paragraph.add_run()
-            run.add_picture(
+            document.add_picture(
                 str(chart_file),
-                width=Inches(6.2)
+                width=Inches(8.5),
             )
 
-            caption = document.add_paragraph()
-            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-            caption_run = caption.add_run(
-                f"图：{chart_file.name}"
+            document.paragraphs[-1].alignment = (
+                WD_ALIGN_PARAGRAPH.CENTER
             )
-            caption_run.font.name = "Microsoft YaHei"
-            caption_run.font.size = Pt(9)
+        else:
+            add_body_paragraph(
+                document,
+                f"趋势图文件不存在：{chart_file}",
+            )
+    else:
+        add_body_paragraph(
+            document,
+            "本次任务没有生成趋势图。",
+        )
 
-    # 输出文件
-    add_heading(document, "六、输出文件", level=1)
-    add_output_files_table(document, output_files)
+    # ========================================================
+    # 八、输出文件
+    # ========================================================
 
-    # 结论
-    add_heading(document, "七、处理说明", level=1)
-
-    add_body_paragraph(
+    add_heading(
         document,
-        "本报告由 DataPilot 智能数据办公 Agent 自动生成。"
-        "系统根据用户输入的自然语言任务，完成了数据读取、"
-        "质量检查、数据清洗、统计分析、图表生成及文件导出。"
+        "八、输出文件",
+        level=1,
     )
 
-    add_body_paragraph(
-        document,
-        "如需进一步分析，可以继续向 DataPilot 提出新的自然语言任务，"
-        "例如要求筛选指定日期、比较不同文件、分析异常值或生成专项报告。"
+    output_files = result.get(
+        "output_files",
+        {},
     )
 
-    document.save(str(output_path))
+    if isinstance(output_files, dict) and output_files:
+        for key, value in output_files.items():
+            add_bullet(
+                document,
+                f"{key}：{value}",
+            )
 
-    return str(output_path.resolve())
+    for key in (
+        "excel_path",
+        "cleaned_excel_path",
+        "statistics_path",
+        "chart_path",
+        "plot_path",
+    ):
+        value = result.get(key)
+
+        if value:
+            add_bullet(
+                document,
+                f"{key}：{value}",
+            )
+
+    add_bullet(
+        document,
+        f"Word 报告：{output_path}",
+    )
+
+    # ========================================================
+    # 保存
+    # ========================================================
+
+    document.save(output_path)
+
+    return str(output_path)
 
 
 if __name__ == "__main__":
-    print("batch_report_generator.py 已准备完成。")
-    print("请通过 DataPilot 批量处理流程调用 generate_batch_word_report()。")
+    print("batch_report_generator.py 已加载成功。")

@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -21,28 +21,36 @@ class DataPilotAgent:
     DataPilot 智能数据办公 Agent。
 
     支持：
-    1. 自然语言任务理解；
-    2. 单文件 CSV / Excel 数据处理；
-    3. 多文件和文件夹批量处理；
-    4. URL 数据文件下载；
-    5. 数据质量检查；
-    6. 数据清洗；
-    7. 统计分析；
-    8. 图表生成；
-    9. Excel 导出；
-    10. Word 报告生成。
+    1. 自然语言任务理解
+    2. 单文件 CSV / Excel 数据处理
+    3. 多文件和文件夹批量处理
+    4. URL 数据文件下载
+    5. 数据质量检查
+    6. 数据清洗
+    7. 统计分析
+    8. 图表生成
+    9. Excel 导出
+    10. Word 报告生成
+    11. 执行进度回调
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ):
         self.api_key = os.getenv("OPENAI_API_KEY")
+
         self.base_url = os.getenv(
             "OPENAI_BASE_URL",
             "https://api.deepseek.com"
         )
+
         self.model = os.getenv(
             "OPENAI_MODEL",
             "deepseek-chat"
         )
+
+        self.progress_callback = progress_callback
 
         if not self.api_key:
             raise ValueError(
@@ -53,6 +61,25 @@ class DataPilotAgent:
             api_key=self.api_key,
             base_url=self.base_url
         )
+
+    # ============================================================
+    # 进度通知
+    # ============================================================
+
+    def report_progress(self, message: str):
+        """
+        向命令行和 GUI 发送执行进度。
+
+        如果没有传入 progress_callback，
+        则只在命令行中打印。
+        """
+        print(message)
+
+        if self.progress_callback:
+            try:
+                self.progress_callback(str(message))
+            except Exception as error:
+                print(f"进度回调执行失败：{error}")
 
     # ============================================================
     # 基础工具
@@ -72,7 +99,9 @@ class DataPilotAgent:
         cleaned_urls = []
 
         for url in urls:
-            url = url.rstrip(".,，。；;、）)】]")
+            url = url.rstrip(
+                ".,，。；;、！!？?）)】]"
+            )
 
             if url not in cleaned_urls:
                 cleaned_urls.append(url)
@@ -88,11 +117,11 @@ class DataPilotAgent:
         统一整理输入路径。
 
         兼容：
-        - 单个字符串；
-        - Path；
-        - 字符串列表；
-        - Path 列表；
-        - file_path 旧参数。
+        - 单个字符串
+        - Path
+        - 字符串列表
+        - Path 列表
+        - file_path 旧参数
         """
         paths = []
 
@@ -130,7 +159,10 @@ class DataPilotAgent:
 
         return normalized_paths
 
-    def contains_directory(self, input_paths: List[str]) -> bool:
+    def contains_directory(
+        self,
+        input_paths: List[str]
+    ) -> bool:
         """
         判断输入路径中是否包含文件夹。
         """
@@ -143,7 +175,10 @@ class DataPilotAgent:
 
         return False
 
-    def is_batch_input(self, input_paths: List[str]) -> bool:
+    def is_batch_input(
+        self,
+        input_paths: List[str]
+    ) -> bool:
         """
         判断是否应该使用批量处理流程。
         """
@@ -159,7 +194,10 @@ class DataPilotAgent:
     # 大模型任务规划
     # ============================================================
 
-    def ask_llm(self, user_task: str) -> Dict[str, Any]:
+    def ask_llm(
+        self,
+        user_task: str
+    ) -> Dict[str, Any]:
         """
         调用大模型，将自然语言任务转换为结构化任务计划。
         """
@@ -194,42 +232,50 @@ JSON 格式如下：
   - report_generation：报告生成任务
   - general：其他任务
 
-- need_download:
+- need_download：
   如果用户要求从 URL、网页或网络地址下载数据，则为 true。
 
-- need_batch_pipeline:
-  如果用户提到批量、多文件、多个文件、文件夹、目录等，则为 true。
+- need_batch_pipeline：
+  如果用户提到批量、多个文件、多份文件、文件夹、目录等，则为 true。
 
-- need_word_report:
+- need_word_report：
   如果用户要求 Word 报告、分析报告、正式报告，则为 true。
 
-- need_excel:
-  如果用户要求 Excel、表格、导出数据，则为 true。
+- need_excel：
+  如果用户要求 Excel、表格或导出数据，则为 true。
 
-- need_chart:
-  如果用户要求统计图、趋势图、可视化、图表，则为 true。
+- need_chart：
+  如果用户要求统计图、趋势图、可视化或图表，则为 true。
 
-- need_quality_check:
+- need_quality_check：
   如果用户要求检查缺失值、重复值、异常值或数据质量，则为 true。
 
-- need_cleaning:
+- need_cleaning：
   如果用户要求清洗、整理、修复数据，则为 true。
 
-- need_statistics:
-  如果用户要求统计、均值、最大值、最小值、分析数据，则为 true。
+- need_statistics：
+  如果用户要求统计、平均值、最大值、最小值或分析数据，则为 true。
 
 判断规则：
 
-1. 用户说“批量”“多个文件”“文件夹”时，need_batch_pipeline 必须为 true。
-2. 用户要求生成 Word 分析报告时，need_word_report 必须为 true。
-3. 用户说“检查缺失值和重复值”时，need_quality_check 必须为 true。
-4. 用户说“清洗后”时，need_cleaning 必须为 true。
-5. 用户说“统计图”时，need_chart 必须为 true。
-6. 用户说“统计结果文件”时，need_statistics 和 need_excel 必须为 true。
+1. 用户说“批量”“多个文件”“文件夹”“目录”时，
+   need_batch_pipeline 必须为 true。
+2. 用户要求生成 Word 分析报告时，
+   need_word_report 必须为 true。
+3. 用户要求检查缺失值和重复值时，
+   need_quality_check 必须为 true。
+4. 用户要求清洗数据时，
+   need_cleaning 必须为 true。
+5. 用户要求生成统计图时，
+   need_chart 必须为 true。
+6. 用户要求导出统计结果文件时，
+   need_statistics 和 need_excel 必须为 true。
 7. 只返回 JSON。
 """
 
         try:
+            self.report_progress("正在调用大模型分析任务……")
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -249,21 +295,32 @@ JSON 格式如下：
             content = response.choices[0].message.content
 
             if not content:
-                raise ValueError("大模型没有返回任务计划。")
+                raise ValueError(
+                    "大模型没有返回任务计划。"
+                )
 
             plan = json.loads(content)
 
             if not isinstance(plan, dict):
-                raise ValueError("大模型返回的任务计划不是 JSON 对象。")
+                raise ValueError(
+                    "大模型返回的任务计划不是 JSON 对象。"
+                )
+
+            self.report_progress("任务规划完成。")
 
             return plan
 
         except Exception as error:
-            print(f"任务规划失败，使用本地规则兜底：{error}")
+            self.report_progress(
+                f"任务规划失败，使用本地规则兜底：{error}"
+            )
 
             return self.fallback_plan(user_task)
 
-    def fallback_plan(self, user_task: str) -> Dict[str, Any]:
+    def fallback_plan(
+        self,
+        user_task: str
+    ) -> Dict[str, Any]:
         """
         当大模型调用失败时，使用关键词进行本地任务规划。
         """
@@ -346,7 +403,9 @@ JSON 格式如下：
 
         return {
             "task_type": "data_analysis",
-            "need_download": bool(self.extract_urls(user_task)),
+            "need_download": bool(
+                self.extract_urls(user_task)
+            ),
             "need_batch_pipeline": need_batch_pipeline,
             "need_word_report": need_word_report,
             "need_excel": need_excel,
@@ -369,7 +428,9 @@ JSON 格式如下：
         """
         下载 URL 对应的数据文件。
         """
-        print(f"正在下载网络数据：{url}")
+        self.report_progress(
+            f"正在下载网络数据：{url}"
+        )
 
         downloaded_path = download_data_file(
             url=url,
@@ -381,7 +442,9 @@ JSON 格式如下：
                 f"网络数据下载失败：{url}"
             )
 
-        print(f"网络数据下载完成：{downloaded_path}")
+        self.report_progress(
+            f"网络数据下载完成：{downloaded_path}"
+        )
 
         return str(downloaded_path)
 
@@ -400,20 +463,32 @@ JSON 格式如下：
         执行单文件数据处理任务。
         """
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
-        print(f"开始处理单个文件：{file_path}")
+        self.report_progress(
+            f"开始处理单个文件：{file_path}"
+        )
+
+        self.report_progress(
+            "正在执行数据质量检查、清洗、统计和图表分析……"
+        )
 
         result = run_data_pipeline(
             file_path=file_path,
             output_dir=str(output_dir)
         )
 
-        # 兼容不同版本的 run_data_pipeline 返回字段
         if not isinstance(result, dict):
             raise TypeError(
                 "run_data_pipeline() 返回结果不是字典。"
             )
+
+        self.report_progress(
+            "数据分析处理完成。"
+        )
 
         word_path = None
 
@@ -426,6 +501,10 @@ JSON 格式如下：
         )
 
         if need_word_report:
+            self.report_progress(
+                "正在生成 Word 分析报告……"
+            )
+
             word_path = output_dir / "data_analysis_report.docx"
 
             try:
@@ -437,7 +516,6 @@ JSON 格式如下：
                 word_path = generated_word_path
 
             except TypeError:
-                # 兼容旧版 generate_word_report 参数格式
                 generated_word_path = generate_word_report(
                     result,
                     str(word_path)
@@ -445,13 +523,19 @@ JSON 格式如下：
 
                 word_path = generated_word_path
 
+            self.report_progress(
+                f"Word 分析报告生成完成：{word_path}"
+            )
+
         return {
             "success": True,
             "task": user_task,
             "plan": plan,
             "is_batch": False,
 
-            "source_files": [str(Path(file_path).resolve())],
+            "source_files": [
+                str(Path(file_path).resolve())
+            ],
             "file_count": 1,
 
             "before_quality": result.get(
@@ -480,13 +564,17 @@ JSON 格式如下：
                 result.get("chart_path")
             ),
 
-            "excel_path": result.get("excel_path"),
+            "excel_path": result.get(
+                "excel_path"
+            ),
             "statistics_path": result.get(
                 "statistics_path"
             ),
             "word_path": word_path,
 
-            "output_dir": str(output_dir.resolve()),
+            "output_dir": str(
+                output_dir.resolve()
+            ),
             "raw_result": result
         }
 
@@ -503,16 +591,28 @@ JSON 格式如下：
     ) -> Dict[str, Any]:
         """
         执行批量数据处理任务。
-
-        这里适配新版 run_batch_pipeline() 返回结构，
-        不再读取不存在的 result["files"]。
         """
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
-        print("\n开始执行批量数据处理任务...")
-        print(f"输入路径：{input_paths}")
-        print(f"输出目录：{output_dir}")
+        self.report_progress(
+            "开始执行批量数据处理任务……"
+        )
+
+        self.report_progress(
+            f"输入路径：{input_paths}"
+        )
+
+        self.report_progress(
+            f"输出目录：{output_dir}"
+        )
+
+        self.report_progress(
+            "正在读取多个 CSV / Excel 文件……"
+        )
 
         result = run_batch_pipeline(
             input_paths=input_paths,
@@ -525,28 +625,37 @@ JSON 格式如下：
                 "run_batch_pipeline() 返回结果不是字典。"
             )
 
-        # 新版批量处理函数返回 input_paths
+        self.report_progress(
+            "批量数据读取和分析完成。"
+        )
+
         source_files = result.get(
             "input_paths",
             []
         )
 
-        # 如果 input_paths 为空，则从 file_info 中恢复
         if not source_files:
             source_files = []
 
-            for item in result.get("file_info", []):
+            for item in result.get(
+                "file_info",
+                []
+            ):
                 if isinstance(item, dict):
-                    file_path = item.get("file_path")
+                    file_path = item.get(
+                        "file_path"
+                    )
 
                     if file_path:
                         source_files.append(
                             str(file_path)
                         )
 
-        # 兼容极旧版本的 files 字段
         if not source_files:
-            old_files = result.get("files", [])
+            old_files = result.get(
+                "files",
+                []
+            )
 
             if isinstance(old_files, list):
                 source_files = [
@@ -554,7 +663,18 @@ JSON 格式如下：
                     for item in old_files
                 ]
 
-        word_path = result.get("word_path")
+        word_path = result.get(
+            "word_path"
+        )
+
+        self.report_progress(
+            "批量 Excel、统计结果和趋势图已经生成。"
+        )
+
+        if word_path:
+            self.report_progress(
+                f"批量 Word 报告已生成：{word_path}"
+            )
 
         return {
             "success": True,
@@ -626,42 +746,52 @@ JSON 格式如下：
         执行用户任务。
 
         参数：
-            user_task:
+            user_task：
                 用户自然语言任务。
 
-            file_path:
+            file_path：
                 兼容旧版的单文件参数。
 
-            output_dir:
+            output_dir：
                 输出目录。
 
-            input_paths:
+            input_paths：
                 支持单个文件、多个文件或文件夹。
         """
         if not user_task or not user_task.strip():
-            raise ValueError("任务内容不能为空。")
+            raise ValueError(
+                "任务内容不能为空。"
+            )
 
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
-        print("\n正在分析任务，请稍候...")
+        self.report_progress(
+            "正在分析任务，请稍候……"
+        )
 
         plan = self.plan_task(user_task)
 
-        print("\n任务计划：")
-        print(json.dumps(
-            plan,
-            ensure_ascii=False,
-            indent=2
-        ))
+        self.report_progress(
+            "任务计划如下："
+        )
 
-        # 整理本地输入路径
+        print(
+            json.dumps(
+                plan,
+                ensure_ascii=False,
+                indent=2
+            )
+        )
+
         normalized_paths = self.normalize_input_paths(
             input_paths=input_paths,
             file_path=file_path
         )
 
-        # 提取并下载 URL
         urls = self.extract_urls(user_task)
         downloaded_files = []
 
@@ -671,26 +801,42 @@ JSON 格式如下：
                 output_dir=output_dir / "downloads"
             )
 
-            downloaded_files.append(downloaded_file)
+            downloaded_files.append(
+                downloaded_file
+            )
 
-        # 如果下载到了网络文件，将其加入输入路径
         for downloaded_file in downloaded_files:
             if downloaded_file not in normalized_paths:
-                normalized_paths.append(downloaded_file)
+                normalized_paths.append(
+                    downloaded_file
+                )
 
         if not normalized_paths:
             raise ValueError(
-                "没有找到输入数据文件。请先选择 CSV、Excel 文件、"
-                "文件夹，或者在任务中提供数据文件 URL。"
+                "没有找到输入数据文件。"
+                "请先选择 CSV、Excel 文件、文件夹，"
+                "或者在任务中提供数据文件 URL。"
             )
 
-        # 判断是否批量任务
+        self.report_progress(
+            f"共识别到 {len(normalized_paths)} 个输入路径。"
+        )
+
         use_batch_pipeline = (
-            plan.get("need_batch_pipeline", False)
-            or self.is_batch_input(normalized_paths)
+            plan.get(
+                "need_batch_pipeline",
+                False
+            )
+            or self.is_batch_input(
+                normalized_paths
+            )
         )
 
         if use_batch_pipeline:
+            self.report_progress(
+                "已识别为批量数据处理任务。"
+            )
+
             result = self.execute_batch_task(
                 user_task=user_task,
                 input_paths=normalized_paths,
@@ -698,6 +844,10 @@ JSON 格式如下：
                 plan=plan
             )
         else:
+            self.report_progress(
+                "已识别为单文件数据处理任务。"
+            )
+
             result = self.execute_single_task(
                 user_task=user_task,
                 file_path=normalized_paths[0],
@@ -708,13 +858,20 @@ JSON 格式如下：
         result["downloaded_files"] = downloaded_files
         result["input_paths"] = normalized_paths
 
+        self.report_progress(
+            "任务执行完成。"
+        )
+
         return result
 
     # ============================================================
     # 任务规划入口
     # ============================================================
 
-    def plan_task(self, user_task: str) -> Dict[str, Any]:
+    def plan_task(
+        self,
+        user_task: str
+    ) -> Dict[str, Any]:
         """
         对外提供任务规划接口。
         """
@@ -729,10 +886,24 @@ def print_result(result: Dict[str, Any]):
     print("任务执行完成")
     print("=" * 60)
 
-    print(f"任务类型：{'批量任务' if result.get('is_batch') else '单文件任务'}")
-    print(f"处理文件数量：{result.get('file_count', 0)}")
+    task_type = (
+        "批量任务"
+        if result.get("is_batch")
+        else "单文件任务"
+    )
 
-    source_files = result.get("source_files", [])
+    print(
+        f"任务类型：{task_type}"
+    )
+
+    print(
+        f"处理文件数量：{result.get('file_count', 0)}"
+    )
+
+    source_files = result.get(
+        "source_files",
+        []
+    )
 
     if source_files:
         print("\n处理文件：")
@@ -752,19 +923,36 @@ def print_result(result: Dict[str, Any]):
             print(f"  - {file_path}")
 
     output_items = [
-        ("清洗后 Excel", result.get("excel_path")),
-        ("统计结果 Excel", result.get("statistics_path")),
-        ("图表", result.get("chart_path") or result.get("plot_path")),
-        ("Word 报告", result.get("word_path")),
+        (
+            "清洗后 Excel",
+            result.get("excel_path")
+        ),
+        (
+            "统计结果 Excel",
+            result.get("statistics_path")
+        ),
+        (
+            "图表",
+            result.get("chart_path")
+            or result.get("plot_path")
+        ),
+        (
+            "Word 报告",
+            result.get("word_path")
+        )
     ]
 
     print("\n输出文件：")
 
     for label, file_path in output_items:
         if file_path:
-            print(f"{label}：{file_path}")
+            print(
+                f"{label}：{file_path}"
+            )
         else:
-            print(f"{label}：未生成")
+            print(
+                f"{label}：未生成"
+            )
 
     print("=" * 60)
 
@@ -775,7 +963,8 @@ if __name__ == "__main__":
 
     try:
         task = input(
-            "请输入任务，例如：请分析 test_weather.csv 并生成报告：\n"
+            "请输入任务，例如："
+            "请分析 test_weather.csv 并生成报告：\n"
         ).strip()
 
         if not task:
@@ -794,4 +983,7 @@ if __name__ == "__main__":
 
     except Exception as error:
         print("\n任务执行失败：")
-        print(type(error).__name__, error)
+        print(
+            type(error).__name__,
+            error
+        )
