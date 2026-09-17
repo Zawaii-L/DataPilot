@@ -1449,7 +1449,645 @@ def export_office_result(
 
 
 # ============================================================
-# 15. 数据基本信息
+# 15. 数据透视式汇总
+# ============================================================
+
+def create_pivot_summary(
+    df,
+    index,
+    values,
+    aggfunc="sum",
+    columns=None,
+    fill_value=0,
+    margins=False,
+    margins_name="总计",
+):
+    """
+    创建数据透视式汇总结果。
+
+    说明：
+    这里生成的是普通 DataFrame 形式的“数据透视式汇总表”，
+    可以直接写入 Excel Sheet。
+    它不是 Excel 内部可拖拽字段的原生 PivotTable 对象。
+
+    参数示例：
+
+    create_pivot_summary(
+        df=df,
+        index=["城市", "月份"],
+        values=["销售额", "订单金额"],
+        aggfunc={
+            "销售额": "sum",
+            "订单金额": "mean",
+        },
+    )
+
+    也支持：
+
+    create_pivot_summary(
+        df=df,
+        index="城市",
+        columns="月份",
+        values="销售额",
+        aggfunc="sum",
+        fill_value=0,
+        margins=True,
+    )
+
+    支持的统计方式：
+        mean
+        sum
+        count
+        max
+        min
+        median
+    """
+    if df is None:
+        raise ValueError(
+            "输入 DataFrame 不能为空。"
+        )
+
+    if not isinstance(
+        df,
+        pd.DataFrame,
+    ):
+        raise TypeError(
+            "df 必须是 pandas DataFrame。"
+        )
+
+    if df.empty:
+        raise ValueError(
+            "输入数据为空，无法创建数据透视汇总。"
+        )
+
+    def normalize_columns(
+        value,
+        parameter_name,
+        allow_none=False,
+    ):
+        if value is None:
+            if allow_none:
+                return None
+
+            raise ValueError(
+                f"{parameter_name} 不能为空。"
+            )
+
+        if isinstance(
+            value,
+            str,
+        ):
+            result = [
+                value
+            ]
+
+        elif isinstance(
+            value,
+            (list, tuple),
+        ):
+            result = [
+                str(item)
+                for item in value
+                if item
+            ]
+
+        else:
+            raise TypeError(
+                f"{parameter_name} 必须是字段名字符串"
+                "或字段名列表。"
+            )
+
+        if not result:
+            raise ValueError(
+                f"{parameter_name} 至少需要一个字段。"
+            )
+
+        unique_result = []
+
+        for item in result:
+            if item not in unique_result:
+                unique_result.append(
+                    item
+                )
+
+        return unique_result
+
+    index_columns = normalize_columns(
+        index,
+        "index",
+    )
+
+    value_columns = normalize_columns(
+        values,
+        "values",
+    )
+
+    column_columns = normalize_columns(
+        columns,
+        "columns",
+        allow_none=True,
+    )
+
+    required_columns = (
+        index_columns
+        + value_columns
+        + (
+            column_columns
+            if column_columns
+            else []
+        )
+    )
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "以下数据透视字段不存在："
+            + ", ".join(
+                missing_columns
+            )
+        )
+
+    supported_operations = {
+        "mean",
+        "sum",
+        "count",
+        "max",
+        "min",
+        "median",
+    }
+
+    if isinstance(
+        aggfunc,
+        str,
+    ):
+        normalized_aggfunc = (
+            aggfunc.lower()
+        )
+
+        if (
+            normalized_aggfunc
+            not in supported_operations
+        ):
+            raise ValueError(
+                f"暂不支持统计操作：{aggfunc}"
+            )
+
+    elif isinstance(
+        aggfunc,
+        dict,
+    ):
+        normalized_aggfunc = {}
+
+        for column, operation in (
+            aggfunc.items()
+        ):
+            if column not in value_columns:
+                raise ValueError(
+                    f"aggfunc 中的字段 {column} "
+                    "不在 values 中。"
+                )
+
+            if isinstance(
+                operation,
+                str,
+            ):
+                operation_value = (
+                    operation.lower()
+                )
+
+                if (
+                    operation_value
+                    not in supported_operations
+                ):
+                    raise ValueError(
+                        f"字段 {column} 包含"
+                        f"暂不支持的统计方式：{operation}"
+                    )
+
+                normalized_aggfunc[
+                    column
+                ] = operation_value
+
+            elif isinstance(
+                operation,
+                (list, tuple),
+            ):
+                operation_list = [
+                    str(item).lower()
+                    for item in operation
+                ]
+
+                unsupported = [
+                    item
+                    for item in operation_list
+                    if item
+                    not in supported_operations
+                ]
+
+                if unsupported:
+                    raise ValueError(
+                        f"字段 {column} 包含"
+                        "暂不支持的统计方式："
+                        + ", ".join(
+                            unsupported
+                        )
+                    )
+
+                normalized_aggfunc[
+                    column
+                ] = operation_list
+
+            else:
+                raise TypeError(
+                    f"字段 {column} 的统计方式"
+                    "必须是字符串或列表。"
+                )
+
+    else:
+        raise TypeError(
+            "aggfunc 必须是字符串或字典。"
+        )
+
+    temp_df = df.copy()
+
+    numeric_operations = {
+        "mean",
+        "sum",
+        "max",
+        "min",
+        "median",
+    }
+
+    for column in value_columns:
+        if isinstance(
+            normalized_aggfunc,
+            str,
+        ):
+            operations = [
+                normalized_aggfunc
+            ]
+
+        else:
+            configured_operation = (
+                normalized_aggfunc.get(
+                    column,
+                    "sum",
+                )
+            )
+
+            if isinstance(
+                configured_operation,
+                str,
+            ):
+                operations = [
+                    configured_operation
+                ]
+
+            else:
+                operations = list(
+                    configured_operation
+                )
+
+        needs_numeric = any(
+            operation
+            in numeric_operations
+            for operation in operations
+        )
+
+        if not needs_numeric:
+            continue
+
+        numeric_series = pd.to_numeric(
+            temp_df[column],
+            errors="coerce",
+        )
+
+        original_non_null_count = int(
+            temp_df[column]
+            .notna()
+            .sum()
+        )
+
+        numeric_non_null_count = int(
+            numeric_series
+            .notna()
+            .sum()
+        )
+
+        if (
+            original_non_null_count > 0
+            and numeric_non_null_count == 0
+        ):
+            raise ValueError(
+                f"字段 {column} 无法执行数值统计，"
+                "因为该字段不是有效数值字段。"
+            )
+
+        temp_df[column] = (
+            numeric_series
+        )
+
+    try:
+        pivot = pd.pivot_table(
+            temp_df,
+            index=index_columns,
+            columns=column_columns,
+            values=value_columns,
+            aggfunc=normalized_aggfunc,
+            fill_value=fill_value,
+            margins=bool(
+                margins
+            ),
+            margins_name=str(
+                margins_name
+            ),
+            dropna=False,
+        )
+
+    except Exception as error:
+        raise ValueError(
+            "数据透视式汇总执行失败："
+            f"{error}"
+        ) from error
+
+    if isinstance(
+        pivot,
+        pd.Series,
+    ):
+        pivot = pivot.to_frame()
+
+    if isinstance(
+        pivot.columns,
+        pd.MultiIndex,
+    ):
+        flattened_columns = []
+
+        for column_info in (
+            pivot.columns
+        ):
+            parts = [
+                str(part)
+                for part in column_info
+                if (
+                    part is not None
+                    and str(part) != ""
+                )
+            ]
+
+            flattened_columns.append(
+                "_".join(
+                    parts
+                )
+            )
+
+        pivot.columns = (
+            flattened_columns
+        )
+
+    else:
+        pivot.columns = [
+            str(column)
+            for column in pivot.columns
+        ]
+
+    pivot = (
+        pivot
+        .reset_index()
+        .reset_index(
+            drop=True
+        )
+    )
+
+    return pivot
+
+
+# ============================================================
+# 16. 多 Sheet Excel 导出
+# ============================================================
+
+def export_multi_sheet_excel(
+    sheets,
+    output_path="outputs/DataPilot_多Sheet分析报告.xlsx",
+):
+    """
+    将多个 DataFrame 写入同一个 Excel 文件的不同 Sheet。
+
+    sheets 示例：
+
+    {
+        "原始数据": raw_df,
+        "城市月份统计": city_month_df,
+        "部门统计": department_df,
+    }
+
+    返回生成后的 Excel 文件路径。
+    """
+    if not isinstance(
+        sheets,
+        dict,
+    ):
+        raise TypeError(
+            "sheets 必须是字典，"
+            "格式为 {Sheet名称: DataFrame}。"
+        )
+
+    if not sheets:
+        raise ValueError(
+            "至少需要提供一个 Sheet。"
+        )
+
+    output_path = Path(
+        output_path
+    )
+
+    if (
+        output_path.suffix.lower()
+        != ".xlsx"
+    ):
+        raise ValueError(
+            "多 Sheet 导出目前仅支持 .xlsx 文件。"
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    normalized_sheets = {}
+
+    for sheet_name, dataframe in (
+        sheets.items()
+    ):
+        if not isinstance(
+            dataframe,
+            pd.DataFrame,
+        ):
+            raise TypeError(
+                f"Sheet {sheet_name} 对应的数据"
+                "必须是 pandas DataFrame。"
+            )
+
+        clean_name = str(
+            sheet_name
+        ).strip()
+
+        if not clean_name:
+            raise ValueError(
+                "Sheet 名称不能为空。"
+            )
+
+        invalid_characters = [
+            "\\",
+            "/",
+            "*",
+            "?",
+            ":",
+            "[",
+            "]",
+        ]
+
+        for character in (
+            invalid_characters
+        ):
+            clean_name = (
+                clean_name.replace(
+                    character,
+                    "_",
+                )
+            )
+
+        clean_name = (
+            clean_name[:31]
+        )
+
+        if not clean_name:
+            clean_name = "Sheet"
+
+        base_name = clean_name
+        suffix_number = 2
+
+        while (
+            clean_name
+            in normalized_sheets
+        ):
+            suffix_text = (
+                f"_{suffix_number}"
+            )
+
+            max_base_length = (
+                31
+                - len(
+                    suffix_text
+                )
+            )
+
+            clean_name = (
+                base_name[
+                    :max_base_length
+                ]
+                + suffix_text
+            )
+
+            suffix_number += 1
+
+        normalized_sheets[
+            clean_name
+        ] = dataframe.copy()
+
+    try:
+        with pd.ExcelWriter(
+            output_path,
+            engine="openpyxl",
+        ) as writer:
+            for sheet_name, dataframe in (
+                normalized_sheets.items()
+            ):
+                dataframe.to_excel(
+                    writer,
+                    index=False,
+                    sheet_name=sheet_name,
+                )
+
+                worksheet = (
+                    writer.book[
+                        sheet_name
+                    ]
+                )
+
+                worksheet.freeze_panes = (
+                    "A2"
+                )
+
+                worksheet.auto_filter.ref = (
+                    worksheet.dimensions
+                )
+
+                for column_cells in (
+                    worksheet.columns
+                ):
+                    max_length = 0
+
+                    for cell in (
+                        column_cells
+                    ):
+                        cell_value = (
+                            ""
+                            if cell.value is None
+                            else str(
+                                cell.value
+                            )
+                        )
+
+                        max_length = max(
+                            max_length,
+                            len(
+                                cell_value
+                            ),
+                        )
+
+                    adjusted_width = min(
+                        max(
+                            max_length + 2,
+                            10,
+                        ),
+                        40,
+                    )
+
+                    column_letter = (
+                        column_cells[0]
+                        .column_letter
+                    )
+
+                    worksheet.column_dimensions[
+                        column_letter
+                    ].width = (
+                        adjusted_width
+                    )
+
+    except ImportError as error:
+        raise ImportError(
+            "多 Sheet Excel 导出需要 openpyxl，"
+            "请先安装：pip install openpyxl"
+        ) from error
+
+    except Exception as error:
+        raise ValueError(
+            "多 Sheet Excel 导出失败："
+            f"{error}"
+        ) from error
+
+    return str(
+        output_path
+    )
+
+
+# ============================================================
+# 17. 数据基本信息
 # ============================================================
 
 def get_data_info(df):
@@ -1504,7 +2142,7 @@ def get_data_info(df):
 
 
 # ============================================================
-# 16. 本地测试
+# 18. 本地测试
 # ============================================================
 
 if __name__ == "__main__":

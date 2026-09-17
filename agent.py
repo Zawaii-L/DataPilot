@@ -22,6 +22,8 @@ from office_data_tools import (
     select_columns,
     group_statistics,
     group_multi_statistics,
+    create_pivot_summary,
+    export_multi_sheet_excel,
     drop_columns,
     rename_columns,
     drop_duplicate_rows,
@@ -64,6 +66,8 @@ class DataPilotAgent:
     22. 缺失值处理
     23. 日期范围筛选
     24. 多字段 + 多指标分组统计
+    25. 数据透视式汇总
+    26. 多 Sheet Excel 导出
     """
 
     def __init__(
@@ -390,6 +394,12 @@ class DataPilotAgent:
             "分别统计",
             "同时统计",
             "订单数量",
+            "数据透视",
+            "透视表",
+            "多sheet",
+            "多个sheet",
+            "不同sheet",
+            "工作表",
         ]
 
         return any(
@@ -697,7 +707,70 @@ median
 如果用户只是要求一个分组字段、一个目标字段和一个统计指标，
 例如“按城市计算平均温度”，仍然可以使用 group_statistics。
 
-12. export_excel
+12. pivot_summary
+
+当用户要求“数据透视”“透视汇总”“行字段 + 列字段交叉统计”时，
+使用 pivot_summary。
+
+JSON 格式：
+
+{
+  "action": "pivot_summary",
+  "index": ["城市"],
+  "columns": ["月份"],
+  "values": ["销售额"],
+  "aggfunc": "sum",
+  "fill_value": 0,
+  "margins": true,
+  "margins_name": "总计",
+  "source": "original",
+  "save_as": "城市月份透视"
+}
+
+说明：
+
+- index：行分组字段，字符串或字段列表。
+- columns：可选的列分组字段，字符串、字段列表或 null。
+- values：需要统计的字段，字符串或字段列表。
+- aggfunc：支持 mean、sum、count、max、min、median；
+  也可以使用对象，例如：
+  {
+    "销售额": "sum",
+    "订单金额": "mean"
+  }
+- fill_value：透视结果空值填充值，通常使用 0。
+- margins：是否生成总计。
+- margins_name：总计行/列名称，默认“总计”。
+- source：
+  - "original" 表示始终使用最初读取的原始数据；
+  - 省略或使用 "current" 表示使用上一步处理后的数据。
+- save_as：把该步骤结果保存为指定 Sheet 名称，供多 Sheet Excel 导出。
+
+13. export_multi_sheet_excel
+
+当用户要求：
+- 保留原始数据；
+- 将不同分析结果放到不同 Sheet；
+- 生成多 Sheet Excel；
+- 生成包含原始数据、统计结果、透视结果的 Excel 报告；
+
+使用：
+
+{
+  "action": "export_multi_sheet_excel",
+  "include_original": true,
+  "original_sheet_name": "原始数据",
+  "output_filename": "DataPilot_多Sheet分析报告.xlsx"
+}
+
+重要：
+- 需要写入不同 Sheet 的统计/透视操作必须设置 save_as。
+- 如果某个统计操作必须基于原始数据，而不是上一个统计结果，
+  必须设置 "source": "original"。
+- export_multi_sheet_excel 应放在 operations 最后一项。
+- 多 Sheet Excel 场景不要再额外生成 export_excel，除非用户明确要求另一个单 Sheet 文件。
+
+14. export_excel
 
 {
   "action": "export_excel"
@@ -832,7 +905,24 @@ median
 25. 如果用户同时要求生成 Excel、图表和 Word 报告，
     need_excel、need_chart、need_word_report 都必须设为 true。
 
-26. 只返回 JSON。
+26. 用户要求数据透视、透视表、交叉汇总时使用 pivot_summary。
+
+27. 用户要求多个 Sheet、不同 Sheet、保留原始数据并分别输出统计结果时，
+    使用 export_multi_sheet_excel。
+
+28. 多 Sheet 任务中，需要保存到独立 Sheet 的操作必须设置 save_as。
+    例如 group_multi_statistics 可以设置：
+    "source": "original",
+    "save_as": "多字段统计"
+
+29. 当多个分析结果都应基于原始数据独立计算时，
+    每个对应操作都设置 "source": "original"，
+    不要让后一个统计错误地基于前一个统计结果继续计算。
+
+30. export_multi_sheet_excel 必须位于多 Sheet 任务 operations 的最后。
+    此时不要再添加 export_excel，除非用户明确要求额外的单 Sheet 文件。
+
+31. 只返回 JSON。
 """
 
         try:
@@ -1859,6 +1949,69 @@ median
             return dataframe, None
 
         # --------------------------------------------------------
+        # pivot_summary
+        # --------------------------------------------------------
+
+        if action == "pivot_summary":
+            index_columns = operation.get(
+                "index"
+            )
+
+            value_columns = operation.get(
+                "values"
+            )
+
+            if not index_columns:
+                raise ValueError(
+                    "pivot_summary 操作缺少 index。"
+                )
+
+            if not value_columns:
+                raise ValueError(
+                    "pivot_summary 操作缺少 values。"
+                )
+
+            self.report_progress(
+                f"[{operation_index}] 正在执行数据透视式汇总："
+                f"行字段={index_columns}，"
+                f"列字段={operation.get('columns')}，"
+                f"统计字段={value_columns}"
+            )
+
+            dataframe = create_pivot_summary(
+                df=dataframe,
+                index=index_columns,
+                columns=operation.get(
+                    "columns"
+                ),
+                values=value_columns,
+                aggfunc=operation.get(
+                    "aggfunc",
+                    "sum",
+                ),
+                fill_value=operation.get(
+                    "fill_value",
+                    0,
+                ),
+                margins=bool(
+                    operation.get(
+                        "margins",
+                        False,
+                    )
+                ),
+                margins_name=operation.get(
+                    "margins_name",
+                    "总计",
+                ),
+            )
+
+            self.report_progress(
+                f"数据透视式汇总完成，共 {len(dataframe)} 行结果。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
         # group_multi_statistics
         # --------------------------------------------------------
 
@@ -2041,6 +2194,10 @@ median
             )
         )
 
+        original_dataframe = dataframe.copy()
+
+        sheet_results = {}
+
         initial_info = get_data_info(
             dataframe
         )
@@ -2068,14 +2225,134 @@ median
                 "unknown",
             )
 
+            # ----------------------------------------------------
+            # v2.8：多 Sheet Excel 导出
+            # ----------------------------------------------------
+
+            if action == "export_multi_sheet_excel":
+                include_original = bool(
+                    operation.get(
+                        "include_original",
+                        True,
+                    )
+                )
+
+                original_sheet_name = (
+                    operation.get(
+                        "original_sheet_name",
+                        "原始数据",
+                    )
+                )
+
+                sheets_to_export = {}
+
+                if include_original:
+                    sheets_to_export[
+                        original_sheet_name
+                    ] = original_dataframe.copy()
+
+                for (
+                    sheet_name,
+                    sheet_dataframe,
+                ) in sheet_results.items():
+                    sheets_to_export[
+                        sheet_name
+                    ] = sheet_dataframe.copy()
+
+                if not sheets_to_export:
+                    sheets_to_export[
+                        "处理结果"
+                    ] = dataframe.copy()
+
+                output_filename = (
+                    operation.get(
+                        "output_filename",
+                        "DataPilot_多Sheet分析报告.xlsx",
+                    )
+                )
+
+                output_filename = Path(
+                    str(output_filename)
+                ).name
+
+                if not output_filename.lower().endswith(
+                    ".xlsx"
+                ):
+                    output_filename += ".xlsx"
+
+                self.report_progress(
+                    f"[{index}] 正在导出多 Sheet Excel："
+                    f"{list(sheets_to_export.keys())}"
+                )
+
+                excel_path = export_multi_sheet_excel(
+                    sheets=sheets_to_export,
+                    output_path=str(
+                        output_dir
+                        / output_filename
+                    ),
+                )
+
+                self.report_progress(
+                    f"多 Sheet Excel 导出完成：{excel_path}"
+                )
+
+                execution_log.append(
+                    {
+                        "step": index,
+                        "action": action,
+                        "operation": operation,
+                        "rows_after": int(
+                            len(dataframe)
+                        ),
+                        "columns_after": int(
+                            len(dataframe.columns)
+                        ),
+                    }
+                )
+
+                continue
+
+            # ----------------------------------------------------
+            # v2.8：允许某个统计步骤重新基于原始数据执行
+            # ----------------------------------------------------
+
+            source_name = str(
+                operation.get(
+                    "source",
+                    "current",
+                )
+            ).strip().lower()
+
+            if source_name == "original":
+                operation_dataframe = (
+                    original_dataframe.copy()
+                )
+
+            else:
+                operation_dataframe = dataframe
+
             dataframe, generated_path = (
                 self.execute_office_operation(
-                    dataframe=dataframe,
+                    dataframe=operation_dataframe,
                     operation=operation,
                     output_dir=output_dir,
                     operation_index=index,
                 )
             )
+
+            save_as = operation.get(
+                "save_as"
+            )
+
+            if save_as:
+                sheet_results[
+                    str(save_as)
+                ] = dataframe.copy()
+
+                self.report_progress(
+                    f"已保存分析结果 Sheet：{save_as}"
+                )
 
             execution_log.append(
                 {
@@ -2109,7 +2386,10 @@ median
         has_export_operation = any(
             isinstance(operation, dict)
             and operation.get("action")
-            == "export_excel"
+            in [
+                "export_excel",
+                "export_multi_sheet_excel",
+            ]
             for operation in operations
         )
 
@@ -2292,6 +2572,8 @@ median
 
             "raw_result": {
                 "final_dataframe": dataframe,
+                "original_dataframe": original_dataframe,
+                "sheet_results": sheet_results,
                 "execution_log": (
                     execution_log
                 ),
