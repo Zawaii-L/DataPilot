@@ -23,6 +23,9 @@ from office_data_tools import (
     group_statistics,
     drop_columns,
     rename_columns,
+    drop_duplicate_rows,
+    handle_missing_values,
+    filter_date_range,
     export_office_result,
     get_data_info,
 )
@@ -56,6 +59,9 @@ class DataPilotAgent:
     18. 字段重命名
     19. 分组统计
     20. 多步骤工具连续执行
+    21. 重复数据删除
+    22. 缺失值处理
+    23. 日期范围筛选
     """
 
     def __init__(
@@ -369,6 +375,14 @@ class DataPilotAgent:
             "合计",
             "求和",
             "中位数",
+            "去重",
+            "重复数据",
+            "重复值",
+            "缺失值",
+            "空值",
+            "填充",
+            "日期范围",
+            "时间范围",
         ]
 
         return any(
@@ -458,6 +472,9 @@ task_type 可使用：
 - 最大值
 - 最小值
 - 中位数
+- 删除重复数据
+- 处理缺失值
+- 按日期范围筛选
 - 最后导出 Excel
 
 则：
@@ -572,7 +589,49 @@ max
 min
 median
 
-8. export_excel
+8. drop_duplicates
+
+{
+  "action": "drop_duplicates",
+  "columns": null,
+  "keep": "first"
+}
+
+columns 为 null 表示按全部字段去重。
+也可以使用字段列表，例如 ["城市", "日期"]。
+keep 只允许 first、last 或 false。
+
+9. handle_missing
+
+{
+  "action": "handle_missing",
+  "columns": ["温度"],
+  "method": "mean",
+  "fill_value": null
+}
+
+method 只允许：
+
+drop
+fill
+mean
+median
+mode
+
+当 method = fill 时必须提供 fill_value。
+
+10. filter_date_range
+
+{
+  "action": "filter_date_range",
+  "column": "日期",
+  "start_date": "2026-09-03",
+  "end_date": "2026-09-06"
+}
+
+start_date 和 end_date 至少提供一个。
+
+11. export_excel
 
 {
   "action": "export_excel"
@@ -683,7 +742,21 @@ median
 18. 不要猜测不存在的列名。
     列名必须尽量严格按照用户描述填写。
 
-19. 只返回 JSON。
+19. 用户要求“去重”“删除重复数据”时使用 drop_duplicates。
+    如果没有指定判断重复的字段，columns 使用 null。
+
+20. 用户要求处理缺失值时使用 handle_missing。
+    “平均值填充”使用 mean；“中位数填充”使用 median；
+    “众数填充”使用 mode；“删除缺失记录”使用 drop；
+    “填充为某个固定值”使用 fill 并设置 fill_value。
+
+21. 用户要求按日期或时间范围保留数据时使用 filter_date_range。
+    必须填写日期字段 column，并按用户要求设置 start_date / end_date。
+
+22. 如果用户同时要求去重、缺失值处理、日期筛选，
+    operations 必须严格按照用户描述的执行顺序生成。
+
+23. 只返回 JSON。
 """
 
         try:
@@ -1607,6 +1680,104 @@ median
 
             self.report_progress(
                 "字段重命名完成。"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # drop_duplicates
+        # --------------------------------------------------------
+
+        if action == "drop_duplicates":
+            columns = operation.get("columns")
+            keep = operation.get("keep", "first")
+
+            if keep is None:
+                keep = "first"
+
+            before_rows = len(dataframe)
+
+            self.report_progress(
+                f"[{operation_index}] 正在删除重复数据……"
+            )
+
+            dataframe = drop_duplicate_rows(
+                df=dataframe,
+                columns=columns,
+                keep=keep,
+            )
+
+            after_rows = len(dataframe)
+
+            self.report_progress(
+                f"去重完成：{before_rows} 行 → {after_rows} 行"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # handle_missing
+        # --------------------------------------------------------
+
+        if action == "handle_missing":
+            columns = operation.get("columns")
+            method = operation.get("method", "drop")
+            fill_value = operation.get("fill_value")
+
+            before_missing = int(dataframe.isna().sum().sum())
+
+            self.report_progress(
+                f"[{operation_index}] 正在处理缺失值："
+                f"字段={columns}，方式={method}"
+            )
+
+            dataframe = handle_missing_values(
+                df=dataframe,
+                columns=columns,
+                method=method,
+                fill_value=fill_value,
+            )
+
+            after_missing = int(dataframe.isna().sum().sum())
+
+            self.report_progress(
+                f"缺失值处理完成：{before_missing} 个 → {after_missing} 个"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # filter_date_range
+        # --------------------------------------------------------
+
+        if action == "filter_date_range":
+            column = operation.get("column")
+            start_date = operation.get("start_date")
+            end_date = operation.get("end_date")
+
+            if not column:
+                raise ValueError(
+                    "filter_date_range 操作缺少 column。"
+                )
+
+            before_rows = len(dataframe)
+
+            self.report_progress(
+                f"[{operation_index}] 正在筛选日期范围："
+                f"{column}，{start_date} 至 {end_date}"
+            )
+
+            dataframe = filter_date_range(
+                df=dataframe,
+                column=column,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+            after_rows = len(dataframe)
+
+            self.report_progress(
+                f"日期筛选完成：{before_rows} 行 → {after_rows} 行"
             )
 
             return dataframe, None
