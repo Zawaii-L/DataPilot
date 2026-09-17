@@ -11,6 +11,7 @@ from batch_data_tools import run_batch_pipeline
 from data_tools import run_data_pipeline
 from report_generator import generate_word_report
 from web_data_tools import download_data_file
+from office_report_tools import generate_office_deliverables
 
 from office_data_tools import (
     read_office_data,
@@ -1872,6 +1873,66 @@ median
                 f"办公任务结果已保存：{excel_path}"
             )
 
+        # --------------------------------------------------------
+        # 根据自然语言任务要求生成 Office 图表 / Word 报告
+        # --------------------------------------------------------
+
+        need_chart = bool(
+            plan.get(
+                "need_chart",
+                False,
+            )
+        )
+
+        need_word_report = bool(
+            plan.get(
+                "need_word_report",
+                False,
+            )
+        )
+
+        chart_path = None
+        word_path = None
+
+        if need_chart or need_word_report:
+            if need_chart:
+                self.report_progress(
+                    "正在生成 Office 数据图表……"
+                )
+
+            if need_word_report:
+                self.report_progress(
+                    "正在生成 Office Word 分析报告……"
+                )
+
+            deliverables = generate_office_deliverables(
+                user_task=user_task,
+                dataframe=dataframe,
+                execution_log=execution_log,
+                source_files=source_files,
+                output_dir=output_dir,
+                need_chart=need_chart,
+                need_word_report=need_word_report,
+            )
+
+            chart_path = deliverables.get(
+                "chart_path"
+            )
+
+            word_path = deliverables.get(
+                "word_path"
+            )
+
+            if chart_path:
+                self.report_progress(
+                    f"Office 数据图表生成完成：{chart_path}"
+                )
+
+            if word_path:
+                self.report_progress(
+                    f"Office Word 分析报告生成完成：{word_path}"
+                )
+
         final_info = get_data_info(
             dataframe
         )
@@ -1909,11 +1970,11 @@ median
 
             "statistics_path": None,
 
-            "chart_path": None,
+            "chart_path": chart_path,
 
-            "plot_path": None,
+            "plot_path": chart_path,
 
-            "word_path": None,
+            "word_path": word_path,
 
             "before_quality": {},
 
