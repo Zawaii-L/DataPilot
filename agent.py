@@ -12,6 +12,11 @@ from data_tools import run_data_pipeline
 from report_generator import generate_word_report
 from web_data_tools import download_data_file
 from office_report_tools import generate_office_deliverables
+from file_discovery_tools import (
+    discover_data_files,
+    inspect_data_files,
+    build_file_catalog_text,
+)
 
 from office_data_tools import (
     read_office_data,
@@ -68,6 +73,9 @@ class DataPilotAgent:
     24. 多字段 + 多指标分组统计
     25. 数据透视式汇总
     26. 多 Sheet Excel 导出
+    27. 文件夹数据文件自动发现
+    28. Excel Sheet / 字段结构探测
+    29. 大模型智能选择任务所需文件
     """
 
     def __init__(
@@ -405,6 +413,251 @@ class DataPilotAgent:
         return any(
             keyword in text
             for keyword in keywords
+        )
+
+    # ============================================================
+    # v2.9：文件自动发现与智能选择
+    # ============================================================
+
+    def discover_candidate_files(
+        self,
+        input_paths=None,
+    ) -> List[Dict[str, Any]]:
+        """
+        根据输入路径发现可用 CSV / Excel 文件。
+
+        - 文件路径：直接加入候选集；
+        - 文件夹路径：递归扫描其中的数据文件；
+        - 没有输入路径：扫描当前工作目录。
+        """
+
+        paths = input_paths or []
+
+        if isinstance(paths, (str, Path)):
+            paths = [paths]
+
+        file_infos = []
+        seen = set()
+
+        def add_info(info):
+            file_path = info.get("file_path")
+            if not file_path:
+                return
+
+            key = os.path.normcase(
+                str(Path(file_path).resolve())
+            )
+
+            if key in seen:
+                return
+
+            seen.add(key)
+            file_infos.append(info)
+
+        if not paths:
+            self.report_progress(
+                f"未指定明确数据文件，正在扫描当前目录：{Path.cwd()}"
+            )
+
+            for info in discover_data_files(
+                Path.cwd(),
+                recursive=False,
+            ):
+                add_info(info)
+
+            return file_infos
+
+        for item in paths:
+            path = Path(item)
+
+            if not path.exists():
+                continue
+
+            if path.is_dir():
+                self.report_progress(
+                    f"正在扫描数据文件夹：{path}"
+                )
+
+                for info in discover_data_files(
+                    path,
+                    recursive=True,
+                ):
+                    add_info(info)
+
+            elif (
+                path.is_file()
+                and path.suffix.lower() in [".csv", ".xlsx", ".xls"]
+            ):
+                for info in inspect_data_files([str(path)]):
+                    add_info(info)
+
+        return file_infos
+
+    def select_files_with_llm(
+        self,
+        user_task: str,
+        file_infos: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        将文件画像交给大模型，让模型根据用户任务选择真正需要的数据文件。
+
+        这里只允许模型从候选目录中选择，不能编造路径。
+        """
+
+        usable_infos = [
+            item
+            for item in file_infos
+            if item.get("inspection_success", False)
+        ]
+
+        if not usable_infos:
+            return []
+
+        if len(usable_infos) == 1:
+            selected = usable_infos[0].get("file_path")
+            return [selected] if selected else []
+
+        catalog_text = build_file_catalog_text(usable_infos)
+
+        system_prompt = """
+你是 DataPilot 的文件选择模块。
+
+你的任务是根据“用户任务”和“候选数据文件目录”，选择完成任务真正需要的 CSV / Excel 文件。
+
+严格规则：
+1. 只能从候选目录中选择文件，绝对不能编造文件名或路径。
+2. 优先根据文件名、Sheet 名、字段名以及用户描述判断。
+3. 用户要求合并某一时间段、某一主题的多个文件时，可以选择多个文件。
+4. 与任务明显无关的文件不要选择。
+5. 如果用户明确指定了某类字段，优先选择包含这些字段的文件。
+6. 如果存在唯一明显匹配文件，只选择该文件。
+7. 如果没有足够依据判断，selected_files 返回空数组，不要猜。
+8. selected_files 中必须返回候选目录里提供的完整 file_path。
+9. 只返回合法 JSON，不要 Markdown，不要解释。
+
+返回格式：
+{
+  "selected_files": ["完整路径1", "完整路径2"],
+  "reason": "简短说明选择依据"
+}
+"""
+
+        user_content = (
+            f"用户任务：\n{user_task}\n\n"
+            f"候选数据文件目录：\n{catalog_text}"
+        )
+
+        self.report_progress(
+            f"发现 {len(usable_infos)} 个候选数据文件，正在让大模型选择任务所需文件……"
+        )
+
+        try:
+            response = (
+                self.client
+                .chat
+                .completions
+                .create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_content,
+                        },
+                    ],
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                )
+            )
+
+            content = response.choices[0].message.content
+            selection = json.loads(content or "{}")
+            requested_paths = selection.get("selected_files", [])
+
+            if not isinstance(requested_paths, list):
+                requested_paths = []
+
+            allowed = {
+                os.path.normcase(str(Path(item["file_path"]).resolve())):
+                str(Path(item["file_path"]).resolve())
+                for item in usable_infos
+                if item.get("file_path")
+            }
+
+            selected_files = []
+
+            for item in requested_paths:
+                try:
+                    key = os.path.normcase(str(Path(str(item)).resolve()))
+                except Exception:
+                    continue
+
+                if key in allowed and allowed[key] not in selected_files:
+                    selected_files.append(allowed[key])
+
+            reason = selection.get("reason")
+
+            if reason:
+                self.report_progress(
+                    f"文件选择依据：{reason}"
+                )
+
+            if selected_files:
+                self.report_progress(
+                    "大模型已选择数据文件："
+                    + ", ".join(Path(item).name for item in selected_files)
+                )
+
+            return selected_files
+
+        except Exception as error:
+            self.report_progress(
+                f"智能文件选择失败：{error}"
+            )
+            return []
+
+    # ============================================================
+    # v2.9：是否需要在已提供的多个文件中进行语义筛选
+    # ============================================================
+
+    def wants_semantic_file_selection(
+        self,
+        user_task: str,
+    ) -> bool:
+        """
+        判断用户是否要求 Agent 自己从候选文件中寻找符合条件的数据文件。
+
+        这用于 GUI 场景：GUI 选择文件夹后可能会先展开成大量文件路径，
+        此时仍应让 Agent 根据任务语义筛选，而不是把整个文件夹全部合并。
+        """
+
+        text = str(user_task or "").lower()
+
+        discovery_keywords = [
+            "自动找到",
+            "自动查找",
+            "自动寻找",
+            "找到所有",
+            "找出所有",
+            "查找所有",
+            "寻找所有",
+            "符合条件的文件",
+            "包含字段的",
+            "包含这些字段",
+            "从这个文件夹",
+            "从文件夹",
+            "在这个文件夹",
+            "在文件夹",
+            "从目录",
+            "在目录",
+        ]
+
+        return any(
+            keyword in text
+            for keyword in discovery_keywords
         )
 
     # ============================================================
@@ -922,7 +1175,26 @@ JSON 格式：
 30. export_multi_sheet_excel 必须位于多 Sheet 任务 operations 的最后。
     此时不要再添加 export_excel，除非用户明确要求额外的单 Sheet 文件。
 
-31. 只返回 JSON。
+31. v2.9 数据源规则：
+    当用户先执行合并、去重、缺失值处理、筛选等明细数据预处理，
+    然后要求多个统计结果都独立基于“处理后的明细数据”计算时，
+    后续统计操作的 source 必须使用 "analysis_base"，不要使用 "original"。
+
+32. source 含义：
+    - "original"：最初读取/合并后、任何后续处理之前的数据；
+    - "analysis_base"：最近完成的明细级预处理结果，例如去重、筛选、缺失值处理后的数据；
+    - "current"：上一个操作的当前结果。
+
+33. 如果多 Sheet Excel 中用户要求“原始数据 Sheet”实际保存的是
+    “合并并去重后的数据”“清洗后的数据”“筛选后的明细数据”，
+    export_multi_sheet_excel 必须增加：
+    "original_sheet_source": "analysis_base"。
+
+34. 例如：合并 → 去重 → 城市统计 → 城市日期透视，且两个统计都要求基于去重后的数据，
+    则 group_multi_statistics 和 pivot_summary 都使用 "source": "analysis_base"；
+    export_multi_sheet_excel 使用 "original_sheet_source": "analysis_base"。
+
+35. 只返回 JSON。
 """
 
         try:
@@ -2196,6 +2468,11 @@ JSON 格式：
 
         original_dataframe = dataframe.copy()
 
+        # v2.9：analysis_base_dataframe 表示完成合并、去重、缺失值处理、
+        # 筛选等行级预处理后的“分析基准数据”。后续多个统计结果可以
+        # 独立基于这一份数据计算，避免第二个统计错误地基于第一个统计结果。
+        analysis_base_dataframe = dataframe.copy()
+
         sheet_results = {}
 
         initial_info = get_data_info(
@@ -2247,9 +2524,29 @@ JSON 格式：
                 sheets_to_export = {}
 
                 if include_original:
+                    original_sheet_source = str(
+                        operation.get(
+                            "original_sheet_source",
+                            "original",
+                        )
+                    ).strip().lower()
+
+                    if original_sheet_source in [
+                        "analysis_base",
+                        "processed_base",
+                        "cleaned",
+                    ]:
+                        export_original_dataframe = (
+                            analysis_base_dataframe.copy()
+                        )
+                    else:
+                        export_original_dataframe = (
+                            original_dataframe.copy()
+                        )
+
                     sheets_to_export[
                         original_sheet_name
-                    ] = original_dataframe.copy()
+                    ] = export_original_dataframe
 
                 for (
                     sheet_name,
@@ -2329,6 +2626,15 @@ JSON 格式：
                     original_dataframe.copy()
                 )
 
+            elif source_name in [
+                "analysis_base",
+                "processed_base",
+                "cleaned",
+            ]:
+                operation_dataframe = (
+                    analysis_base_dataframe.copy()
+                )
+
             else:
                 operation_dataframe = dataframe
 
@@ -2340,6 +2646,22 @@ JSON 格式：
                     operation_index=index,
                 )
             )
+
+            # v2.9：这些操作仍然产生“明细级数据”，因此更新分析基准。
+            # 分组统计、透视等聚合操作不会覆盖分析基准。
+            if action in [
+                "merge",
+                "filter",
+                "apply_filters",
+                "sort",
+                "select_columns",
+                "drop_columns",
+                "rename_columns",
+                "drop_duplicates",
+                "handle_missing",
+                "filter_date_range",
+            ]:
+                analysis_base_dataframe = dataframe.copy()
 
             save_as = operation.get(
                 "save_as"
@@ -2617,7 +2939,88 @@ JSON 格式：
         )
 
         # --------------------------------------------------------
-        # 1. LLM 生成任务计划
+        # 1. 整理显式输入，并在需要时自动发现 / 选择文件
+        # --------------------------------------------------------
+
+        explicit_file_inputs = False
+
+        if input_paths:
+            normalized_paths = self.normalize_input_paths(
+                input_paths=input_paths,
+                file_path=file_path,
+            )
+
+            explicit_file_inputs = any(
+                Path(item).is_file()
+                for item in normalized_paths
+                if Path(item).exists()
+            )
+
+            contains_folder = self.contains_directory(
+                normalized_paths
+            )
+
+            if contains_folder:
+                file_infos = self.discover_candidate_files(
+                    normalized_paths
+                )
+
+                selected_files = self.select_files_with_llm(
+                    user_task=user_task,
+                    file_infos=file_infos,
+                )
+
+                if selected_files:
+                    normalized_paths = selected_files
+
+            elif (
+                len(normalized_paths) > 1
+                and self.wants_semantic_file_selection(user_task)
+            ):
+                self.report_progress(
+                    f"检测到文件夹型语义任务，正在从 "
+                    f"{len(normalized_paths)} 个已提供文件中筛选真正需要的数据文件……"
+                )
+
+                file_infos = self.discover_candidate_files(
+                    normalized_paths
+                )
+
+                selected_files = self.select_files_with_llm(
+                    user_task=user_task,
+                    file_infos=file_infos,
+                )
+
+                if selected_files:
+                    normalized_paths = selected_files
+
+        else:
+            extracted_paths = self.extract_local_files(
+                user_task
+            )
+
+            normalized_paths = self.normalize_input_paths(
+                input_paths=extracted_paths,
+                file_path=file_path,
+            )
+
+            explicit_file_inputs = bool(normalized_paths)
+
+            if not normalized_paths:
+                file_infos = self.discover_candidate_files()
+
+                selected_files = self.select_files_with_llm(
+                    user_task=user_task,
+                    file_infos=file_infos,
+                )
+
+                if selected_files:
+                    normalized_paths = self.normalize_input_paths(
+                        input_paths=selected_files
+                    )
+
+        # --------------------------------------------------------
+        # 2. LLM 生成任务执行计划
         # --------------------------------------------------------
 
         plan = self.plan_task(
@@ -2635,32 +3038,6 @@ JSON 格式：
                 indent=2,
             )
         )
-
-        # --------------------------------------------------------
-        # 2. 整理本地输入文件
-        # --------------------------------------------------------
-
-        if input_paths:
-            normalized_paths = (
-                self.normalize_input_paths(
-                    input_paths=input_paths,
-                    file_path=file_path,
-                )
-            )
-
-        else:
-            extracted_paths = (
-                self.extract_local_files(
-                    user_task
-                )
-            )
-
-            normalized_paths = (
-                self.normalize_input_paths(
-                    input_paths=extracted_paths,
-                    file_path=file_path,
-                )
-            )
 
         # --------------------------------------------------------
         # 3. 去重
