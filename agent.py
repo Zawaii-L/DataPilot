@@ -787,10 +787,65 @@ JSON 格式如下：
             )
         )
 
-        normalized_paths = self.normalize_input_paths(
-            input_paths=input_paths,
-            file_path=file_path
-        )
+        # ========================================================
+        # 自动从自然语言任务中提取 CSV / Excel 文件名
+        # ========================================================
+        extracted_paths = []
+
+        # 只有在调用方没有明确传入 input_paths 时，
+        # 才从用户自然语言中自动提取文件名。
+        if not input_paths:
+            file_patterns = re.findall(
+                r'(?<![\w./\\-])'
+                r'([^\s，。,；;、"“”\'‘’<>（）()\[\]{}]+'
+                r'\.(?:csv|xlsx|xls))'
+                r'(?![\w])',
+                user_task,
+                flags=re.IGNORECASE
+            )
+
+            for item in file_patterns:
+                cleaned_item = item.strip().strip(
+                    '，。,；;、"“”\'‘’<>（）()[]{}'
+                )
+
+                if not cleaned_item:
+                    continue
+
+                candidate_path = Path(cleaned_item)
+
+                # 相对路径默认相对于当前项目目录
+                if not candidate_path.is_absolute():
+                    candidate_path = Path.cwd() / candidate_path
+
+                if candidate_path.exists() and candidate_path.is_file():
+                    extracted_paths.append(str(candidate_path.resolve()))
+
+        # 显式传入的 input_paths 优先；
+        # 如果没有 input_paths，则使用自动提取的文件列表。
+        if input_paths:
+            normalized_paths = self.normalize_input_paths(
+                input_paths=input_paths,
+                file_path=file_path
+            )
+        else:
+            normalized_paths = self.normalize_input_paths(
+                input_paths=extracted_paths,
+                file_path=file_path
+            )
+
+        # 去重，同时保持文件出现顺序
+        unique_paths = []
+        seen_paths = set()
+
+        for item in normalized_paths:
+            resolved_item = str(Path(item).resolve())
+
+            if resolved_item not in seen_paths:
+                seen_paths.add(resolved_item)
+                unique_paths.append(resolved_item)
+
+        normalized_paths = unique_paths
 
         urls = self.extract_urls(user_task)
         downloaded_files = []
