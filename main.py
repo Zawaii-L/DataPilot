@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import traceback
+from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -20,13 +21,12 @@ from PySide6.QtWidgets import (
     QListWidget,
 )
 
-
 from agent import DataPilotAgent
 
 
 class AgentWorker(QThread):
     """
-    后台执行 Agent 任务，避免桌面窗口卡死。
+    后台执行 DataPilot Agent 任务，避免主界面卡死。
     """
 
     log_signal = Signal(str)
@@ -45,20 +45,24 @@ class AgentWorker(QThread):
         self.input_paths = input_paths
         self.output_dir = output_dir
 
+    def report_progress(self, message):
+        """
+        将 Agent 内部的进度消息转发给 GUI。
+        """
+        self.log_signal.emit(str(message))
+
     def run(self):
         try:
             self.log_signal.emit(
-                "正在初始化 DataPilot Agent..."
+                "正在初始化 DataPilot Agent……"
             )
 
-            agent = DataPilotAgent()
+            agent = DataPilotAgent(
+                progress_callback=self.report_progress
+            )
 
             self.log_signal.emit(
                 "DataPilot Agent 初始化成功。"
-            )
-            self.log_signal.emit("")
-            self.log_signal.emit(
-                "正在分析任务，请稍候..."
             )
             self.log_signal.emit("")
 
@@ -68,15 +72,13 @@ class AgentWorker(QThread):
                 output_dir=self.output_dir,
             )
 
-            if result.get("success"):
-                self.success_signal.emit(result)
-            else:
+            if not isinstance(result, dict):
                 self.error_signal.emit(
-                    result.get(
-                        "message",
-                        "任务执行失败。",
-                    )
+                    "Agent 返回结果不是字典。"
                 )
+                return
+
+            self.success_signal.emit(result)
 
         except Exception:
             error_message = traceback.format_exc()
@@ -84,6 +86,9 @@ class AgentWorker(QThread):
 
 
 class DataPilotWindow(QWidget):
+    """
+    DataPilot 桌面端主窗口。
+    """
 
     def __init__(self):
         super().__init__()
@@ -126,8 +131,11 @@ class DataPilotWindow(QWidget):
 
         subtitle_label = QLabel(
             "用自然语言描述任务，Agent 自动完成数据获取、"
-            "清洗、分析和报告生成。支持单文件、多文件和文件夹。"
+            "数据清洗、统计分析和报告生成。"
+            "支持单文件、多文件、文件夹和网络数据。"
         )
+
+        subtitle_label.setWordWrap(True)
 
         subtitle_label.setStyleSheet(
             """
@@ -155,10 +163,10 @@ class DataPilotWindow(QWidget):
 
         self.task_input.setPlaceholderText(
             "例如：\n"
-            "帮我分析这些天气数据，检查缺失值和重复值，"
-            "清洗后生成统计图、Excel和Word报告。\n\n"
-            "也可以直接输入网络数据网址：\n"
-            "请下载这个CSV文件并分析：\n"
+            "请分析这些天气数据，检查缺失值和重复值，"
+            "清洗后生成统计图、Excel 和 Word 报告。\n\n"
+            "也可以直接输入网络数据地址：\n"
+            "请下载这个 CSV 文件并分析：\n"
             "https://example.com/data.csv"
         )
 
@@ -606,17 +614,12 @@ class DataPilotWindow(QWidget):
             task
         )
 
+        # 如果没有手动选择本地文件，也没有 URL，
+        # 仍然允许执行，让 agent.py 自动从自然语言中识别文件名。
         if not self.selected_paths and not urls:
-            QMessageBox.warning(
-                self,
-                "提示",
-                (
-                    "请先选择一个本地文件、多个文件、"
-                    "文件夹，或者在任务中提供可下载的数据网址。"
-                ),
+            self.append_log(
+                "未手动选择文件，将尝试从任务文本中自动识别本地数据文件。"
             )
-
-            return
 
         if output_dir:
             os.makedirs(
@@ -673,12 +676,12 @@ class DataPilotWindow(QWidget):
 
         else:
             self.append_log(
-                "数据来源：网络网址"
+                "数据来源：由 Agent 自动识别或从网络下载"
             )
 
         if urls:
             self.append_log(
-                f"识别到网络网址：{urls[0]}"
+                f"识别到网络地址：{urls[0]}"
             )
 
         self.append_log(
@@ -691,31 +694,7 @@ class DataPilotWindow(QWidget):
         # 禁用控件
         # ====================================================
 
-        self.run_button.setEnabled(
-            False
-        )
-
-        self.file_button.setEnabled(
-            False
-        )
-
-        self.multi_file_button.setEnabled(
-            False
-        )
-
-        self.folder_button.setEnabled(
-            False
-        )
-
-        self.clear_file_button.setEnabled(
-            False
-        )
-
-        self.output_button.setEnabled(
-            False
-        )
-
-        self.clear_output_button.setEnabled(
+        self.set_controls_enabled(
             False
         )
 
@@ -752,6 +731,43 @@ class DataPilotWindow(QWidget):
         self.worker.start()
 
     # ========================================================
+    # 统一控制控件状态
+    # ========================================================
+
+    def set_controls_enabled(self, enabled):
+        self.run_button.setEnabled(
+            enabled
+        )
+
+        self.file_button.setEnabled(
+            enabled
+        )
+
+        self.multi_file_button.setEnabled(
+            enabled
+        )
+
+        self.folder_button.setEnabled(
+            enabled
+        )
+
+        self.clear_file_button.setEnabled(
+            enabled
+        )
+
+        self.output_button.setEnabled(
+            enabled
+        )
+
+        self.clear_output_button.setEnabled(
+            enabled
+        )
+
+        self.clear_button.setEnabled(
+            enabled
+        )
+
+    # ========================================================
     # 任务成功
     # ========================================================
 
@@ -763,7 +779,7 @@ class DataPilotWindow(QWidget):
         )
 
         self.append_log(
-            "任务执行成功！"
+            "任务执行成功"
         )
 
         self.append_log(
@@ -789,6 +805,11 @@ class DataPilotWindow(QWidget):
             "source_files"
         )
 
+        if not source_files:
+            source_files = result.get(
+                "input_paths"
+            )
+
         if source_files:
             self.append_log("")
 
@@ -812,11 +833,28 @@ class DataPilotWindow(QWidget):
                 f"实际处理的数据文件：\n{source_file}"
             )
 
+        downloaded_files = result.get(
+            "downloaded_files",
+            []
+        )
+
+        if downloaded_files:
+            self.append_log("")
+
+            self.append_log(
+                "网络下载文件："
+            )
+
+            for downloaded_file in downloaded_files:
+                self.append_log(
+                    f"  - {downloaded_file}"
+                )
+
         downloaded_file = result.get(
             "downloaded_file"
         )
 
-        if downloaded_file:
+        if downloaded_file and not downloaded_files:
             self.append_log("")
 
             self.append_log(
@@ -842,7 +880,7 @@ class DataPilotWindow(QWidget):
             self.append_log("")
 
             self.append_log(
-                f"统计文件：\n{statistics_path}"
+                f"统计结果文件：\n{statistics_path}"
             )
 
         chart_path = result.get(
@@ -922,41 +960,19 @@ class DataPilotWindow(QWidget):
         )
 
     # ========================================================
-    # 任务结束，恢复按钮
+    # 任务结束，恢复控件
     # ========================================================
 
     def task_finished(self):
-        self.run_button.setEnabled(
-            True
-        )
-
-        self.file_button.setEnabled(
-            True
-        )
-
-        self.multi_file_button.setEnabled(
-            True
-        )
-
-        self.folder_button.setEnabled(
-            True
-        )
-
-        self.clear_file_button.setEnabled(
-            True
-        )
-
-        self.output_button.setEnabled(
-            True
-        )
-
-        self.clear_output_button.setEnabled(
+        self.set_controls_enabled(
             True
         )
 
         self.progress_bar.setVisible(
             False
         )
+
+        self.worker = None
 
     # ========================================================
     # 日志
@@ -967,11 +983,17 @@ class DataPilotWindow(QWidget):
             str(message)
         )
 
+        # 自动滚动到日志底部
+        scrollbar = self.log_output.verticalScrollBar()
+        scrollbar.setValue(
+            scrollbar.maximum()
+        )
+
     def clear_log(self):
         self.log_output.clear()
 
     # ========================================================
-    # 提取网址
+    # 提取网络地址
     # ========================================================
 
     @staticmethod
@@ -990,11 +1012,13 @@ class DataPilotWindow(QWidget):
 
         for url in urls:
             url = url.rstrip(
-                "，。；、,.!?！？）)】]"
+                "，。,；;。.!！？!?）)]}"
             )
 
             if url not in cleaned_urls:
-                cleaned_urls.append(url)
+                cleaned_urls.append(
+                    url
+                )
 
         return cleaned_urls
 
