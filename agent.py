@@ -17,6 +17,14 @@ from file_discovery_tools import (
     inspect_data_files,
     build_file_catalog_text,
 )
+from document_tools import (
+    SUPPORTED_DOCUMENT_EXTENSIONS,
+    inspect_documents,
+    read_document,
+    scan_document_files,
+)
+from document_selector import select_documents_with_llm
+from document_report_tools import generate_document_summary_report
 
 from office_data_tools import (
     read_office_data,
@@ -76,6 +84,11 @@ class DataPilotAgent:
     27. 文件夹数据文件自动发现
     28. Excel Sheet / 字段结构探测
     29. 大模型智能选择任务所需文件
+    30. Word / PDF / TXT / Markdown 文档读取
+    31. 办公文档语义选择
+    32. 多文档全文综合与摘要
+    33. 文档综合结果自动生成 Word 报告
+    34. CSV / Excel + Word / PDF 跨格式混合办公任务
     """
 
     def __init__(
@@ -2406,6 +2419,418 @@ JSON 格式：
         )
 
     # ============================================================
+    # v3.0：LLM 办公计划字段校验与自动纠正
+    # ============================================================
+
+    def resolve_dataframe_column(
+        self,
+        requested_column,
+        actual_columns,
+    ):
+        """
+        将 LLM 计划中的字段名映射到 DataFrame 的真实字段名。
+
+        优先级：
+        1. 完全一致；
+        2. 忽略空格 / 下划线 / 横线 / 大小写后完全一致；
+        3. 唯一包含关系，例如“温度” -> “平均温度”；
+        4. 无法唯一判断时保留原值，让底层工具继续严格报错，
+           避免静默映射到错误字段。
+        """
+
+        if requested_column is None:
+            return None
+
+        requested_text = str(requested_column).strip()
+
+        if not requested_text:
+            return requested_column
+
+        actual_list = [
+            str(column)
+            for column in actual_columns
+        ]
+
+        if requested_text in actual_list:
+            return requested_text
+
+        def normalize_name(value):
+            return re.sub(
+                r"[\\s_\\-（）()\\[\\]【】]+",
+                "",
+                str(value),
+            ).lower()
+
+        requested_normalized = normalize_name(
+            requested_text
+        )
+
+        exact_normalized_matches = [
+            column
+            for column in actual_list
+            if normalize_name(column)
+            == requested_normalized
+        ]
+
+        if len(exact_normalized_matches) == 1:
+            return exact_normalized_matches[0]
+
+        contains_matches = [
+            column
+            for column in actual_list
+            if (
+                requested_normalized
+                in normalize_name(column)
+                or normalize_name(column)
+                in requested_normalized
+            )
+        ]
+
+        if len(contains_matches) == 1:
+            return contains_matches[0]
+
+        return requested_column
+
+    def resolve_dataframe_columns(
+        self,
+        requested_columns,
+        actual_columns,
+    ):
+        """
+        批量纠正字段名，同时保留输入的字符串 / 列表形式。
+        """
+
+        if requested_columns is None:
+            return None
+
+        if isinstance(
+            requested_columns,
+            (str, int, float),
+        ):
+            return self.resolve_dataframe_column(
+                requested_columns,
+                actual_columns,
+            )
+
+        if isinstance(
+            requested_columns,
+            (list, tuple),
+        ):
+            resolved = []
+
+            for column in requested_columns:
+                mapped = self.resolve_dataframe_column(
+                    column,
+                    actual_columns,
+                )
+
+                if mapped not in resolved:
+                    resolved.append(mapped)
+
+            return resolved
+
+        return requested_columns
+
+    def infer_dedup_columns_from_task(
+        self,
+        user_task: str,
+        actual_columns,
+    ) -> List[str]:
+        """
+        从“按/按照 A 和 B 去重”这类自然语言中提取真实去重字段。
+
+        这里只解析去重动作前紧邻的字段描述，避免把后面的统计字段
+        （例如平均温度、降水量）错误加入去重条件。
+        """
+
+        task = str(user_task or "")
+
+        patterns = [
+            r"(?:按照|按)\\s*(.+?)\\s*(?:去除重复记录|删除重复记录|删除重复数据|去重)",
+            r"(?:以)\\s*(.+?)\\s*(?:为准|作为依据)?\\s*(?:去除重复记录|删除重复记录|删除重复数据|去重)",
+        ]
+
+        segment = None
+
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                task,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                segment = match.group(1)
+                break
+
+        if not segment:
+            return []
+
+        pieces = re.split(
+            r"[、,，/＋+]|和|与|及",
+            segment,
+        )
+
+        inferred = []
+
+        for piece in pieces:
+            candidate = piece.strip(
+                " ：:；;。"
+            )
+
+            if not candidate:
+                continue
+
+            mapped = self.resolve_dataframe_column(
+                candidate,
+                actual_columns,
+            )
+
+            if (
+                mapped in [
+                    str(column)
+                    for column in actual_columns
+                ]
+                and mapped not in inferred
+            ):
+                inferred.append(mapped)
+
+        return inferred
+
+    def normalize_office_operations(
+        self,
+        user_task: str,
+        operations: List[Dict[str, Any]],
+        actual_columns,
+    ) -> List[Dict[str, Any]]:
+        """
+        在真正执行前，用 DataFrame 的真实字段约束 LLM 生成的计划。
+
+        目的：
+        - “温度”自动纠正为唯一真实字段“平均温度”；
+        - group_by / filter / pivot / missing 等字段统一校验；
+        - 用户明确说“按城市和日期去重”时，确保 subset 真正使用
+          ["城市", "日期"]，而不是被 LLM 简化成单字段去重。
+        """
+
+        normalized_operations = []
+
+        for raw_operation in operations:
+            if not isinstance(
+                raw_operation,
+                dict,
+            ):
+                normalized_operations.append(
+                    raw_operation
+                )
+                continue
+
+            operation = dict(
+                raw_operation
+            )
+
+            action = str(
+                operation.get(
+                    "action",
+                    "",
+                )
+            ).strip()
+
+            single_column_keys = {
+                "filter": ["column"],
+                "sort": ["column"],
+                "group_statistics": [
+                    "group_by",
+                    "target_column",
+                ],
+                "filter_date_range": ["column"],
+            }
+
+            for key in single_column_keys.get(
+                action,
+                [],
+            ):
+                if key in operation:
+                    operation[key] = (
+                        self.resolve_dataframe_column(
+                            operation.get(key),
+                            actual_columns,
+                        )
+                    )
+
+            list_column_keys = {
+                "select_columns": ["columns"],
+                "drop_columns": ["columns"],
+                "handle_missing": ["columns"],
+                "drop_duplicates": ["columns"],
+                "group_multi_statistics": [
+                    "group_by"
+                ],
+                "pivot_summary": [
+                    "index",
+                    "columns",
+                    "values",
+                ],
+            }
+
+            for key in list_column_keys.get(
+                action,
+                [],
+            ):
+                if key in operation:
+                    operation[key] = (
+                        self.resolve_dataframe_columns(
+                            operation.get(key),
+                            actual_columns,
+                        )
+                    )
+
+            if action == "apply_filters":
+                filters = operation.get(
+                    "filters",
+                    [],
+                )
+
+                if isinstance(filters, list):
+                    fixed_filters = []
+
+                    for filter_item in filters:
+                        if not isinstance(
+                            filter_item,
+                            dict,
+                        ):
+                            fixed_filters.append(
+                                filter_item
+                            )
+                            continue
+
+                        fixed_item = dict(
+                            filter_item
+                        )
+
+                        if "column" in fixed_item:
+                            fixed_item["column"] = (
+                                self.resolve_dataframe_column(
+                                    fixed_item.get(
+                                        "column"
+                                    ),
+                                    actual_columns,
+                                )
+                            )
+
+                        fixed_filters.append(
+                            fixed_item
+                        )
+
+                    operation["filters"] = (
+                        fixed_filters
+                    )
+
+            if action == "rename_columns":
+                rename_map = operation.get(
+                    "rename_map",
+                    {},
+                )
+
+                if isinstance(rename_map, dict):
+                    operation["rename_map"] = {
+                        self.resolve_dataframe_column(
+                            old_name,
+                            actual_columns,
+                        ): new_name
+                        for old_name, new_name
+                        in rename_map.items()
+                    }
+
+            if action == "group_multi_statistics":
+                aggregations = operation.get(
+                    "aggregations",
+                    {},
+                )
+
+                if isinstance(
+                    aggregations,
+                    dict,
+                ):
+                    fixed_aggregations = {}
+
+                    for (
+                        column,
+                        functions,
+                    ) in aggregations.items():
+                        mapped_column = (
+                            self.resolve_dataframe_column(
+                                column,
+                                actual_columns,
+                            )
+                        )
+
+                        fixed_aggregations[
+                            mapped_column
+                        ] = functions
+
+                    operation[
+                        "aggregations"
+                    ] = fixed_aggregations
+
+            if action == "pivot_summary":
+                aggfunc = operation.get(
+                    "aggfunc"
+                )
+
+                if isinstance(
+                    aggfunc,
+                    dict,
+                ):
+                    operation["aggfunc"] = {
+                        self.resolve_dataframe_column(
+                            column,
+                            actual_columns,
+                        ): function
+                        for column, function
+                        in aggfunc.items()
+                    }
+
+            if action == "drop_duplicates":
+                inferred_columns = (
+                    self.infer_dedup_columns_from_task(
+                        user_task=user_task,
+                        actual_columns=actual_columns,
+                    )
+                )
+
+                current_columns = operation.get(
+                    "columns"
+                )
+
+                if inferred_columns:
+                    current_list = (
+                        current_columns
+                        if isinstance(
+                            current_columns,
+                            list,
+                        )
+                        else (
+                            [current_columns]
+                            if current_columns
+                            else []
+                        )
+                    )
+
+                    # 用户自然语言中明确给出的去重字段比 LLM 计划更可靠。
+                    # 当 LLM 漏字段、未给字段或给出不同字段时，以用户描述为准。
+                    if current_list != inferred_columns:
+                        operation[
+                            "columns"
+                        ] = inferred_columns
+
+            normalized_operations.append(
+                operation
+            )
+
+        return normalized_operations
+
+    # ============================================================
     # Office 多步骤任务执行
     # ============================================================
 
@@ -2465,6 +2890,46 @@ JSON 格式：
                 operations=operations,
             )
         )
+
+        original_operations = [
+            dict(operation)
+            if isinstance(operation, dict)
+            else operation
+            for operation in operations
+        ]
+
+        operations = self.normalize_office_operations(
+            user_task=user_task,
+            operations=operations,
+            actual_columns=list(
+                dataframe.columns
+            ),
+        )
+
+        if operations != original_operations:
+            self.report_progress(
+                "已根据真实数据字段校验并纠正任务计划。"
+            )
+
+            for step_index, (
+                before_operation,
+                after_operation,
+            ) in enumerate(
+                zip(
+                    original_operations,
+                    operations,
+                ),
+                start=1,
+            ):
+                if (
+                    before_operation
+                    != after_operation
+                ):
+                    self.report_progress(
+                        f"计划纠正 [{step_index}]："
+                        f"{before_operation} → "
+                        f"{after_operation}"
+                    )
 
         original_dataframe = dataframe.copy()
 
@@ -2906,6 +3371,1315 @@ JSON 格式：
     # 主执行入口
     # ============================================================
 
+    # ============================================================
+    # v3.0：跨格式混合办公任务
+    # ============================================================
+
+    def looks_like_mixed_office_task(
+        self,
+        user_task: str,
+        input_paths=None,
+    ) -> bool:
+        """
+        判断任务是否同时需要处理结构化数据文件和办公文档。
+
+        混合任务典型形式：
+        - Excel + Word
+        - CSV + PDF
+        - Excel / CSV + Word / PDF / TXT / Markdown
+        """
+
+        text = (user_task or "").lower()
+
+        # 用户明确排除结构化数据时，不能因为候选文件夹里同时存在
+        # CSV / Excel，就误路由为 mixed_office_task。
+        #
+        # 例如：
+        # “只阅读相关 PDF，不分析 CSV 或 Excel 数据”
+        # 应进入纯 document_task。
+        data_exclusion_patterns = [
+            r"不(?:要)?分析\s*(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+            r"不(?:要)?处理\s*(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+            r"不(?:要)?读取\s*(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+            r"不(?:要)?使用\s*(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+            r"无需分析\s*(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+            r"无需处理\s*(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+            r"只(?:阅读|读取|分析|处理|总结|查看).*?(?:pdf|word|docx|文档|报告).*?(?:不|无需).*?(?:csv|excel|xlsx|xls|表格|结构化数据|数据文件)",
+        ]
+
+        if any(
+            re.search(
+                pattern,
+                text,
+                flags=re.IGNORECASE,
+            )
+            for pattern in data_exclusion_patterns
+        ):
+            return False
+
+        data_words = [
+            "excel",
+            "xlsx",
+            "xls",
+            "csv",
+            "表格",
+            "数据",
+            "统计",
+            "计算",
+            "分析数据",
+        ]
+
+        document_words = [
+            "word",
+            "docx",
+            "pdf",
+            "文档",
+            "报告",
+            "会议纪要",
+            "markdown",
+            "txt",
+            "阅读",
+            "总结",
+            "综合",
+        ]
+
+        has_data_word = any(
+            word in text
+            for word in data_words
+        )
+        has_document_word = any(
+            word in text
+            for word in document_words
+        )
+
+        has_data_file = False
+        has_document_file = False
+
+        for item in input_paths or []:
+            try:
+                path = Path(item)
+
+                if not path.is_file():
+                    continue
+
+                suffix = path.suffix.lower()
+
+                if suffix in {".csv", ".xlsx", ".xls"}:
+                    has_data_file = True
+
+                if suffix in SUPPORTED_DOCUMENT_EXTENSIONS:
+                    has_document_file = True
+
+            except Exception:
+                continue
+
+        explicit_cross_format = any(
+            phrase in text
+            for phrase in [
+                "一起看",
+                "都看",
+                "综合",
+                "结合",
+                "跨文件",
+                "跨格式",
+                "所有相关文件",
+                "相关文件",
+            ]
+        )
+
+        document_only_patterns = [
+            r"只(?:阅读|读取|查看|分析|总结).*?(?:pdf|word|docx|文档|报告)",
+            r"只(?:要|需要).*?(?:pdf|word|docx|文档|报告)",
+            r"仅(?:阅读|读取|查看|分析|总结).*?(?:pdf|word|docx|文档|报告)",
+        ]
+
+        document_only_intent = any(
+            re.search(
+                pattern,
+                text,
+                flags=re.IGNORECASE,
+            )
+            for pattern in document_only_patterns
+        )
+
+        if document_only_intent:
+            return False
+
+        return (
+            has_data_word
+            and has_document_word
+            and (
+                explicit_cross_format
+                or (
+                    has_data_file
+                    and has_document_file
+                )
+            )
+        )
+
+    def collect_mixed_candidates(
+        self,
+        input_paths=None,
+    ) -> List[str]:
+        """
+        收集混合办公任务候选文件。
+
+        支持：
+        - CSV
+        - Excel
+        - DOCX
+        - PDF
+        - TXT
+        - Markdown
+        """
+
+        supported = {
+            ".csv",
+            ".xlsx",
+            ".xls",
+            *SUPPORTED_DOCUMENT_EXTENSIONS,
+        }
+
+        candidates = []
+        seen = set()
+
+        for item in input_paths or []:
+            try:
+                path = Path(item)
+
+                if path.is_dir():
+                    for child in path.rglob("*"):
+                        if (
+                            child.is_file()
+                            and child.suffix.lower() in supported
+                            and not child.name.startswith("~$")
+                            and not any(
+                                part.lower() in {
+                                    ".venv",
+                                    "venv",
+                                    "env",
+                                    ".git",
+                                    "__pycache__",
+                                    "outputs",
+                                    "output",
+                                    "site-packages",
+                                    "node_modules",
+                                    "build",
+                                    "dist",
+                                }
+                                for part in child.parts
+                            )
+                        ):
+                            resolved = str(child.resolve())
+                            key = os.path.normcase(resolved)
+
+                            if key not in seen:
+                                seen.add(key)
+                                candidates.append(resolved)
+
+                    continue
+
+                if (
+                    path.is_file()
+                    and path.suffix.lower() in supported
+                    and not path.name.startswith("~$")
+                ):
+                    resolved = str(path.resolve())
+                    key = os.path.normcase(resolved)
+
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(resolved)
+
+            except Exception:
+                continue
+
+        return candidates
+
+    def build_mixed_candidate_catalog(
+        self,
+        candidates: List[str],
+    ) -> str:
+        """
+        为 CSV / Excel / 办公文档建立统一候选目录。
+        """
+
+        blocks = []
+
+        for index, file_path in enumerate(
+            candidates,
+            start=1,
+        ):
+            path = Path(file_path)
+            suffix = path.suffix.lower()
+
+            if suffix in {".csv", ".xlsx", ".xls"}:
+                try:
+                    infos = inspect_data_files(
+                        [str(path)]
+                    )
+                    info = infos[0] if infos else {}
+
+                    blocks.append(
+                        "\n".join(
+                            [
+                                f"[候选 {index}]",
+                                f"文件名：{path.name}",
+                                f"完整路径：{path.resolve()}",
+                                "类型：结构化数据文件",
+                                f"扩展名：{suffix}",
+                                f"Sheet：{info.get('sheet_names', [])}",
+                                f"字段：{info.get('columns', [])}",
+                            ]
+                        )
+                    )
+
+                except Exception as error:
+                    blocks.append(
+                        "\n".join(
+                            [
+                                f"[候选 {index}]",
+                                f"文件名：{path.name}",
+                                f"完整路径：{path.resolve()}",
+                                "类型：结构化数据文件",
+                                f"读取画像失败：{error}",
+                            ]
+                        )
+                    )
+
+            else:
+                try:
+                    infos = inspect_documents(
+                        [str(path)],
+                        preview_characters=1200,
+                    )
+                    info = infos[0] if infos else {}
+
+                    blocks.append(
+                        "\n".join(
+                            [
+                                f"[候选 {index}]",
+                                f"文件名：{path.name}",
+                                f"完整路径：{path.resolve()}",
+                                "类型：办公文档",
+                                f"扩展名：{suffix}",
+                                "内容预览：",
+                                str(
+                                    info.get(
+                                        "preview",
+                                        "",
+                                    )
+                                )[:1200],
+                            ]
+                        )
+                    )
+
+                except Exception as error:
+                    blocks.append(
+                        "\n".join(
+                            [
+                                f"[候选 {index}]",
+                                f"文件名：{path.name}",
+                                f"完整路径：{path.resolve()}",
+                                "类型：办公文档",
+                                f"读取画像失败：{error}",
+                            ]
+                        )
+                    )
+
+        return "\n\n".join(blocks)
+
+    def select_mixed_files_with_llm(
+        self,
+        user_task: str,
+        candidates: List[str],
+    ) -> Dict[str, Any]:
+        """
+        让大模型从统一候选目录中选择混合任务真正需要的文件。
+        选择结果必须通过 Python 白名单验证。
+        """
+
+        if not candidates:
+            return {
+                "selected_files": [],
+                "reason": "",
+            }
+
+        catalog = self.build_mixed_candidate_catalog(
+            candidates
+        )
+
+        prompt = f"""
+你是 DataPilot 的跨格式办公文件选择模块。
+
+【用户任务】
+{user_task}
+
+【候选文件目录】
+{catalog}
+
+请从候选目录中选择真正完成用户任务所需要的文件。
+
+严格规则：
+1. 只能选择候选目录中存在的完整路径。
+2. 不得编造文件名或路径。
+3. 如果用户要求综合 Excel/CSV 数据和 Word/PDF 文档，应同时选择相关的数据文件和相关文档。
+4. 与任务主题明显无关的文件不要选择。
+5. 如果用户说“所有相关文件”，应选择所有与主题直接相关的候选文件。
+6. 只返回合法 JSON，不要 Markdown。
+
+返回格式：
+{{
+  "selected_files": ["完整路径1", "完整路径2"],
+  "reason": "选择依据"
+}}
+""".strip()
+
+        self.report_progress(
+            f"识别到 {len(candidates)} 个跨格式候选文件，"
+            "正在进行统一语义选择……"
+        )
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 DataPilot 跨格式办公文件选择模块。"
+                        "只能从候选白名单中选择文件。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0,
+            response_format={
+                "type": "json_object"
+            },
+        )
+
+        content = (
+            response.choices[0]
+            .message.content
+            or "{}"
+        )
+
+        result = json.loads(content)
+        requested = result.get(
+            "selected_files",
+            [],
+        )
+
+        allowed = {
+            os.path.normcase(
+                str(Path(item).resolve())
+            ): str(Path(item).resolve())
+            for item in candidates
+        }
+
+        selected = []
+
+        for item in requested:
+            try:
+                key = os.path.normcase(
+                    str(Path(str(item)).resolve())
+                )
+            except Exception:
+                continue
+
+            if (
+                key in allowed
+                and allowed[key] not in selected
+            ):
+                selected.append(
+                    allowed[key]
+                )
+
+        reason = str(
+            result.get(
+                "reason",
+                "",
+            )
+        ).strip()
+
+        if reason:
+            self.report_progress(
+                f"跨格式文件选择依据：{reason}"
+            )
+
+        if selected:
+            self.report_progress(
+                "已选择跨格式文件："
+                + ", ".join(
+                    Path(item).name
+                    for item in selected
+                )
+            )
+
+        return {
+            "selected_files": selected,
+            "reason": reason,
+        }
+
+    def analyze_structured_file_for_mixed_task(
+        self,
+        file_path: str,
+    ) -> str:
+        """
+        使用 Pandas 实际读取和计算结构化数据摘要。
+
+        这里不让大模型自行猜数值。
+        数值统计、缺失值、日期范围和分类频数均由 DataFrame 计算。
+        """
+
+        path = Path(file_path)
+
+        self.report_progress(
+            f"正在实际读取并统计数据文件：{path.name}"
+        )
+
+        dataframe = read_office_data(
+            str(path)
+        )
+
+        lines = [
+            f"===== 数据文件：{path.name} =====",
+            f"完整路径：{path.resolve()}",
+            f"记录数：{len(dataframe)}",
+            f"字段数：{len(dataframe.columns)}",
+            "字段："
+            + ", ".join(
+                str(column)
+                for column in dataframe.columns
+            ),
+        ]
+
+        missing = dataframe.isna().sum()
+        missing_items = [
+            f"{column}={int(count)}"
+            for column, count in missing.items()
+            if int(count) > 0
+        ]
+
+        lines.append(
+            "缺失值："
+            + (
+                "；".join(missing_items)
+                if missing_items
+                else "无"
+            )
+        )
+
+        numeric_df = dataframe.select_dtypes(
+            include="number"
+        )
+
+        if not numeric_df.empty:
+            lines.append("\n[数值字段实际统计]")
+            description = (
+                numeric_df
+                .describe()
+                .transpose()
+            )
+
+            for column, row in description.iterrows():
+                parts = [
+                    f"count={row.get('count'):.0f}",
+                    f"mean={row.get('mean'):.4g}",
+                    f"min={row.get('min'):.4g}",
+                    f"max={row.get('max'):.4g}",
+                ]
+
+                if "std" in row:
+                    parts.append(
+                        f"std={row.get('std'):.4g}"
+                    )
+
+                lines.append(
+                    f"- {column}: "
+                    + ", ".join(parts)
+                )
+
+        non_numeric_columns = [
+            column
+            for column in dataframe.columns
+            if column not in numeric_df.columns
+        ]
+
+        if non_numeric_columns:
+            lines.append(
+                "\n[非数值字段主要取值]"
+            )
+
+            for column in non_numeric_columns[:8]:
+                series = (
+                    dataframe[column]
+                    .dropna()
+                    .astype(str)
+                )
+
+                if series.empty:
+                    continue
+
+                counts = (
+                    series
+                    .value_counts()
+                    .head(8)
+                )
+
+                value_text = "；".join(
+                    f"{value}={int(count)}"
+                    for value, count in counts.items()
+                )
+
+                lines.append(
+                    f"- {column}: {value_text}"
+                )
+
+        lines.append(
+            "\n[前 8 行数据]"
+        )
+        lines.append(
+            dataframe.head(8).to_string(
+                index=False
+            )
+        )
+
+        return "\n".join(lines)
+
+    def synthesize_mixed_office_sources(
+        self,
+        user_task: str,
+        selected_files: List[str],
+    ) -> str:
+        """
+        综合结构化数据的 Python 实际统计结果与办公文档全文。
+        """
+
+        source_blocks = []
+        data_count = 0
+        document_count = 0
+        max_document_characters = 30000
+        max_total_document_characters = 70000
+        used_document_characters = 0
+
+        for file_path in selected_files:
+            path = Path(file_path)
+            suffix = path.suffix.lower()
+
+            if suffix in {".csv", ".xlsx", ".xls"}:
+                source_blocks.append(
+                    self.analyze_structured_file_for_mixed_task(
+                        file_path
+                    )
+                )
+                data_count += 1
+                continue
+
+            if suffix in SUPPORTED_DOCUMENT_EXTENSIONS:
+                self.report_progress(
+                    f"正在阅读全文：{path.name}"
+                )
+
+                document_text = read_document(
+                    file_path
+                )
+
+                if not document_text.strip():
+                    document_text = (
+                        "[该文档未提取到可读文本]"
+                    )
+
+                document_text = document_text[
+                    :max_document_characters
+                ]
+
+                remaining = (
+                    max_total_document_characters
+                    - used_document_characters
+                )
+
+                if remaining <= 0:
+                    continue
+
+                document_text = document_text[
+                    :remaining
+                ]
+                used_document_characters += len(
+                    document_text
+                )
+
+                source_blocks.append(
+                    (
+                        f"===== 办公文档：{path.name} =====\n"
+                        f"完整路径：{path.resolve()}\n\n"
+                        f"{document_text}"
+                    )
+                )
+                document_count += 1
+
+        if not source_blocks:
+            raise ValueError(
+                "跨格式任务没有读取到可综合的内容。"
+            )
+
+        self.report_progress(
+            f"已完成 {data_count} 个数据文件的实际统计，"
+            f"并读取 {document_count} 个办公文档，"
+            "正在进行跨格式综合……"
+        )
+
+        prompt = f"""
+你是 DataPilot 的跨格式办公任务 Agent。
+
+【用户任务】
+{user_task}
+
+【Python 实际计算的数据结果 + 办公文档全文】
+{chr(10).join(source_blocks)}
+
+请生成最终可交付结果。
+
+严格要求：
+1. 数据文件中的数值必须以 Python 已计算结果为依据，不得自行编造或重新心算。
+2. 办公文档事实只能来自提供的文档内容。
+3. 明确区分“数据计算结果”和“文档中的陈述”。
+4. 如果数据结果与文档说法不能直接对应，不要强行建立因果关系。
+5. 多文件重复信息要去重。
+6. 重要结论尽量注明来源文件名。
+7. 如果来源不足以支持某项结论，明确说明。
+8. 输出结构清晰，适合作为办公汇报。
+9. 不要输出内部推理过程。
+""".strip()
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 DataPilot 跨格式办公 Agent。"
+                        "结构化数据以 Python 实际计算结果为准，"
+                        "文档事实以读取到的原文为准。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0,
+        )
+
+        answer = (
+            response.choices[0]
+            .message.content
+            or ""
+        ).strip()
+
+        if not answer:
+            raise ValueError(
+                "大模型没有返回跨格式综合结果。"
+            )
+
+        return answer
+
+    def execute_mixed_office_task(
+        self,
+        user_task: str,
+        input_paths=None,
+        output_dir="outputs",
+    ) -> Dict[str, Any]:
+        """
+        执行 CSV / Excel + Word / PDF 等跨格式综合任务。
+        """
+
+        candidates = self.collect_mixed_candidates(
+            input_paths=input_paths,
+        )
+
+        if not candidates:
+            raise ValueError(
+                "没有找到可用于跨格式任务的文件。"
+            )
+
+        selection = self.select_mixed_files_with_llm(
+            user_task=user_task,
+            candidates=candidates,
+        )
+
+        selected_files = selection.get(
+            "selected_files",
+            [],
+        )
+
+        if not selected_files:
+            raise ValueError(
+                "没有找到与跨格式任务相关的文件。"
+            )
+
+        data_files = [
+            item
+            for item in selected_files
+            if Path(item).suffix.lower()
+            in {".csv", ".xlsx", ".xls"}
+        ]
+
+        document_files = [
+            item
+            for item in selected_files
+            if Path(item).suffix.lower()
+            in SUPPORTED_DOCUMENT_EXTENSIONS
+        ]
+
+        if not data_files:
+            raise ValueError(
+                "跨格式任务没有选中 CSV / Excel 数据文件。"
+            )
+
+        if not document_files:
+            raise ValueError(
+                "跨格式任务没有选中 Word / PDF / TXT / Markdown 文档。"
+            )
+
+        answer = self.synthesize_mixed_office_sources(
+            user_task=user_task,
+            selected_files=selected_files,
+        )
+
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.report_progress(
+            "正在生成跨格式综合 Word 报告……"
+        )
+
+        word_path = generate_document_summary_report(
+            summary_text=answer,
+            output_dir=str(output_dir_path),
+            filename="DataPilot_跨格式综合报告.docx",
+        )
+
+        self.report_progress(
+            f"跨格式综合 Word 报告生成完成：{word_path}"
+        )
+
+        return {
+            "success": True,
+            "task_type": "mixed_office_task",
+            "message": answer,
+            "document_answer": answer,
+            "selected_documents": document_files,
+            "selected_data_files": data_files,
+            "selected_files": selected_files,
+            "input_paths": selected_files,
+            "word_path": word_path,
+            "output_files": [
+                word_path,
+            ],
+            "output_dir": str(
+                output_dir_path.resolve()
+            ),
+            "selection_reason": selection.get(
+                "reason",
+                "",
+            ),
+            "raw_result": {
+                "answer": answer,
+                "selected_files": selected_files,
+                "selected_data_files": data_files,
+                "selected_documents": document_files,
+                "selection_reason": selection.get(
+                    "reason",
+                    "",
+                ),
+                "word_path": word_path,
+            },
+            "plan": {
+                "task_type": "mixed_office_task",
+                "description": (
+                    "统一选择 CSV / Excel 与办公文档，"
+                    "由 Python 计算数据结果，阅读全文后跨格式综合。"
+                ),
+                "operations": [
+                    "discover_mixed_files",
+                    "semantic_select_mixed_files",
+                    "analyze_structured_data",
+                    "read_documents",
+                    "synthesize_mixed_sources",
+                    "generate_word_report",
+                ],
+            },
+        }
+
+    # ============================================================
+    # v3.0：办公文档任务识别
+    # ============================================================
+
+    def looks_like_document_task(
+        self,
+        user_task: str,
+        input_paths=None,
+    ) -> bool:
+        """
+        判断用户是否在要求阅读 / 总结 / 综合办公文档。
+
+        v3.0 第一阶段支持：
+        - DOCX
+        - PDF
+        - TXT
+        - Markdown
+        """
+
+        text = (user_task or "").lower()
+
+        strong_keywords = [
+            "文档",
+            "word",
+            "docx",
+            "pdf",
+            "markdown",
+            "md文件",
+            "txt",
+            "会议纪要",
+            "报告内容",
+            "阅读文件",
+            "阅读相关",
+            "阅读全文",
+            "综合摘要",
+            "总结文档",
+            "整理摘要",
+            "提取文档",
+        ]
+
+        if any(
+            keyword in text
+            for keyword in strong_keywords
+        ):
+            return True
+
+        # 如果任务明确要求“阅读 / 总结 / 综合”，并且输入中确实有文档，
+        # 也视作文档任务。
+        action_keywords = [
+            "阅读",
+            "总结",
+            "摘要",
+            "概括",
+            "整理",
+            "归纳",
+            "提取",
+            "综合",
+            "对比",
+        ]
+
+        if not any(
+            keyword in text
+            for keyword in action_keywords
+        ):
+            return False
+
+        for item in input_paths or []:
+            try:
+                path = Path(item)
+
+                if (
+                    path.is_file()
+                    and path.suffix.lower()
+                    in SUPPORTED_DOCUMENT_EXTENSIONS
+                ):
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    # ============================================================
+    # v3.0：收集办公文档候选文件
+    # ============================================================
+
+    def collect_document_candidates(
+        self,
+        input_paths=None,
+    ) -> List[str]:
+        """
+        从 GUI 提供的文件 / 文件夹中收集办公文档。
+
+        如果 GUI 已经把文件夹展开成大量文件，
+        这里会只保留 DOCX / PDF / TXT / Markdown，
+        不会把 CSV / Excel 当作文档交给模型。
+        """
+
+        candidates = []
+        seen = set()
+
+        paths = input_paths or []
+
+        for item in paths:
+            try:
+                path = Path(item)
+
+                if path.is_dir():
+                    discovered = scan_document_files(
+                        folder_path=path,
+                        recursive=True,
+                    )
+
+                    for discovered_path in discovered:
+                        resolved = str(
+                            Path(discovered_path).resolve()
+                        )
+                        key = os.path.normcase(resolved)
+
+                        if key not in seen:
+                            seen.add(key)
+                            candidates.append(resolved)
+
+                    continue
+
+                if (
+                    path.is_file()
+                    and path.suffix.lower()
+                    in SUPPORTED_DOCUMENT_EXTENSIONS
+                ):
+                    # 忽略 Office 临时文件。
+                    if path.name.startswith("~$"):
+                        continue
+
+                    resolved = str(path.resolve())
+                    key = os.path.normcase(resolved)
+
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(resolved)
+
+            except Exception:
+                continue
+
+        # 没有显式候选时，扫描当前工作目录。
+        if not candidates:
+            try:
+                discovered = scan_document_files(
+                    folder_path=Path.cwd(),
+                    recursive=False,
+                )
+
+                for discovered_path in discovered:
+                    resolved = str(
+                        Path(discovered_path).resolve()
+                    )
+                    key = os.path.normcase(resolved)
+
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(resolved)
+
+            except Exception:
+                pass
+
+        return candidates
+
+    # ============================================================
+    # v3.0：多文档全文综合
+    # ============================================================
+
+    def synthesize_documents(
+        self,
+        user_task: str,
+        selected_files: List[str],
+    ) -> str:
+        """
+        读取被选中文档全文，并让大模型严格基于文档内容完成任务。
+        """
+
+        if not selected_files:
+            raise ValueError(
+                "没有可用于综合处理的办公文档。"
+            )
+
+        document_blocks = []
+        total_characters = 0
+        max_total_characters = 90000
+        max_per_document = 35000
+
+        for index, file_path in enumerate(
+            selected_files,
+            start=1,
+        ):
+            self.report_progress(
+                f"正在阅读全文：{Path(file_path).name}"
+            )
+
+            text = read_document(file_path)
+
+            if not text.strip():
+                text = "[该文档未提取到可读文本]"
+
+            if len(text) > max_per_document:
+                text = (
+                    text[:max_per_document]
+                    + "\n\n[该文档内容因长度限制已截断]"
+                )
+
+            remaining = (
+                max_total_characters
+                - total_characters
+            )
+
+            if remaining <= 0:
+                break
+
+            if len(text) > remaining:
+                text = (
+                    text[:remaining]
+                    + "\n\n[总文档内容因长度限制已截断]"
+                )
+
+            total_characters += len(text)
+
+            document_blocks.append(
+                (
+                    f"===== 文档 {index} =====\n"
+                    f"文件名：{Path(file_path).name}\n"
+                    f"完整路径：{file_path}\n\n"
+                    f"{text}"
+                )
+            )
+
+        if not document_blocks:
+            raise ValueError(
+                "选中文档没有提取到可供处理的内容。"
+            )
+
+        source_text = "\n\n".join(
+            document_blocks
+        )
+
+        prompt = f"""
+你是 DataPilot 的办公文档处理 Agent。
+
+请严格根据下面提供的文档内容完成用户任务。
+
+【用户任务】
+{user_task}
+
+【已选择并读取的文档】
+{source_text}
+
+要求：
+
+1. 只能根据提供的文档内容作答。
+2. 不要虚构文档中不存在的事实。
+3. 如果多个文档内容重复，要合并去重，不要机械重复。
+4. 如果不同文档存在不同说法，要明确指出分别来自哪个文件。
+5. 如果用户要求摘要、整理、归纳或综合，请给出结构清晰的结果。
+6. 重要结论尽量注明来源文件名。
+7. 如果文档不足以支持某项结论，要明确说明文档没有提供。
+8. 不要讨论你的内部推理过程。
+9. 直接给出可以交付给用户的最终结果。
+""".strip()
+
+        self.report_progress(
+            f"已读取 {len(document_blocks)} 个相关文档，"
+            "正在进行跨文档综合处理……"
+        )
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 DataPilot 办公文档处理 Agent。"
+                        "必须忠实依据用户提供的文档内容，"
+                        "不得编造来源中不存在的信息。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0,
+        )
+
+        answer = (
+            response.choices[0]
+            .message.content
+            or ""
+        ).strip()
+
+        if not answer:
+            raise ValueError(
+                "大模型没有返回文档处理结果。"
+            )
+
+        return answer
+
+    # ============================================================
+    # v3.0：执行办公文档任务
+    # ============================================================
+
+    def execute_document_task(
+        self,
+        user_task: str,
+        input_paths=None,
+        output_dir="outputs",
+    ) -> Dict[str, Any]:
+        """
+        执行 v3.0 第一阶段办公文档任务：
+
+        候选文档
+            ↓
+        文档画像
+            ↓
+        DeepSeek 语义选择
+            ↓
+        Python 白名单验证
+            ↓
+        阅读全文
+            ↓
+        多文档综合
+        """
+
+        candidates = self.collect_document_candidates(
+            input_paths=input_paths,
+        )
+
+        if not candidates:
+            raise ValueError(
+                "没有找到可读取的办公文档。"
+                "当前支持 DOCX、PDF、TXT 和 Markdown。"
+            )
+
+        self.report_progress(
+            f"识别到 {len(candidates)} 个办公文档候选文件。"
+        )
+
+        self.report_progress(
+            "正在读取文档预览并生成文档画像……"
+        )
+
+        document_infos = inspect_documents(
+            candidates,
+            preview_characters=1500,
+        )
+
+        successful_infos = [
+            info
+            for info in document_infos
+            if info.get("inspection_success")
+        ]
+
+        failed_count = (
+            len(document_infos)
+            - len(successful_infos)
+        )
+
+        self.report_progress(
+            f"文档画像完成：成功 {len(successful_infos)} 个，"
+            f"失败 {failed_count} 个。"
+        )
+
+        if not successful_infos:
+            raise ValueError(
+                "候选文档均无法读取。"
+            )
+
+        selection = select_documents_with_llm(
+            task=user_task,
+            document_infos=successful_infos,
+            callback=self.report_progress,
+        )
+
+        selected_files = selection.get(
+            "selected_files",
+            [],
+        )
+
+        if not selected_files:
+            raise ValueError(
+                "没有找到与当前任务相关的办公文档。"
+            )
+
+        answer = self.synthesize_documents(
+            user_task=user_task,
+            selected_files=selected_files,
+        )
+
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.report_progress(
+            "正在生成文档综合 Word 报告……"
+        )
+
+        word_path = generate_document_summary_report(
+            summary_text=answer,
+            output_dir=str(output_dir_path),
+            filename="DataPilot_文档综合报告.docx",
+        )
+
+        self.report_progress(
+            f"文档综合 Word 报告生成完成：{word_path}"
+        )
+
+        self.report_progress(
+            "办公文档任务执行完成。"
+        )
+
+        return {
+            "success": True,
+            "task_type": "document_task",
+            "message": answer,
+            "document_answer": answer,
+            "selected_documents": selected_files,
+            "input_paths": selected_files,
+            "word_path": word_path,
+            "output_files": [
+                word_path,
+            ],
+            "output_dir": str(
+                output_dir_path.resolve()
+            ),
+            "selection_reason": selection.get(
+                "reason",
+                "",
+            ),
+            "raw_result": {
+                "answer": answer,
+                "selected_documents": selected_files,
+                "selection_reason": selection.get(
+                    "reason",
+                    "",
+                ),
+                "word_path": word_path,
+            },
+            "plan": {
+                "task_type": "document_task",
+                "description": (
+                    "自动发现并选择相关办公文档，"
+                    "阅读全文后进行跨文档综合处理。"
+                ),
+                "operations": [
+                    "discover_documents",
+                    "inspect_documents",
+                    "semantic_select_documents",
+                    "read_documents",
+                    "synthesize_documents",
+                    "generate_document_word_report",
+                ],
+            },
+        }
+
     def execute_task(
         self,
         user_task: str,
@@ -2937,6 +4711,47 @@ JSON 格式：
         self.report_progress(
             "正在分析任务，请稍候……"
         )
+
+        # --------------------------------------------------------
+        # v3.0：跨格式混合任务优先于纯文档 / 纯数据任务
+        # --------------------------------------------------------
+
+        document_route_paths = self.normalize_input_paths(
+            input_paths=input_paths,
+            file_path=file_path,
+        )
+
+        if self.looks_like_mixed_office_task(
+            user_task=user_task,
+            input_paths=document_route_paths,
+        ):
+            self.report_progress(
+                "已识别为跨格式混合办公任务。"
+            )
+
+            return self.execute_mixed_office_task(
+                user_task=user_task,
+                input_paths=document_route_paths,
+                output_dir=output_dir,
+            )
+
+        # --------------------------------------------------------
+        # v3.0：办公文档任务路由
+        # --------------------------------------------------------
+
+        if self.looks_like_document_task(
+            user_task=user_task,
+            input_paths=document_route_paths,
+        ):
+            self.report_progress(
+                "已识别为办公文档理解任务。"
+            )
+
+            return self.execute_document_task(
+                user_task=user_task,
+                input_paths=document_route_paths,
+                output_dir=output_dir,
+            )
 
         # --------------------------------------------------------
         # 1. 整理显式输入，并在需要时自动发现 / 选择文件
@@ -3183,8 +4998,49 @@ JSON 格式：
 
         else:
             # ----------------------------------------------------
-            # 8. 原来的普通分析流程
+            # 8. 普通分析流程
             # ----------------------------------------------------
+
+            # 如果规划器明确判断为 general，且没有任何分析/清洗/
+            # 图表/Excel/Word/质量检查要求，则不要因为用户选择了
+            # 多个文件就擅自执行批量数据分析。
+            no_requested_processing = (
+                task_type == "general"
+                and not operations
+                and not any(
+                    bool(plan.get(key, False))
+                    for key in [
+                        "need_batch_pipeline",
+                        "need_word_report",
+                        "need_excel",
+                        "need_chart",
+                        "need_quality_check",
+                        "need_cleaning",
+                        "need_statistics",
+                    ]
+                )
+            )
+
+            if no_requested_processing:
+                self.report_progress(
+                    "任务未提出具体数据处理要求，不自动执行批量分析。"
+                )
+
+                return {
+                    "success": True,
+                    "task_type": "general",
+                    "message": plan.get(
+                        "description",
+                        "未提出具体数据处理要求。",
+                    ),
+                    "plan": plan,
+                    "input_paths": normalized_paths,
+                    "output_dir": str(
+                        output_dir.resolve()
+                    ),
+                    "output_files": [],
+                    "raw_result": {},
+                }
 
             use_batch_pipeline = (
                 plan.get(
@@ -3281,6 +5137,89 @@ def print_result(
     print(
         "=" * 60
     )
+
+    result_task_type = result.get(
+        "task_type"
+    )
+
+    # ============================================================
+    # v3.0：办公文档任务结果
+    # ============================================================
+
+    if result_task_type == "document_task":
+        print(
+            "任务类型：办公文档理解任务"
+        )
+
+        selected_documents = result.get(
+            "selected_documents",
+            [],
+        )
+
+        print(
+            f"处理文档数量：{len(selected_documents)}"
+        )
+
+        if selected_documents:
+            print(
+                "\n已阅读文档："
+            )
+
+            for document_path in selected_documents:
+                print(
+                    f"  - {document_path}"
+                )
+
+        selection_reason = result.get(
+            "selection_reason",
+            "",
+        )
+
+        if selection_reason:
+            print(
+                "\n文档选择依据："
+            )
+
+            print(
+                selection_reason
+            )
+
+        document_answer = (
+            result.get(
+                "document_answer"
+            )
+            or result.get(
+                "message"
+            )
+            or ""
+        )
+
+        if document_answer:
+            print(
+                "\n综合处理结果："
+            )
+
+            print(
+                "-" * 60
+            )
+
+            print(
+                document_answer
+            )
+
+            print(
+                "-" * 60
+            )
+
+        print(
+            "=" * 60
+        )
+
+        return
+
+    # ============================================================
+    # 原有数据任务结果
+    # ============================================================
 
     if result.get(
         "is_office_task"

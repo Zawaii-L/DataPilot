@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -22,6 +23,29 @@ from PySide6.QtWidgets import (
 )
 
 from agent import DataPilotAgent
+
+# 文件夹扫描时默认忽略程序环境、版本控制、缓存和历史输出目录。
+# 这些目录通常包含第三方许可证、缓存文件或 Agent 自己生成的结果，
+# 不应作为用户办公资料再次进入语义筛选。
+IGNORED_SCAN_DIRS = {
+    ".venv",
+    "venv",
+    "env",
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    "site-packages",
+    "outputs",
+    "output",
+    "dist",
+    "build",
+}
+
 
 
 # ============================================================
@@ -93,7 +117,7 @@ class MainWindow(QMainWindow):
 
         self.resize(
             1000,
-            760,
+            720,
         )
 
         self.init_ui()
@@ -103,10 +127,24 @@ class MainWindow(QMainWindow):
     # ========================================================
 
     def init_ui(self):
+        # 主界面使用滚动区域，避免小屏幕或较低分辨率下
+        # 底部控件被窗口裁掉。
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(
+            True
+        )
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+
         central_widget = QWidget()
 
-        self.setCentralWidget(
+        scroll_area.setWidget(
             central_widget
+        )
+
+        self.setCentralWidget(
+            scroll_area
         )
 
         main_layout = QVBoxLayout()
@@ -138,8 +176,8 @@ class MainWindow(QMainWindow):
         )
 
         subtitle_label = QLabel(
-            "用自然语言描述任务，"
-            "自动完成数据下载、清洗、分析和报告生成"
+            "用自然语言描述任务，自动完成数据处理、"
+            "办公文档阅读、跨文档总结和报告生成"
         )
 
         subtitle_label.setStyleSheet(
@@ -174,14 +212,14 @@ class MainWindow(QMainWindow):
         self.task_input = QTextEdit()
 
         self.task_input.setPlaceholderText(
-            "例如：请批量分析我选择的这些文件，"
-            "检查数据质量，清洗数据，"
-            "生成统计图和 Word 报告。\n\n"
-            "也可以直接输入包含 CSV / Excel 下载链接的任务。"
+            "例如：请批量分析我选择的数据文件，检查数据质量，"
+            "清洗数据，生成统计图和 Word 报告。\n\n"
+            "也可以选择 Word / PDF / TXT / Markdown 文档，"
+            "让 Agent 阅读相关内容并进行跨文档综合总结。"
         )
 
         self.task_input.setMinimumHeight(
-            90
+            70
         )
 
         main_layout.addWidget(
@@ -251,7 +289,7 @@ class MainWindow(QMainWindow):
         self.file_list = QListWidget()
 
         self.file_list.setMinimumHeight(
-            100
+            80
         )
 
         main_layout.addWidget(
@@ -384,7 +422,7 @@ class MainWindow(QMainWindow):
         )
 
         self.log_output.setMinimumHeight(
-            220
+            150
         )
 
         main_layout.addWidget(
@@ -410,11 +448,53 @@ class MainWindow(QMainWindow):
         self.result_list = QListWidget()
 
         self.result_list.setMinimumHeight(
-            120
+            100
         )
 
         main_layout.addWidget(
             self.result_list
+        )
+
+        # ----------------------------------------------------
+        # 文档综合结果
+        # ----------------------------------------------------
+
+        self.document_result_label = QLabel(
+            "文档综合结果"
+        )
+
+        self.document_result_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+
+        self.document_result_label.setVisible(
+            False
+        )
+
+        main_layout.addWidget(
+            self.document_result_label
+        )
+
+        self.document_result_output = QTextEdit()
+
+        self.document_result_output.setReadOnly(
+            True
+        )
+
+        self.document_result_output.setMinimumHeight(
+            180
+        )
+
+        self.document_result_output.setPlaceholderText(
+            "文档阅读与跨文档综合结果将在这里显示。"
+        )
+
+        self.document_result_output.setVisible(
+            False
+        )
+
+        main_layout.addWidget(
+            self.document_result_output
         )
 
         # ----------------------------------------------------
@@ -542,10 +622,13 @@ class MainWindow(QMainWindow):
         file_paths, _ = (
             QFileDialog.getOpenFileNames(
                 self,
-                "选择数据文件",
+                "选择输入文件",
                 "",
                 (
+                    "DataPilot 支持文件 "
+                    "(*.csv *.xlsx *.xls *.docx *.pdf *.txt *.md);;"
                     "数据文件 (*.csv *.xlsx *.xls);;"
+                    "办公文档 (*.docx *.pdf *.txt *.md);;"
                     "所有文件 (*.*)"
                 ),
             )
@@ -582,7 +665,7 @@ class MainWindow(QMainWindow):
         folder_path = (
             QFileDialog.getExistingDirectory(
                 self,
-                "选择数据文件夹",
+                "选择输入文件夹",
             )
         )
 
@@ -593,15 +676,40 @@ class MainWindow(QMainWindow):
             ".csv",
             ".xlsx",
             ".xls",
+            ".docx",
+            ".pdf",
+            ".txt",
+            ".md",
         )
 
         found_files = []
 
-        for root, _, files in os.walk(
+        for root, dirs, files in os.walk(
             folder_path
         ):
+            # 直接从 os.walk 的待遍历目录列表中移除无关目录，
+            # 这样不仅不会把其中的文件加入 GUI，也不会浪费时间继续扫描。
+            dirs[:] = [
+                directory
+                for directory in dirs
+                if directory.lower()
+                not in {
+                    name.lower()
+                    for name in IGNORED_SCAN_DIRS
+                }
+                and not directory.startswith(".")
+            ]
+
             for file_name in files:
-                if file_name.lower().endswith(
+                lower_name = file_name.lower()
+
+                if file_name.startswith("~$"):
+                    continue
+
+                if file_name.startswith("."):
+                    continue
+
+                if lower_name.endswith(
                     supported_extensions
                 ):
                     found_files.append(
@@ -615,7 +723,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "提示",
-                "所选文件夹中没有找到 CSV 或 Excel 文件。",
+                (
+                    "所选文件夹中没有找到 DataPilot 支持的文件。\n"
+                    "当前支持：CSV、Excel、Word、PDF、TXT、Markdown。"
+                ),
             )
 
             return
@@ -644,7 +755,7 @@ class MainWindow(QMainWindow):
             added_count += 1
 
         self.append_log(
-            f"从文件夹中识别到 {len(found_files)} 个数据文件，"
+            f"从文件夹中识别到 {len(found_files)} 个支持文件，"
             f"新增 {added_count} 个文件。"
         )
 
@@ -796,6 +907,14 @@ class MainWindow(QMainWindow):
 
         self.result_list.clear()
 
+        self.document_result_output.clear()
+        self.document_result_output.setVisible(
+            False
+        )
+        self.document_result_label.setVisible(
+            False
+        )
+
         self.open_excel_button.setEnabled(
             False
         )
@@ -896,6 +1015,185 @@ class MainWindow(QMainWindow):
         self.append_log(
             "=" * 60
         )
+
+        # ----------------------------------------------------
+        # v3.0：办公文档 / 跨格式混合办公任务
+        # ----------------------------------------------------
+
+        task_type = self.result.get(
+            "task_type"
+        )
+
+        if task_type in {
+            "document_task",
+            "mixed_office_task",
+        }:
+            selected_documents = self.result.get(
+                "selected_documents",
+                [],
+            )
+
+            selected_data_files = self.result.get(
+                "selected_data_files",
+                [],
+            )
+
+            selection_reason = self.result.get(
+                "selection_reason",
+                "",
+            )
+
+            document_answer = (
+                self.result.get("document_answer")
+                or self.result.get("message")
+                or ""
+            )
+
+            if task_type == "mixed_office_task":
+                self.append_log(
+                    "任务类型：跨格式混合办公任务"
+                )
+
+                self.append_log(
+                    f"实际处理数据文件数量：{len(selected_data_files)}"
+                )
+
+                self.append_log(
+                    f"实际阅读文档数量：{len(selected_documents)}"
+                )
+
+                if selected_data_files:
+                    self.append_log(
+                        "已分析数据文件："
+                    )
+
+                    for data_path in selected_data_files:
+                        self.append_log(
+                            f"  - {data_path}"
+                        )
+
+                        self.result_list.addItem(
+                            f"已分析数据：{data_path}"
+                        )
+
+            else:
+                self.append_log(
+                    "任务类型：办公文档理解任务"
+                )
+
+                self.append_log(
+                    f"实际阅读文档数量：{len(selected_documents)}"
+                )
+
+            if selected_documents:
+                self.append_log(
+                    "已阅读文档："
+                )
+
+                for document_path in selected_documents:
+                    self.append_log(
+                        f"  - {document_path}"
+                    )
+
+                    self.result_list.addItem(
+                        f"已阅读文档：{document_path}"
+                    )
+
+            if selection_reason:
+                if task_type == "mixed_office_task":
+                    self.append_log(
+                        "跨格式文件选择依据："
+                    )
+                else:
+                    self.append_log(
+                        "文档选择依据："
+                    )
+
+                self.append_log(
+                    selection_reason
+                )
+
+            if document_answer:
+                if task_type == "mixed_office_task":
+                    self.document_result_label.setText(
+                        "跨格式综合结果"
+                    )
+                else:
+                    self.document_result_label.setText(
+                        "文档综合结果"
+                    )
+
+                self.document_result_output.setPlainText(
+                    document_answer
+                )
+
+                self.document_result_label.setVisible(
+                    True
+                )
+
+                self.document_result_output.setVisible(
+                    True
+                )
+
+                if task_type == "mixed_office_task":
+                    self.append_log(
+                        "跨格式综合结果已显示在下方“跨格式综合结果”区域。"
+                    )
+                else:
+                    self.append_log(
+                        "跨文档综合结果已显示在下方“文档综合结果”区域。"
+                    )
+
+            word_path = self.result.get(
+                "word_path"
+            )
+
+            if word_path:
+                self.result_list.addItem(
+                    f"Word 报告：{word_path}"
+                )
+
+                self.append_log(
+                    f"Word 报告：{word_path}"
+                )
+
+                self.open_word_button.setEnabled(
+                    True
+                )
+
+            output_dir = (
+                self.output_input
+                .text()
+                .strip()
+            )
+
+            if (
+                output_dir
+                and os.path.isdir(output_dir)
+            ):
+                self.open_output_button.setEnabled(
+                    True
+                )
+
+            if task_type == "mixed_office_task":
+                completion_text = (
+                    "跨格式混合办公任务执行成功。\n"
+                    f"已分析 {len(selected_data_files)} 个数据文件，"
+                    f"阅读 {len(selected_documents)} 个办公文档。"
+                )
+            else:
+                completion_text = (
+                    "办公文档任务执行成功。\n"
+                    f"已阅读 {len(selected_documents)} 个相关文档。"
+                )
+
+            QMessageBox.information(
+                self,
+                "执行完成",
+                completion_text,
+            )
+
+            return
 
         # ----------------------------------------------------
         # 任务计划
