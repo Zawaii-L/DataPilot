@@ -127,7 +127,9 @@ def filter_data(
             errors="coerce",
         )
 
-        numeric_value = float(value)
+        numeric_value = float(
+            value
+        )
 
         return result[
             numeric_series > numeric_value
@@ -143,7 +145,9 @@ def filter_data(
             errors="coerce",
         )
 
-        numeric_value = float(value)
+        numeric_value = float(
+            value
+        )
 
         return result[
             numeric_series >= numeric_value
@@ -159,7 +163,9 @@ def filter_data(
             errors="coerce",
         )
 
-        numeric_value = float(value)
+        numeric_value = float(
+            value
+        )
 
         return result[
             numeric_series < numeric_value
@@ -175,7 +181,9 @@ def filter_data(
             errors="coerce",
         )
 
-        numeric_value = float(value)
+        numeric_value = float(
+            value
+        )
 
         return result[
             numeric_series <= numeric_value
@@ -224,7 +232,9 @@ def filter_data(
             value,
             (list, tuple, set),
         ):
-            value = [value]
+            value = [
+                value
+            ]
 
         string_values = [
             str(item)
@@ -233,7 +243,9 @@ def filter_data(
 
         return result[
             series.astype(str)
-            .isin(string_values)
+            .isin(
+                string_values
+            )
         ].copy()
 
     raise ValueError(
@@ -367,7 +379,7 @@ def select_columns(
 
 
 # ============================================================
-# 7. 分组统计
+# 7. 单字段分组统计
 # ============================================================
 
 def group_statistics(
@@ -377,7 +389,7 @@ def group_statistics(
     operation="mean",
 ):
     """
-    按字段进行分组统计。
+    按一个字段进行单指标分组统计。
 
     支持：
         mean
@@ -406,6 +418,10 @@ def group_statistics(
         "median",
     }
 
+    operation = str(
+        operation
+    ).lower()
+
     if operation not in supported_operations:
         raise ValueError(
             f"暂不支持统计操作：{operation}"
@@ -427,7 +443,9 @@ def group_statistics(
             group_by,
             dropna=False,
         )[target_column]
-        .agg(operation)
+        .agg(
+            operation
+        )
         .reset_index()
     )
 
@@ -456,7 +474,427 @@ def group_statistics(
 
 
 # ============================================================
-# 8. 删除字段
+# 8. 多字段 + 多指标分组统计
+# ============================================================
+
+def group_multi_statistics(
+    df,
+    group_by,
+    aggregations,
+):
+    """
+    多字段、多指标分组统计。
+
+    示例：
+
+    group_multi_statistics(
+        df=df,
+        group_by=["城市", "月份"],
+        aggregations={
+            "销售额": ["sum", "mean"],
+            "订单金额": ["mean", "max"],
+            "订单号": ["count"],
+        },
+    )
+
+    group_by 支持：
+        "城市"
+        ["城市"]
+        ["城市", "月份"]
+
+    aggregations 支持：
+
+        {
+            "销售额": ["sum", "mean"],
+            "订单金额": ["mean", "max"],
+            "订单号": ["count"]
+        }
+
+    支持的统计方式：
+        mean
+        sum
+        count
+        max
+        min
+        median
+
+    返回列示例：
+        城市
+        月份
+        销售额_合计
+        销售额_平均值
+        订单金额_平均值
+        订单金额_最大值
+        订单号_数量
+    """
+
+    # --------------------------------------------------------
+    # 检查 DataFrame
+    # --------------------------------------------------------
+
+    if df is None:
+        raise ValueError(
+            "输入 DataFrame 不能为空。"
+        )
+
+    if not isinstance(
+        df,
+        pd.DataFrame,
+    ):
+        raise TypeError(
+            "df 必须是 pandas DataFrame。"
+        )
+
+    if df.empty:
+        raise ValueError(
+            "输入数据为空，无法执行分组统计。"
+        )
+
+    # --------------------------------------------------------
+    # 整理分组字段
+    # --------------------------------------------------------
+
+    if isinstance(
+        group_by,
+        str,
+    ):
+        group_columns = [
+            group_by
+        ]
+
+    elif isinstance(
+        group_by,
+        (list, tuple),
+    ):
+        group_columns = list(
+            group_by
+        )
+
+    else:
+        raise TypeError(
+            "group_by 必须是字段名字符串"
+            "或字段名列表。"
+        )
+
+    group_columns = [
+        str(column)
+        for column in group_columns
+        if column
+    ]
+
+    if not group_columns:
+        raise ValueError(
+            "至少需要一个分组字段。"
+        )
+
+    # 去掉重复的分组字段
+    unique_group_columns = []
+
+    for column in group_columns:
+        if column not in unique_group_columns:
+            unique_group_columns.append(
+                column
+            )
+
+    group_columns = (
+        unique_group_columns
+    )
+
+    missing_group_columns = [
+        column
+        for column in group_columns
+        if column not in df.columns
+    ]
+
+    if missing_group_columns:
+        raise ValueError(
+            "以下分组字段不存在："
+            + ", ".join(
+                missing_group_columns
+            )
+        )
+
+    # --------------------------------------------------------
+    # 检查 aggregations
+    # --------------------------------------------------------
+
+    if not isinstance(
+        aggregations,
+        dict,
+    ):
+        raise TypeError(
+            "aggregations 必须是字典。"
+        )
+
+    if not aggregations:
+        raise ValueError(
+            "aggregations 不能为空。"
+        )
+
+    supported_operations = {
+        "mean",
+        "sum",
+        "count",
+        "max",
+        "min",
+        "median",
+    }
+
+    operation_names = {
+        "mean": "平均值",
+        "sum": "合计",
+        "count": "数量",
+        "max": "最大值",
+        "min": "最小值",
+        "median": "中位数",
+    }
+
+    # --------------------------------------------------------
+    # 标准化统计配置
+    # --------------------------------------------------------
+
+    normalized_aggregations = {}
+
+    for column, operations in (
+        aggregations.items()
+    ):
+        if column not in df.columns:
+            raise ValueError(
+                f"统计字段不存在：{column}"
+            )
+
+        if isinstance(
+            operations,
+            str,
+        ):
+            operation_list = [
+                operations
+            ]
+
+        elif isinstance(
+            operations,
+            (list, tuple),
+        ):
+            operation_list = list(
+                operations
+            )
+
+        else:
+            raise TypeError(
+                f"字段 {column} 的统计方式"
+                "必须是字符串或列表。"
+            )
+
+        if not operation_list:
+            raise ValueError(
+                f"字段 {column} 没有提供统计方式。"
+            )
+
+        operation_list = [
+            str(operation).lower()
+            for operation in operation_list
+        ]
+
+        # 去除重复统计方式
+        unique_operations = []
+
+        for operation in operation_list:
+            if (
+                operation
+                not in unique_operations
+            ):
+                unique_operations.append(
+                    operation
+                )
+
+        operation_list = (
+            unique_operations
+        )
+
+        unsupported_operations = [
+            operation
+            for operation in operation_list
+            if operation
+            not in supported_operations
+        ]
+
+        if unsupported_operations:
+            raise ValueError(
+                f"字段 {column} 包含"
+                "暂不支持的统计方式："
+                + ", ".join(
+                    unsupported_operations
+                )
+            )
+
+        normalized_aggregations[
+            column
+        ] = operation_list
+
+    # --------------------------------------------------------
+    # 创建临时数据
+    # --------------------------------------------------------
+
+    temp_df = df.copy()
+
+    # --------------------------------------------------------
+    # 数值统计字段转换
+    #
+    # count 可以用于文本字段。
+    # mean / sum / max / min / median
+    # 需要数值字段。
+    # --------------------------------------------------------
+
+    numeric_operations = {
+        "mean",
+        "sum",
+        "max",
+        "min",
+        "median",
+    }
+
+    for column, operations in (
+        normalized_aggregations.items()
+    ):
+        needs_numeric = any(
+            operation
+            in numeric_operations
+            for operation in operations
+        )
+
+        if not needs_numeric:
+            continue
+
+        numeric_series = (
+            pd.to_numeric(
+                temp_df[column],
+                errors="coerce",
+            )
+        )
+
+        original_non_null_count = int(
+            temp_df[column]
+            .notna()
+            .sum()
+        )
+
+        numeric_non_null_count = int(
+            numeric_series
+            .notna()
+            .sum()
+        )
+
+        if (
+            original_non_null_count > 0
+            and numeric_non_null_count == 0
+        ):
+            raise ValueError(
+                f"字段 {column} "
+                "无法执行数值统计，"
+                "因为该字段不是有效数值字段。"
+            )
+
+        temp_df[column] = (
+            numeric_series
+        )
+
+    # --------------------------------------------------------
+    # 执行分组统计
+    # --------------------------------------------------------
+
+    try:
+        grouped = (
+            temp_df
+            .groupby(
+                group_columns,
+                dropna=False,
+            )
+            .agg(
+                normalized_aggregations
+            )
+        )
+
+    except Exception as error:
+        raise ValueError(
+            "多字段多指标统计执行失败："
+            f"{error}"
+        ) from error
+
+    # --------------------------------------------------------
+    # 展开 Pandas MultiIndex 列
+    #
+    # 例如：
+    # ('销售额', 'sum')
+    #
+    # 变成：
+    # 销售额_合计
+    # --------------------------------------------------------
+
+    flattened_columns = []
+
+    for column_info in grouped.columns:
+        if isinstance(
+            column_info,
+            tuple,
+        ):
+            source_column = (
+                column_info[0]
+            )
+
+            operation = (
+                column_info[1]
+            )
+
+        else:
+            source_column = str(
+                column_info
+            )
+
+            operation = ""
+
+        operation_cn = (
+            operation_names.get(
+                operation,
+                operation,
+            )
+        )
+
+        if operation_cn:
+            new_column_name = (
+                f"{source_column}_"
+                f"{operation_cn}"
+            )
+
+        else:
+            new_column_name = str(
+                source_column
+            )
+
+        flattened_columns.append(
+            new_column_name
+        )
+
+    grouped.columns = (
+        flattened_columns
+    )
+
+    # --------------------------------------------------------
+    # 把 group_by 从 index 恢复为普通字段
+    # --------------------------------------------------------
+
+    grouped = (
+        grouped
+        .reset_index()
+        .reset_index(
+            drop=True
+        )
+    )
+
+    return grouped
+
+
+# ============================================================
+# 9. 删除字段
 # ============================================================
 
 def drop_columns(
@@ -481,7 +919,7 @@ def drop_columns(
 
 
 # ============================================================
-# 9. 重命名字段
+# 10. 重命名字段
 # ============================================================
 
 def rename_columns(
@@ -507,7 +945,7 @@ def rename_columns(
 
 
 # ============================================================
-# 10. 数据去重
+# 11. 数据去重
 # ============================================================
 
 def drop_duplicate_rows(
@@ -519,31 +957,35 @@ def drop_duplicate_rows(
     删除重复记录。
 
     参数：
-        df:
-            输入 DataFrame。
 
-        columns:
-            用哪些字段判断重复。
+    columns:
+        None：
+            使用全部字段判断。
 
-            None：
-                使用全部字段判断。
+        ["城市", "日期"]：
+            只根据指定字段判断重复。
 
-            ["城市", "日期"]：
-                只根据指定字段判断重复。
+    keep:
+        "first"：
+            保留第一条。
 
-        keep:
-            "first"：
-                保留第一条。
+        "last"：
+            保留最后一条。
 
-            "last"：
-                保留最后一条。
-
-            False：
-                所有重复记录都删除。
+        False：
+            所有重复记录都删除。
     """
     result = df.copy()
 
     if columns:
+        if isinstance(
+            columns,
+            str,
+        ):
+            columns = [
+                columns
+            ]
+
         missing_columns = [
             column
             for column in columns
@@ -562,6 +1004,26 @@ def drop_duplicate_rows(
 
     else:
         subset = None
+
+    # LLM 有时可能返回字符串 "false"
+    if isinstance(
+        keep,
+        str,
+    ):
+        keep_text = (
+            keep
+            .strip()
+            .lower()
+        )
+
+        if keep_text == "false":
+            keep = False
+
+        elif keep_text == "first":
+            keep = "first"
+
+        elif keep_text == "last":
+            keep = "last"
 
     valid_keep_values = [
         "first",
@@ -587,7 +1049,7 @@ def drop_duplicate_rows(
 
 
 # ============================================================
-# 11. 缺失值处理
+# 12. 缺失值处理
 # ============================================================
 
 def handle_missing_values(
@@ -599,7 +1061,7 @@ def handle_missing_values(
     """
     处理数据中的缺失值。
 
-    支持的方法：
+    支持：
 
     drop
         删除存在缺失值的记录。
@@ -608,25 +1070,13 @@ def handle_missing_values(
         使用指定 fill_value 填充。
 
     mean
-        使用该字段平均值填充。
-        适用于数值字段。
+        使用平均值填充。
 
     median
-        使用该字段中位数填充。
-        适用于数值字段。
+        使用中位数填充。
 
     mode
-        使用该字段众数填充。
-        可用于文本或数值字段。
-
-    参数：
-
-    columns:
-        None：
-            对全部字段处理。
-
-        ["温度", "湿度"]：
-            只处理指定字段。
+        使用众数填充。
     """
     result = df.copy()
 
@@ -813,7 +1263,7 @@ def handle_missing_values(
 
 
 # ============================================================
-# 12. 日期范围筛选
+# 13. 日期范围筛选
 # ============================================================
 
 def filter_date_range(
@@ -824,15 +1274,6 @@ def filter_date_range(
 ):
     """
     根据日期字段筛选指定时间范围。
-
-    示例：
-
-    filter_date_range(
-        df,
-        column="日期",
-        start_date="2026-09-01",
-        end_date="2026-09-30",
-    )
 
     支持：
 
@@ -863,16 +1304,32 @@ def filter_date_range(
 
     result = df.copy()
 
-    date_series = pd.to_datetime(
-        result[column],
-        errors="coerce",
-    )
+    # --------------------------------------------------------
+    # Pandas 新版本对混合日期格式更严格。
+    # 优先尝试 format="mixed"，
+    # 如果当前 Pandas 不支持则自动回退。
+    # --------------------------------------------------------
+
+    try:
+        date_series = pd.to_datetime(
+            result[column],
+            errors="coerce",
+            format="mixed",
+        )
+
+    except TypeError:
+        date_series = pd.to_datetime(
+            result[column],
+            errors="coerce",
+        )
 
     valid_date_mask = (
         date_series.notna()
     )
 
-    mask = valid_date_mask.copy()
+    mask = (
+        valid_date_mask.copy()
+    )
 
     if start_date is not None:
         start_datetime = pd.to_datetime(
@@ -908,16 +1365,15 @@ def filter_date_range(
                 f"无法识别结束日期：{end_date}"
             )
 
-        # 如果用户只写日期，
-        # 例如 2026-09-30，
-        # 这里将结束日期扩展到当天结束，
-        # 避免漏掉当天带时间的数据。
+        # 如果用户只提供日期，没有提供具体时间，
+        # 则将结束日期扩展到当天结束。
         end_date_text = str(
             end_date
         ).strip()
 
         has_explicit_time = any(
-            separator in end_date_text
+            separator
+            in end_date_text
             for separator in [
                 ":",
                 "T",
@@ -961,7 +1417,7 @@ def filter_date_range(
 
 
 # ============================================================
-# 13. 导出办公处理结果
+# 14. 导出办公处理结果
 # ============================================================
 
 def export_office_result(
@@ -993,7 +1449,7 @@ def export_office_result(
 
 
 # ============================================================
-# 14. 数据基本信息
+# 15. 数据基本信息
 # ============================================================
 
 def get_data_info(df):
@@ -1048,7 +1504,7 @@ def get_data_info(df):
 
 
 # ============================================================
-# 15. 本地测试
+# 16. 本地测试
 # ============================================================
 
 if __name__ == "__main__":

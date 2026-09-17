@@ -21,6 +21,7 @@ from office_data_tools import (
     sort_data,
     select_columns,
     group_statistics,
+    group_multi_statistics,
     drop_columns,
     rename_columns,
     drop_duplicate_rows,
@@ -62,6 +63,7 @@ class DataPilotAgent:
     21. 重复数据删除
     22. 缺失值处理
     23. 日期范围筛选
+    24. 多字段 + 多指标分组统计
     """
 
     def __init__(
@@ -383,6 +385,11 @@ class DataPilotAgent:
             "填充",
             "日期范围",
             "时间范围",
+            "多字段",
+            "多指标",
+            "分别统计",
+            "同时统计",
+            "订单数量",
         ]
 
         return any(
@@ -631,7 +638,66 @@ mode
 
 start_date 和 end_date 至少提供一个。
 
-11. export_excel
+11. group_multi_statistics
+
+当用户要求以下任一情况时，优先使用 group_multi_statistics：
+
+- 按多个字段同时分组
+- 对多个统计字段同时计算不同指标
+- 一个统计字段同时计算多个指标
+
+JSON 格式：
+
+{
+  "action": "group_multi_statistics",
+  "group_by": ["城市", "月份"],
+  "aggregations": {
+    "销售额": ["sum", "mean"],
+    "订单金额": ["mean", "max"],
+    "订单号": ["count"]
+  }
+}
+
+group_by：
+- 必须使用字段列表
+- 可以包含一个或多个字段
+- 例如 ["城市", "月份"]
+
+aggregations：
+- 必须是 JSON 对象
+- key 是需要统计的字段名
+- value 是该字段需要执行的统计方式列表
+
+统计方式只允许：
+
+mean
+sum
+count
+max
+min
+median
+
+例如用户说：
+
+“按城市和月份分组，统计销售额的合计和平均值、
+订单金额的平均值和最大值，并统计订单数量”
+
+应生成：
+
+{
+  "action": "group_multi_statistics",
+  "group_by": ["城市", "月份"],
+  "aggregations": {
+    "销售额": ["sum", "mean"],
+    "订单金额": ["mean", "max"],
+    "订单号": ["count"]
+  }
+}
+
+如果用户只是要求一个分组字段、一个目标字段和一个统计指标，
+例如“按城市计算平均温度”，仍然可以使用 group_statistics。
+
+12. export_excel
 
 {
   "action": "export_excel"
@@ -756,7 +822,17 @@ start_date 和 end_date 至少提供一个。
 22. 如果用户同时要求去重、缺失值处理、日期筛选，
     operations 必须严格按照用户描述的执行顺序生成。
 
-23. 只返回 JSON。
+23. 当用户要求多个分组字段，或者多个统计字段，
+    或者同一字段需要多个统计指标时，
+    使用 group_multi_statistics。
+
+24. group_multi_statistics 的 group_by 必须使用字段列表，
+    aggregations 必须使用“字段名 → 统计方式列表”的 JSON 对象。
+
+25. 如果用户同时要求生成 Excel、图表和 Word 报告，
+    need_excel、need_chart、need_word_report 都必须设为 true。
+
+26. 只返回 JSON。
 """
 
         try:
@@ -1778,6 +1854,47 @@ start_date 和 end_date 至少提供一个。
 
             self.report_progress(
                 f"日期筛选完成：{before_rows} 行 → {after_rows} 行"
+            )
+
+            return dataframe, None
+
+        # --------------------------------------------------------
+        # group_multi_statistics
+        # --------------------------------------------------------
+
+        if action == "group_multi_statistics":
+            group_by = operation.get(
+                "group_by"
+            )
+
+            aggregations = operation.get(
+                "aggregations",
+                {},
+            )
+
+            if not group_by:
+                raise ValueError(
+                    "group_multi_statistics 操作缺少 group_by。"
+                )
+
+            if not aggregations:
+                raise ValueError(
+                    "group_multi_statistics 操作缺少 aggregations。"
+                )
+
+            self.report_progress(
+                f"[{operation_index}] 正在执行多字段 + 多指标分组统计："
+                f"分组字段={group_by}，统计配置={aggregations}"
+            )
+
+            dataframe = group_multi_statistics(
+                df=dataframe,
+                group_by=group_by,
+                aggregations=aggregations,
+            )
+
+            self.report_progress(
+                f"多字段 + 多指标分组统计完成，共 {len(dataframe)} 行结果。"
             )
 
             return dataframe, None
