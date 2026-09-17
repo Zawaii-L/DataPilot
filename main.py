@@ -2,81 +2,57 @@ import os
 import re
 import sys
 import traceback
-from pathlib import Path
+import subprocess
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QWidget,
-    QVBoxLayout,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
-    QPushButton,
-    QTextEdit,
-    QLineEdit,
-    QFileDialog,
-    QMessageBox,
-    QGroupBox,
-    QProgressBar,
     QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+    QLineEdit,
 )
 
 from agent import DataPilotAgent
 
 
 class AgentWorker(QThread):
-    """
-    后台执行 DataPilot Agent 任务，避免主界面卡死。
-    """
-
     log_signal = Signal(str)
     success_signal = Signal(dict)
     error_signal = Signal(str)
 
-    def __init__(
-        self,
-        task,
-        input_paths,
-        output_dir,
-    ):
+    def __init__(self, task, input_paths, output_dir):
         super().__init__()
-
         self.task = task
         self.input_paths = input_paths
         self.output_dir = output_dir
 
     def report_progress(self, message):
-        """
-        将 Agent 内部的进度消息转发给 GUI。
-        """
         self.log_signal.emit(str(message))
 
     def run(self):
         try:
-            self.log_signal.emit(
-                "正在初始化 DataPilot Agent……"
-            )
+            self.report_progress("正在创建 DataPilot Agent...")
 
             agent = DataPilotAgent(
                 progress_callback=self.report_progress
             )
 
-            self.log_signal.emit(
-                "DataPilot Agent 初始化成功。"
-            )
-            self.log_signal.emit("")
+            self.report_progress("开始执行任务...")
 
             result = agent.execute_task(
                 user_task=self.task,
                 input_paths=self.input_paths,
                 output_dir=self.output_dir,
             )
-
-            if not isinstance(result, dict):
-                self.error_signal.emit(
-                    "Agent 返回结果不是字典。"
-                )
-                return
 
             self.success_signal.emit(result)
 
@@ -85,951 +61,567 @@ class AgentWorker(QThread):
             self.error_signal.emit(error_message)
 
 
-class DataPilotWindow(QWidget):
-    """
-    DataPilot 桌面端主窗口。
-    """
-
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.worker = None
-        self.selected_paths = []
+        self.result = {}
+        self.output_dir = "outputs"
 
-        self.setWindowTitle(
-            "DataPilot - 智能数据办公 Agent"
-        )
-
-        self.resize(1050, 800)
+        self.setWindowTitle("DataPilot - 智能数据办公 Agent")
+        self.resize(1000, 760)
 
         self.init_ui()
 
     def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
         main_layout = QVBoxLayout()
-        main_layout.setSpacing(12)
+        central_widget.setLayout(main_layout)
 
-        # ====================================================
-        # 标题
-        # ====================================================
-
-        title_label = QLabel(
-            "DataPilot · 智能数据办公 Agent"
-        )
-
+        title_label = QLabel("DataPilot · 智能数据办公 Agent")
         title_label.setStyleSheet(
             """
             QLabel {
                 font-size: 24px;
                 font-weight: bold;
-                color: #1f4e79;
-                padding: 8px 0;
+                padding: 12px 0;
             }
             """
         )
-
         main_layout.addWidget(title_label)
 
         subtitle_label = QLabel(
-            "用自然语言描述任务，Agent 自动完成数据获取、"
-            "数据清洗、统计分析和报告生成。"
-            "支持单文件、多文件、文件夹和网络数据。"
+            "用自然语言描述任务，自动完成数据下载、清洗、分析和报告生成"
         )
-
-        subtitle_label.setWordWrap(True)
-
         subtitle_label.setStyleSheet(
             """
             QLabel {
                 color: #666666;
-                font-size: 13px;
-                padding-bottom: 5px;
+                padding-bottom: 10px;
             }
             """
         )
-
         main_layout.addWidget(subtitle_label)
 
-        # ====================================================
-        # 1. 任务输入
-        # ====================================================
-
-        task_group = QGroupBox(
-            "1. 输入办公任务"
-        )
-
-        task_layout = QVBoxLayout()
+        task_label = QLabel("任务描述")
+        task_label.setStyleSheet("font-weight: bold;")
+        main_layout.addWidget(task_label)
 
         self.task_input = QTextEdit()
-
         self.task_input.setPlaceholderText(
-            "例如：\n"
-            "请分析这些天气数据，检查缺失值和重复值，"
-            "清洗后生成统计图、Excel 和 Word 报告。\n\n"
-            "也可以直接输入网络数据地址：\n"
-            "请下载这个 CSV 文件并分析：\n"
-            "https://example.com/data.csv"
+            "例如：请批量分析我选择的这些文件，检查数据质量，"
+            "清洗数据，生成统计图和 Word 报告"
         )
+        self.task_input.setMinimumHeight(90)
+        main_layout.addWidget(self.task_input)
 
-        self.task_input.setMinimumHeight(125)
-
-        task_layout.addWidget(
-            self.task_input
-        )
-
-        task_group.setLayout(
-            task_layout
-        )
-
-        main_layout.addWidget(
-            task_group
-        )
-
-        # ====================================================
-        # 2. 本地文件选择
-        # ====================================================
-
-        file_group = QGroupBox(
-            "2. 选择本地数据文件或文件夹（可选）"
-        )
-
-        file_layout = QVBoxLayout()
-
-        self.file_input = QLineEdit()
-
-        self.file_input.setPlaceholderText(
-            "可以选择一个文件、多个文件或整个文件夹"
-        )
-
-        self.file_input.setReadOnly(True)
+        file_label = QLabel("输入文件")
+        file_label.setStyleSheet("font-weight: bold;")
+        main_layout.addWidget(file_label)
 
         file_button_layout = QHBoxLayout()
 
-        self.file_button = QPushButton(
-            "选择单个文件"
-        )
+        self.select_file_button = QPushButton("选择文件")
+        self.select_file_button.clicked.connect(self.select_files)
+        file_button_layout.addWidget(self.select_file_button)
 
-        self.file_button.clicked.connect(
-            self.select_file
-        )
+        self.select_folder_button = QPushButton("选择文件夹")
+        self.select_folder_button.clicked.connect(self.select_folder)
+        file_button_layout.addWidget(self.select_folder_button)
 
-        self.multi_file_button = QPushButton(
-            "选择多个文件"
-        )
+        self.clear_file_button = QPushButton("清空文件")
+        self.clear_file_button.clicked.connect(self.clear_files)
+        file_button_layout.addWidget(self.clear_file_button)
 
-        self.multi_file_button.clicked.connect(
-            self.select_multiple_files
-        )
+        file_button_layout.addStretch()
 
-        self.folder_button = QPushButton(
-            "选择文件夹"
-        )
+        main_layout.addLayout(file_button_layout)
 
-        self.folder_button.clicked.connect(
-            self.select_folder
-        )
-
-        self.clear_file_button = QPushButton(
-            "清除选择"
-        )
-
-        self.clear_file_button.clicked.connect(
-            self.clear_file
-        )
-
-        file_button_layout.addWidget(
-            self.file_button
-        )
-
-        file_button_layout.addWidget(
-            self.multi_file_button
-        )
-
-        file_button_layout.addWidget(
-            self.folder_button
-        )
-
-        file_button_layout.addWidget(
-            self.clear_file_button
-        )
-
-        self.selected_file_list = QListWidget()
-
-        self.selected_file_list.setMinimumHeight(
-            90
-        )
-
-        file_layout.addWidget(
-            self.file_input
-        )
-
-        file_layout.addLayout(
-            file_button_layout
-        )
-
-        file_layout.addWidget(
-            self.selected_file_list
-        )
-
-        file_group.setLayout(
-            file_layout
-        )
-
-        main_layout.addWidget(
-            file_group
-        )
-
-        # ====================================================
-        # 3. 输出目录选择
-        # ====================================================
-
-        output_group = QGroupBox(
-            "3. 选择输出目录"
-        )
+        self.file_list = QListWidget()
+        self.file_list.setMinimumHeight(100)
+        main_layout.addWidget(self.file_list)
 
         output_layout = QHBoxLayout()
 
+        output_label = QLabel("输出目录：")
+        output_layout.addWidget(output_label)
+
         self.output_input = QLineEdit()
+        self.output_input.setText(os.path.abspath("outputs"))
+        output_layout.addWidget(self.output_input)
 
-        self.output_input.setPlaceholderText(
-            "请选择结果保存目录，默认保存到 outputs"
-        )
+        self.select_output_button = QPushButton("选择目录")
+        self.select_output_button.clicked.connect(self.select_output_dir)
+        output_layout.addWidget(self.select_output_button)
 
-        self.output_input.setReadOnly(True)
+        main_layout.addLayout(output_layout)
 
-        self.output_button = QPushButton(
-            "选择目录"
-        )
+        control_layout = QHBoxLayout()
 
-        self.output_button.clicked.connect(
-            self.select_output_dir
-        )
+        self.start_button = QPushButton("开始执行")
+        self.start_button.setMinimumHeight(40)
+        self.start_button.clicked.connect(self.start_task)
+        control_layout.addWidget(self.start_button)
 
-        self.clear_output_button = QPushButton(
-            "清除目录"
-        )
+        self.clear_log_button = QPushButton("清空日志")
+        self.clear_log_button.setMinimumHeight(40)
+        self.clear_log_button.clicked.connect(self.clear_log)
+        control_layout.addWidget(self.clear_log_button)
 
-        self.clear_output_button.clicked.connect(
-            self.clear_output_dir
-        )
+        control_layout.addStretch()
 
-        output_layout.addWidget(
-            self.output_input
-        )
-
-        output_layout.addWidget(
-            self.output_button
-        )
-
-        output_layout.addWidget(
-            self.clear_output_button
-        )
-
-        output_group.setLayout(
-            output_layout
-        )
-
-        main_layout.addWidget(
-            output_group
-        )
-
-        # ====================================================
-        # 操作按钮
-        # ====================================================
-
-        button_layout = QHBoxLayout()
-
-        self.run_button = QPushButton(
-            "开始执行任务"
-        )
-
-        self.run_button.setMinimumHeight(
-            42
-        )
-
-        self.run_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #1f75cb;
-                color: white;
-                font-size: 15px;
-                font-weight: bold;
-                border-radius: 6px;
-                padding: 8px 20px;
-            }
-
-            QPushButton:hover {
-                background-color: #155a9c;
-            }
-
-            QPushButton:disabled {
-                background-color: #aaaaaa;
-            }
-            """
-        )
-
-        self.run_button.clicked.connect(
-            self.start_task
-        )
-
-        self.clear_button = QPushButton(
-            "清空日志"
-        )
-
-        self.clear_button.setMinimumHeight(
-            42
-        )
-
-        self.clear_button.clicked.connect(
-            self.clear_log
-        )
-
-        button_layout.addWidget(
-            self.run_button
-        )
-
-        button_layout.addWidget(
-            self.clear_button
-        )
-
-        button_layout.addStretch()
-
-        main_layout.addLayout(
-            button_layout
-        )
-
-        # ====================================================
-        # 进度条
-        # ====================================================
+        main_layout.addLayout(control_layout)
 
         self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
 
-        self.progress_bar.setRange(
-            0,
-            0
-        )
-
-        self.progress_bar.setVisible(
-            False
-        )
-
-        main_layout.addWidget(
-            self.progress_bar
-        )
-
-        # ====================================================
-        # 日志区域
-        # ====================================================
-
-        log_group = QGroupBox(
-            "4. 执行日志与结果"
-        )
-
-        log_layout = QVBoxLayout()
+        log_label = QLabel("执行日志")
+        log_label.setStyleSheet("font-weight: bold;")
+        main_layout.addWidget(log_label)
 
         self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setMinimumHeight(220)
+        main_layout.addWidget(self.log_output)
 
-        self.log_output.setReadOnly(
-            True
+        result_label = QLabel("结果文件")
+        result_label.setStyleSheet("font-weight: bold;")
+        main_layout.addWidget(result_label)
+
+        self.result_list = QListWidget()
+        self.result_list.setMinimumHeight(120)
+        main_layout.addWidget(self.result_list)
+
+        result_button_layout = QHBoxLayout()
+
+        self.open_excel_button = QPushButton("打开清洗后 Excel")
+        self.open_excel_button.clicked.connect(
+            lambda: self.open_result_file("excel_path")
         )
+        self.open_excel_button.setEnabled(False)
+        result_button_layout.addWidget(self.open_excel_button)
 
-        self.log_output.setMinimumHeight(
-            280
+        self.open_statistics_button = QPushButton("打开统计 Excel")
+        self.open_statistics_button.clicked.connect(
+            lambda: self.open_result_file("statistics_path")
         )
+        self.open_statistics_button.setEnabled(False)
+        result_button_layout.addWidget(self.open_statistics_button)
 
-        log_layout.addWidget(
-            self.log_output
+        self.open_chart_button = QPushButton("打开趋势图")
+        self.open_chart_button.clicked.connect(
+            lambda: self.open_result_file("chart_path")
         )
+        self.open_chart_button.setEnabled(False)
+        result_button_layout.addWidget(self.open_chart_button)
 
-        log_group.setLayout(
-            log_layout
+        self.open_word_button = QPushButton("打开 Word 报告")
+        self.open_word_button.clicked.connect(
+            lambda: self.open_result_file("word_path")
         )
+        self.open_word_button.setEnabled(False)
+        result_button_layout.addWidget(self.open_word_button)
 
-        main_layout.addWidget(
-            log_group
-        )
+        self.open_output_button = QPushButton("打开输出文件夹")
+        self.open_output_button.clicked.connect(self.open_output_folder)
+        self.open_output_button.setEnabled(False)
+        result_button_layout.addWidget(self.open_output_button)
 
-        self.setLayout(
-            main_layout
-        )
+        main_layout.addLayout(result_button_layout)
 
-    # ========================================================
-    # 单个文件选择
-    # ========================================================
+    def append_log(self, message):
+        self.log_output.append(str(message))
+        scrollbar = self.log_output.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
-    def select_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
+    def clear_log(self):
+        self.log_output.clear()
+
+    def select_files(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择数据文件",
             "",
-            (
-                "数据文件 (*.csv *.xlsx *.xls);;"
-                "CSV 文件 (*.csv);;"
-                "Excel 文件 (*.xlsx *.xls)"
-            ),
+            "数据文件 (*.csv *.xlsx *.xls);;所有文件 (*.*)",
         )
 
-        if file_path:
-            self.selected_paths = [
-                file_path
-            ]
+        if not file_paths:
+            return
 
-            self.refresh_selected_paths()
+        for file_path in file_paths:
+            if self.file_list.findItems(
+                file_path,
+                Qt.MatchExactly
+            ):
+                continue
 
-            self.append_log(
-                f"已选择本地数据文件：{file_path}"
-            )
+            self.file_list.addItem(file_path)
 
-    # ========================================================
-    # 多个文件选择
-    # ========================================================
-
-    def select_multiple_files(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择多个数据文件",
-            "",
-            (
-                "数据文件 (*.csv *.xlsx *.xls);;"
-                "CSV 文件 (*.csv);;"
-                "Excel 文件 (*.xlsx *.xls)"
-            ),
-        )
-
-        if file_paths:
-            self.selected_paths = list(
-                file_paths
-            )
-
-            self.refresh_selected_paths()
-
-            self.append_log(
-                f"已选择 {len(file_paths)} 个本地数据文件。"
-            )
-
-    # ========================================================
-    # 文件夹选择
-    # ========================================================
+        self.append_log(f"已选择 {len(file_paths)} 个文件。")
 
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(
             self,
             "选择数据文件夹",
-            "",
         )
 
-        if folder_path:
-            self.selected_paths = [
-                folder_path
-            ]
+        if not folder_path:
+            return
 
-            self.refresh_selected_paths()
+        supported_extensions = (".csv", ".xlsx", ".xls")
+        found_files = []
 
-            self.append_log(
-                f"已选择数据文件夹：{folder_path}"
-            )
+        for root, _, files in os.walk(folder_path):
+            for file_name in files:
+                if file_name.lower().endswith(supported_extensions):
+                    found_files.append(
+                        os.path.join(root, file_name)
+                    )
 
-    # ========================================================
-    # 刷新文件列表
-    # ========================================================
-
-    def refresh_selected_paths(self):
-        self.file_input.clear()
-
-        self.selected_file_list.clear()
-
-        if not self.selected_paths:
-            self.file_input.setPlaceholderText(
-                "可以选择一个文件、多个文件或整个文件夹"
+        if not found_files:
+            QMessageBox.information(
+                self,
+                "提示",
+                "所选文件夹中没有找到 CSV 或 Excel 文件。",
             )
             return
 
-        self.file_input.setText(
-            f"已选择 {len(self.selected_paths)} 个路径"
-        )
+        existing_files = {
+            self.file_list.item(index).text()
+            for index in range(self.file_list.count())
+        }
 
-        for path in self.selected_paths:
-            self.selected_file_list.addItem(
-                path
-            )
+        added_count = 0
 
-    # ========================================================
-    # 清除文件选择
-    # ========================================================
-
-    def clear_file(self):
-        self.selected_paths = []
-
-        self.refresh_selected_paths()
+        for file_path in found_files:
+            if file_path not in existing_files:
+                self.file_list.addItem(file_path)
+                added_count += 1
 
         self.append_log(
-            "已清除本地文件和文件夹选择。"
+            f"从文件夹中识别到 {len(found_files)} 个数据文件，"
+            f"新增 {added_count} 个文件。"
         )
 
-    # ========================================================
-    # 输出目录选择
-    # ========================================================
+    def clear_files(self):
+        self.file_list.clear()
+        self.append_log("已清空输入文件列表。")
 
     def select_output_dir(self):
-        output_dir = QFileDialog.getExistingDirectory(
+        folder_path = QFileDialog.getExistingDirectory(
             self,
             "选择输出目录",
-            "",
+            self.output_input.text(),
         )
 
-        if output_dir:
-            self.output_input.setText(
-                output_dir
-            )
+        if folder_path:
+            self.output_input.setText(folder_path)
 
-            self.append_log(
-                f"已选择输出目录：{output_dir}"
-            )
+    def get_input_paths(self):
+        paths = []
 
-    def clear_output_dir(self):
-        self.output_input.clear()
+        for index in range(self.file_list.count()):
+            paths.append(self.file_list.item(index).text())
 
-        self.append_log(
-            "已清除输出目录，将使用默认 outputs 目录。"
-        )
+        return paths
 
-    # ========================================================
-    # 开始执行任务
-    # ========================================================
+    def extract_urls_from_text(self, text):
+        url_pattern = r"https?://[^\s，。；;]+"
+        return re.findall(url_pattern, text)
+
+    def set_controls_enabled(self, enabled):
+        self.start_button.setEnabled(enabled)
+        self.select_file_button.setEnabled(enabled)
+        self.select_folder_button.setEnabled(enabled)
+        self.clear_file_button.setEnabled(enabled)
+        self.select_output_button.setEnabled(enabled)
+        self.clear_log_button.setEnabled(enabled)
 
     def start_task(self):
         task = self.task_input.toPlainText().strip()
-
-        output_dir = self.output_input.text().strip()
 
         if not task:
             QMessageBox.warning(
                 self,
                 "提示",
-                "请先输入你想让 Agent 完成的任务。",
+                "请先输入任务描述。",
             )
-
             return
 
-        urls = self.extract_urls_from_text(
-            task
-        )
+        input_paths = self.get_input_paths()
+        urls = self.extract_urls_from_text(task)
 
-        # 如果没有手动选择本地文件，也没有 URL，
-        # 仍然允许执行，让 agent.py 自动从自然语言中识别文件名。
-        if not self.selected_paths and not urls:
+        if not input_paths and not urls:
             self.append_log(
-                "未手动选择文件，将尝试从任务文本中自动识别本地数据文件。"
+                "没有手动选择文件，也没有发现 URL，"
+                "将交给 Agent 根据自然语言自动识别文件。"
             )
 
-        if output_dir:
-            os.makedirs(
-                output_dir,
-                exist_ok=True,
-            )
+        output_dir = self.output_input.text().strip()
 
-        else:
-            output_dir = os.path.join(
-                os.getcwd(),
-                "outputs",
-            )
+        if not output_dir:
+            output_dir = os.path.abspath("outputs")
 
-            self.output_input.setText(
-                output_dir
-            )
+        os.makedirs(output_dir, exist_ok=True)
 
-            os.makedirs(
-                output_dir,
-                exist_ok=True,
-            )
+        self.result = {}
+        self.result_list.clear()
 
-        # ====================================================
-        # 显示开始日志
-        # ====================================================
+        self.open_excel_button.setEnabled(False)
+        self.open_statistics_button.setEnabled(False)
+        self.open_chart_button.setEnabled(False)
+        self.open_word_button.setEnabled(False)
+        self.open_output_button.setEnabled(False)
 
-        self.log_output.clear()
+        self.append_log("=" * 60)
+        self.append_log("开始执行 DataPilot 任务")
+        self.append_log(f"任务：{task}")
 
-        self.append_log(
-            "=" * 60
-        )
-
-        self.append_log(
-            "开始执行 DataPilot Agent 任务"
-        )
-
-        self.append_log(
-            "=" * 60
-        )
-
-        self.append_log(
-            f"任务：{task}"
-        )
-
-        if self.selected_paths:
-            self.append_log(
-                f"已选择 {len(self.selected_paths)} 个路径："
-            )
-
-            for path in self.selected_paths:
-                self.append_log(
-                    f"  - {path}"
-                )
-
-        else:
-            self.append_log(
-                "数据来源：由 Agent 自动识别或从网络下载"
-            )
+        if input_paths:
+            self.append_log(f"手动选择文件数量：{len(input_paths)}")
 
         if urls:
-            self.append_log(
-                f"识别到网络地址：{urls[0]}"
-            )
+            self.append_log(f"识别到网络 URL 数量：{len(urls)}")
 
-        self.append_log(
-            f"输出目录：{output_dir}"
-        )
+        self.append_log(f"输出目录：{output_dir}")
+        self.append_log("=" * 60)
 
-        self.append_log("")
-
-        # ====================================================
-        # 禁用控件
-        # ====================================================
-
-        self.set_controls_enabled(
-            False
-        )
-
-        self.progress_bar.setVisible(
-            True
-        )
-
-        # ====================================================
-        # 启动后台线程
-        # ====================================================
+        self.set_controls_enabled(False)
+        self.progress_bar.setVisible(True)
 
         self.worker = AgentWorker(
             task=task,
-            input_paths=self.selected_paths,
+            input_paths=input_paths,
             output_dir=output_dir,
         )
 
-        self.worker.log_signal.connect(
-            self.append_log
-        )
-
-        self.worker.success_signal.connect(
-            self.task_success
-        )
-
-        self.worker.error_signal.connect(
-            self.task_error
-        )
-
-        self.worker.finished.connect(
-            self.task_finished
-        )
+        self.worker.log_signal.connect(self.append_log)
+        self.worker.success_signal.connect(self.task_success)
+        self.worker.error_signal.connect(self.task_error)
+        self.worker.finished.connect(self.task_finished)
 
         self.worker.start()
 
-    # ========================================================
-    # 统一控制控件状态
-    # ========================================================
-
-    def set_controls_enabled(self, enabled):
-        self.run_button.setEnabled(
-            enabled
-        )
-
-        self.file_button.setEnabled(
-            enabled
-        )
-
-        self.multi_file_button.setEnabled(
-            enabled
-        )
-
-        self.folder_button.setEnabled(
-            enabled
-        )
-
-        self.clear_file_button.setEnabled(
-            enabled
-        )
-
-        self.output_button.setEnabled(
-            enabled
-        )
-
-        self.clear_output_button.setEnabled(
-            enabled
-        )
-
-        self.clear_button.setEnabled(
-            enabled
-        )
-
-    # ========================================================
-    # 任务成功
-    # ========================================================
-
     def task_success(self, result):
-        self.append_log("")
+        self.result = result or {}
 
-        self.append_log(
-            "=" * 60
-        )
+        self.append_log("=" * 60)
+        self.append_log("任务执行成功！")
+        self.append_log("=" * 60)
 
-        self.append_log(
-            "任务执行成功"
-        )
-
-        self.append_log(
-            "=" * 60
-        )
-
-        plan = result.get(
-            "plan"
-        )
+        plan = self.result.get("plan")
 
         if plan:
-            self.append_log("")
+            self.append_log("任务计划：")
+            self.append_log(str(plan))
 
-            self.append_log(
-                "大模型生成的任务计划："
-            )
-
-            self.append_log(
-                str(plan)
-            )
-
-        source_files = result.get(
-            "source_files"
-        )
+        source_files = self.result.get("source_files")
 
         if not source_files:
-            source_files = result.get(
-                "input_paths"
-            )
+            source_files = self.result.get("input_paths")
 
         if source_files:
-            self.append_log("")
+            self.append_log(f"实际处理文件数量：{len(source_files)}")
 
-            self.append_log(
-                f"实际处理文件数量：{len(source_files)}"
-            )
-
-            for source_file in source_files:
-                self.append_log(
-                    f"  - {source_file}"
-                )
-
-        source_file = result.get(
-            "source_file"
-        )
-
-        if source_file and not source_files:
-            self.append_log("")
-
-            self.append_log(
-                f"实际处理的数据文件：\n{source_file}"
-            )
-
-        downloaded_files = result.get(
-            "downloaded_files",
-            []
-        )
+        downloaded_files = self.result.get("downloaded_files")
 
         if downloaded_files:
-            self.append_log("")
-
             self.append_log(
-                "网络下载文件："
+                f"下载文件数量：{len(downloaded_files)}"
             )
 
-            for downloaded_file in downloaded_files:
-                self.append_log(
-                    f"  - {downloaded_file}"
+        result_items = [
+            ("excel_path", "清洗后 Excel"),
+            ("statistics_path", "统计结果 Excel"),
+            ("chart_path", "趋势图"),
+            ("plot_path", "趋势图"),
+            ("word_path", "Word 报告"),
+        ]
+
+        added_keys = set()
+
+        for key, label in result_items:
+            if key in added_keys:
+                continue
+
+            file_path = self.result.get(key)
+
+            if file_path and os.path.exists(file_path):
+                added_keys.add(key)
+
+                self.result_list.addItem(
+                    f"{label}：{file_path}"
                 )
 
-        downloaded_file = result.get(
-            "downloaded_file"
+                self.append_log(
+                    f"{label}：{file_path}"
+                )
+
+        self.open_excel_button.setEnabled(
+            self.is_valid_result_file("excel_path")
         )
 
-        if downloaded_file and not downloaded_files:
-            self.append_log("")
-
-            self.append_log(
-                f"网络下载文件：\n{downloaded_file}"
-            )
-
-        excel_path = result.get(
-            "excel_path"
+        self.open_statistics_button.setEnabled(
+            self.is_valid_result_file("statistics_path")
         )
 
-        if excel_path:
-            self.append_log("")
+        chart_key = "chart_path"
 
-            self.append_log(
-                f"Excel 文件：\n{excel_path}"
-            )
+        if not self.is_valid_result_file("chart_path"):
+            chart_key = "plot_path"
 
-        statistics_path = result.get(
-            "statistics_path"
+        self.open_chart_button.setProperty(
+            "result_key",
+            chart_key,
         )
 
-        if statistics_path:
-            self.append_log("")
-
-            self.append_log(
-                f"统计结果文件：\n{statistics_path}"
-            )
-
-        chart_path = result.get(
-            "chart_path"
-        ) or result.get(
-            "plot_path"
+        self.open_chart_button.setEnabled(
+            self.is_valid_result_file(chart_key)
         )
 
-        if chart_path:
-            self.append_log("")
-
-            self.append_log(
-                f"图表文件：\n{chart_path}"
-            )
-
-        word_path = result.get(
-            "word_path"
+        self.open_word_button.setEnabled(
+            self.is_valid_result_file("word_path")
         )
 
-        if word_path:
-            self.append_log("")
+        output_dir = self.output_input.text().strip()
 
-            self.append_log(
-                f"Word 报告：\n{word_path}"
-            )
-
-        self.append_log("")
-
-        self.append_log(
-            "全部处理完成，可以打开输出文件查看结果。"
-        )
-
-        if word_path:
-            report_message = (
-                "DataPilot 已完成任务。\n\n"
-                "Excel、统计文件、图表和 Word 报告已经生成。"
-            )
-        else:
-            report_message = (
-                "DataPilot 已完成任务。\n\n"
-                "Excel、统计文件和图表已经生成。"
-            )
+        if output_dir and os.path.isdir(output_dir):
+            self.open_output_button.setEnabled(True)
 
         QMessageBox.information(
             self,
-            "任务完成",
-            report_message,
+            "执行完成",
+            "任务执行成功，结果文件已经生成。",
         )
 
-    # ========================================================
-    # 任务失败
-    # ========================================================
+    def is_valid_result_file(self, key):
+        file_path = self.result.get(key)
+
+        return bool(
+            file_path
+            and isinstance(file_path, str)
+            and os.path.exists(file_path)
+        )
+
+    def open_result_file(self, key):
+        if key == "chart_path":
+            selected_key = self.open_chart_button.property("result_key")
+
+            if selected_key:
+                key = selected_key
+
+        file_path = self.result.get(key)
+
+        if not file_path:
+            QMessageBox.warning(
+                self,
+                "提示",
+                "没有找到对应的结果文件。",
+            )
+            return
+
+        if not os.path.exists(file_path):
+            QMessageBox.warning(
+                self,
+                "提示",
+                f"文件不存在：\n{file_path}",
+            )
+            return
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(os.path.abspath(file_path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", os.path.abspath(file_path)]
+                )
+            else:
+                subprocess.Popen(
+                    ["xdg-open", os.path.abspath(file_path)]
+                )
+
+            self.append_log(
+                f"已打开文件：{file_path}"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "打开失败",
+                f"无法打开文件：\n{error}",
+            )
+
+    def open_output_folder(self):
+        output_dir = self.output_input.text().strip()
+
+        if not output_dir:
+            QMessageBox.warning(
+                self,
+                "提示",
+                "没有设置输出目录。",
+            )
+            return
+
+        if not os.path.isdir(output_dir):
+            QMessageBox.warning(
+                self,
+                "提示",
+                f"输出目录不存在：\n{output_dir}",
+            )
+            return
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(os.path.abspath(output_dir))
+            elif sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", os.path.abspath(output_dir)]
+                )
+            else:
+                subprocess.Popen(
+                    ["xdg-open", os.path.abspath(output_dir)]
+                )
+
+            self.append_log(
+                f"已打开输出目录：{output_dir}"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "打开失败",
+                f"无法打开输出目录：\n{error}",
+            )
 
     def task_error(self, error_message):
-        self.append_log("")
-
-        self.append_log(
-            "=" * 60
-        )
-
-        self.append_log(
-            "任务执行失败"
-        )
-
-        self.append_log(
-            "=" * 60
-        )
-
-        self.append_log(
-            error_message
-        )
+        self.append_log("=" * 60)
+        self.append_log("任务执行失败：")
+        self.append_log(error_message)
+        self.append_log("=" * 60)
 
         QMessageBox.critical(
             self,
             "执行失败",
-            "任务执行过程中出现错误，请查看日志。",
+            "任务执行过程中出现错误，请查看执行日志。",
         )
-
-    # ========================================================
-    # 任务结束，恢复控件
-    # ========================================================
 
     def task_finished(self):
-        self.set_controls_enabled(
-            True
-        )
-
-        self.progress_bar.setVisible(
-            False
-        )
-
+        self.progress_bar.setVisible(False)
+        self.set_controls_enabled(True)
         self.worker = None
-
-    # ========================================================
-    # 日志
-    # ========================================================
-
-    def append_log(self, message):
-        self.log_output.append(
-            str(message)
-        )
-
-        # 自动滚动到日志底部
-        scrollbar = self.log_output.verticalScrollBar()
-        scrollbar.setValue(
-            scrollbar.maximum()
-        )
-
-    def clear_log(self):
-        self.log_output.clear()
-
-    # ========================================================
-    # 提取网络地址
-    # ========================================================
-
-    @staticmethod
-    def extract_urls_from_text(text):
-        if not text:
-            return []
-
-        url_pattern = r"https?://[^\s<>\"']+"
-
-        urls = re.findall(
-            url_pattern,
-            text,
-        )
-
-        cleaned_urls = []
-
-        for url in urls:
-            url = url.rstrip(
-                "，。,；;。.!！？!?）)]}"
-            )
-
-            if url not in cleaned_urls:
-                cleaned_urls.append(
-                    url
-                )
-
-        return cleaned_urls
 
 
 if __name__ == "__main__":
+    from PySide6.QtCore import Qt
+
     app = QApplication(sys.argv)
 
-    window = DataPilotWindow()
-
+    window = MainWindow()
     window.show()
 
-    sys.exit(
-        app.exec()
-    )
+    sys.exit(app.exec())
