@@ -30,6 +30,7 @@ from document_report_tools import (
 )
 
 from agent_loop import AgentLoop
+from task_planner import TaskPlanner
 from workspace_manager import WorkspaceManager
 
 from office_data_tools import (
@@ -4752,10 +4753,15 @@ JSON 格式：
         max_iterations: int = 12,
     ) -> Dict[str, Any]:
         """
-        使用 v3.1 动态 Agent Loop 执行任务。
+        使用 Workspace 动态 Agent Loop 执行任务。
 
-        v3.0 原有 execute_task() 保持不变，
-        避免破坏已经封版的旧流程。
+        v4.0：
+        - 先建立 Workspace；
+        - 再由 TaskPlanner 建立结构化 TaskPlan；
+        - 将 TaskPlan 注入 runtime_context；
+        - 最后交给 AgentLoop 执行。
+
+        旧 execute_task() 路由继续保留，避免破坏历史流程。
         """
         task = str(user_task or "").strip()
 
@@ -4786,6 +4792,27 @@ JSON 格式：
             file_path=file_path,
             output_dir=requested_output_path,
             workspace_manager=workspace_manager,
+        )
+
+        self.report_progress(
+            "DataPilot v4.0 正在建立执行前任务合同。"
+        )
+
+        task_planner = TaskPlanner(
+            progress_callback=self.progress_callback,
+            client=self.client,
+            model=self.model,
+        )
+
+        task_plan = task_planner.create_plan(
+            task,
+            context=runtime_context,
+        )
+
+        runtime_context["task_plan"] = task_plan.to_dict()
+
+        self.report_progress(
+            "TaskPlan 已建立并注入 AgentLoop 运行上下文。"
         )
 
         self.report_progress(
@@ -5476,12 +5503,32 @@ JSON 格式：
                 for item in loop_result.tool_results
             ],
             "decisions": loop_result.decisions,
+            "verification_report": (
+                dict(
+                    getattr(
+                        loop_result,
+                        "verification_report",
+                        None,
+                    )
+                )
+                if isinstance(
+                    getattr(
+                        loop_result,
+                        "verification_report",
+                        None,
+                    ),
+                    dict,
+                )
+                else None
+            ),
             "runtime_context": runtime_context,
+            "task_plan": task_plan.to_dict(),
             "plan": {
-                "task_type": "v3_6_workspace_agent_loop",
+                "task_type": "v4_0_planned_workspace_agent_loop",
                 "description": (
-                    "DataPilot v3.6 Workspace 动态工具执行"
+                    "DataPilot v4.0 Task Planning + Workspace 动态工具执行"
                 ),
+                "task_plan": task_plan.to_dict(),
             },
         }
 

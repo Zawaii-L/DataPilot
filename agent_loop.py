@@ -12,6 +12,8 @@ from openai import OpenAI
 from execution_context import ExecutionContext, ReferenceResolver
 from tool_executor import ToolExecutionResult, ToolExecutor
 from tool_registry import ToolRegistry, create_default_tool_registry
+from task_planner import TaskPlan
+from verification_engine import VerificationEngine, VerificationReport
 
 
 load_dotenv()
@@ -28,6 +30,7 @@ class AgentLoopResult:
     iterations: int = 0
     tool_results: List[ToolExecutionResult] = field(default_factory=list)
     decisions: List[Dict[str, Any]] = field(default_factory=list)
+    verification_report: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -41,6 +44,7 @@ class AgentLoopResult:
                 for item in self.tool_results
             ],
             "decisions": self.decisions,
+            "verification_report": self.verification_report,
         }
 
 
@@ -73,6 +77,7 @@ class AgentLoop:
         client: Optional[OpenAI] = None,
         model: Optional[str] = None,
         max_iterations: int = 12,
+        verifier: Optional[VerificationEngine] = None,
     ):
         self.registry = registry or create_default_tool_registry()
         self.progress_callback = progress_callback
@@ -83,6 +88,7 @@ class AgentLoop:
         )
 
         self.context = ExecutionContext()
+        self.verifier = verifier or VerificationEngine()
 
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv(
@@ -139,8 +145,19 @@ class AgentLoop:
             )
 
         runtime_context = dict(context or {})
+        runtime_context = self._normalize_task_plan_context(
+            runtime_context
+        )
         decisions: List[Dict[str, Any]] = []
         tool_results: List[ToolExecutionResult] = []
+
+        # v4.0 Completion Gate：
+        # runtime_context.verification_observation 用于把验收失败原因
+        # 注入下一轮 LLM；这里再独立保存最近一次正式验收报告，
+        # 供最终 AgentLoopResult 使用，避免结果状态依赖临时上下文。
+        latest_verification_report: Optional[
+            Dict[str, Any]
+        ] = None
 
         self.report_progress(
             "DataPilot Workspace Agent Loop 启动。"
@@ -180,18 +197,55 @@ class AgentLoop:
                 ).strip()
 
                 self.report_progress(
-                    "Agent 判断任务已经完成。"
+                    "Agent 请求完成任务，正在进入 v4.0 Completion Gate……"
                 )
 
-                return AgentLoopResult(
-                    success=True,
+                verification_report = self._run_completion_gate(
                     goal=goal,
                     final_answer=final_answer,
-                    stop_reason="completed",
-                    iterations=iteration,
+                    iteration=iteration,
+                    runtime_context=runtime_context,
                     tool_results=tool_results,
                     decisions=decisions,
                 )
+
+                if verification_report.verified:
+                    self.report_progress(
+                        "Completion Gate：PASS，任务验收通过。"
+                    )
+
+                    runtime_context.pop(
+                        "verification_observation",
+                        None,
+                    )
+
+                    return AgentLoopResult(
+                        success=True,
+                        goal=goal,
+                        final_answer=final_answer,
+                        stop_reason="completed",
+                        iterations=iteration,
+                        tool_results=tool_results,
+                        decisions=decisions,
+                        verification_report=(
+                            verification_report.to_dict()
+                        ),
+                    )
+
+                latest_verification_report = (
+                    verification_report.to_dict()
+                )
+                runtime_context["verification_observation"] = dict(
+                    latest_verification_report
+                )
+
+                self.report_progress(
+                    "Completion Gate：未通过。"
+                    "验收结果已作为 Observation 注入下一轮，"
+                    "Agent 将继续修正。"
+                )
+
+                continue
 
             if action_type != "tool":
                 raise ValueError(
@@ -318,8 +372,10 @@ class AgentLoop:
         # - finish：说明最后一次 Observation 已经满足目标；
         # - tool：说明仍需真实工具，因此按 max_iterations 结束；
         #
-        # 这样不会因为“已经生成文件”之类的启发式条件自动判成功，
-        # 最终是否完成仍由 LLM 基于全部真实 Observation 判断。
+        # 这样不会因为“已经生成文件”之类的启发式条件自动判成功。
+        # v4.0 起，LLM 的最终 finish 仍只是“申请完成”，必须继续经过
+        # Python Completion Gate；Gate FAIL 时返回 verification_failed，
+        # 不允许被旧的 max_iterations 收尾逻辑绕过。
         self.report_progress(
             "Agent 已用完常规执行轮数，正在进行最终完成判定……"
         )
@@ -346,17 +402,59 @@ class AgentLoop:
             ).strip()
 
             self.report_progress(
-                "最终判定：最后一次工具执行后，用户目标已经完成。"
+                "最终判定请求完成，正在进入 v4.0 Completion Gate……"
+            )
+
+            verification_report = self._run_completion_gate(
+                goal=goal,
+                final_answer=final_answer,
+                iteration=self.max_iterations + 1,
+                runtime_context=runtime_context,
+                tool_results=tool_results,
+                decisions=decisions,
+            )
+
+            if verification_report.verified:
+                self.report_progress(
+                    "Completion Gate：PASS，最后一次工具执行后的任务验收通过。"
+                )
+
+                return AgentLoopResult(
+                    success=True,
+                    goal=goal,
+                    final_answer=final_answer,
+                    stop_reason="completed",
+                    iterations=self.max_iterations + 1,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    verification_report=(
+                        verification_report.to_dict()
+                    ),
+                )
+
+            latest_verification_report = (
+                verification_report.to_dict()
+            )
+            runtime_context["verification_observation"] = dict(
+                latest_verification_report
+            )
+
+            self.report_progress(
+                "Completion Gate：最终验收未通过，"
+                "且工具执行预算已经耗尽。"
             )
 
             return AgentLoopResult(
-                success=True,
+                success=False,
                 goal=goal,
-                final_answer=final_answer,
-                stop_reason="completed",
+                final_answer="",
+                stop_reason="verification_failed",
                 iterations=self.max_iterations + 1,
                 tool_results=tool_results,
                 decisions=decisions,
+                verification_report=(
+                    verification_report.to_dict()
+                ),
             )
 
         self.report_progress(
@@ -371,6 +469,48 @@ class AgentLoop:
             iterations=self.max_iterations + 1,
             tool_results=tool_results,
             decisions=decisions,
+            verification_report=(
+                dict(latest_verification_report)
+                if isinstance(
+                    latest_verification_report,
+                    dict,
+                )
+                else None
+            ),
+        )
+
+    def _run_completion_gate(
+        self,
+        *,
+        goal: str,
+        final_answer: str,
+        iteration: int,
+        runtime_context: Dict[str, Any],
+        tool_results: List[ToolExecutionResult],
+        decisions: List[Dict[str, Any]],
+    ) -> VerificationReport:
+        """
+        v4.0 Completion Gate。
+
+        LLM 的 finish 只是“申请完成”，不是最终成功判定。
+        Python VerificationEngine 会基于真实工具历史、Workspace 和
+        TaskPlan 再做一次确定性验收。
+        """
+        provisional_result = AgentLoopResult(
+            success=True,
+            goal=goal,
+            final_answer=final_answer,
+            stop_reason="completed",
+            iterations=iteration,
+            tool_results=tool_results,
+            decisions=decisions,
+        )
+
+        return self.verifier.verify(
+            task_plan=runtime_context.get("task_plan"),
+            loop_result=provisional_result,
+            runtime_context=runtime_context,
+            workspace_summary=None,
         )
 
     def _decide_next_action(
@@ -716,6 +856,25 @@ class AgentLoop:
 48. finish 前检查最终交付物路径。若用户要求生成文件，而最终成功写入的文件仍只有 temporary_dir 中的半成品，则任务未完成。
 49. 不要修改 manifest.json。Workspace manifest 由 Python 的 WorkspaceManager 自动维护，Agent 只负责正确使用工作区路径。
 50. 不要把 temporary_dir 中的临时文件当作最终交付物写进 final_answer。final_answer 应优先报告 deliverables_dir 中最后验证成功的文件。
+
+【v4.0 TaskPlan 任务合同规则】
+51. 如果当前真实执行状态中存在 runtime_context.task_plan，它是本次任务在执行前建立的结构化任务合同，必须与用户最终目标一起使用。
+52. evidence_requirements 表示完成任务必须取得或核实的真实证据；缺少关键证据时不得凭空补全，也不得 finish。
+53. source_requirements 表示需要识别、读取或甄别的输入资料；不能仅凭文件名声称已经满足资料要求。
+54. deliverable_requirements 表示最终必须交付的结果。存在多个交付物时，必须逐项完成，不得只完成其中一部分就 finish。
+55. execution_requirements 是计划中的必要业务步骤。可以根据真实 Observation 调整具体工具路径，但不得无理由跳过仍然必要的业务要求。
+56. verification_requirements 是 finish 前的验收合同。只要仍有关键验收要求缺少真实 Observation 支撑，就不得返回 finish。
+57. safety_requirements 必须持续遵守；TaskPlan 不会覆盖 ToolPreflight 和 Workspace Policy，Python 层安全校验仍具有最终约束力。
+58. assumptions 不是事实。必须通过真实资料或工具结果确认后才能把其中内容作为最终结论；无法确认时应明确保留不确定性。
+59. TaskPlan 是任务合同，不是固定工具脚本。工具失败或真实证据与初始假设不一致时，应根据 Observation 修正执行路径，但仍应围绕 task_goal 和尚未满足的合同要求继续。
+60. finish 时必须同时满足用户最终目标和 TaskPlan 中仍适用的 deliverable / verification / safety 要求；不得仅因为模型认为“差不多完成”而结束。
+
+【v4.0 Completion Gate 规则】
+61. action_type=finish 只是向 Python Completion Gate 申请完成，不代表任务已经成功。
+62. 如果 runtime_context.verification_observation 存在，说明上一次 finish 被 Python 验收层拒绝；必须优先读取其中 failures、pending_requirements 和 checks，再决定如何补证据或修正。
+63. Completion Gate 失败后，不要机械地再次 finish。只要仍可通过真实工具补齐缺失证据，就应调用对应工具。
+64. verification_observation 中的 pending_requirements 表示当前 Python 层尚不能证明的验收要求；不得把 pending 擅自改写成“已验证”。
+65. 只有 Completion Gate 返回 PASS，Python 才会把任务最终标记为 completed。
 {budget_rule}
 
 ============================================================
@@ -744,6 +903,48 @@ class AgentLoop:
 
 {catalog}
 """.strip()
+
+    @staticmethod
+    def _normalize_task_plan_context(
+        runtime_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        v4.0：把 TaskPlan 规范化为 JSON-safe dict 后放入 runtime_context。
+
+        兼容三种情况：
+        1. context["task_plan"] 是 TaskPlan；
+        2. context["task_plan"] 已经是 dict；
+        3. 没有 TaskPlan，保持 v3.9 行为。
+        """
+        normalized = dict(runtime_context or {})
+        task_plan = normalized.get("task_plan")
+
+        if task_plan is None:
+            return normalized
+
+        if isinstance(task_plan, TaskPlan):
+            normalized["task_plan"] = task_plan.to_dict()
+            return normalized
+
+        if isinstance(task_plan, dict):
+            normalized["task_plan"] = dict(task_plan)
+            return normalized
+
+        if hasattr(task_plan, "to_dict"):
+            converted = task_plan.to_dict()
+
+            if not isinstance(converted, dict):
+                raise TypeError(
+                    "runtime_context.task_plan.to_dict() 必须返回 dict。"
+                )
+
+            normalized["task_plan"] = converted
+            return normalized
+
+        raise TypeError(
+            "runtime_context.task_plan 必须是 TaskPlan、dict，"
+            "或提供返回 dict 的 to_dict()。"
+        )
 
     def _build_state(
         self,
@@ -793,6 +994,7 @@ class AgentLoop:
 
         return {
             "goal": goal,
+            "task_plan": runtime_context.get("task_plan"),
             "runtime_context": runtime_context,
             "completed_tool_steps": observations,
             "tool_step_count": len(tool_results),

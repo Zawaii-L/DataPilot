@@ -497,6 +497,28 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
+        # v4.0：任务验收 / Completion Gate
+        # ----------------------------------------------------
+
+        self.verification_label = QLabel(
+            "v4.0 任务验收"
+        )
+        self.verification_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+        self.verification_label.setVisible(False)
+        main_layout.addWidget(self.verification_label)
+
+        self.verification_output = QTextEdit()
+        self.verification_output.setReadOnly(True)
+        self.verification_output.setMinimumHeight(150)
+        self.verification_output.setPlaceholderText(
+            "Python Completion Gate 的验收状态、失败项和待验证项将在这里显示。"
+        )
+        self.verification_output.setVisible(False)
+        main_layout.addWidget(self.verification_output)
+
+        # ----------------------------------------------------
         # 文档综合结果
         # ----------------------------------------------------
 
@@ -998,6 +1020,10 @@ class MainWindow(QMainWindow):
             False
         )
 
+        self.verification_output.clear()
+        self.verification_output.setVisible(False)
+        self.verification_label.setVisible(False)
+
         self.document_result_output.clear()
         self.document_result_output.setVisible(
             False
@@ -1126,6 +1152,7 @@ class MainWindow(QMainWindow):
         if task_type in {
             "v3_1_agent_loop",
             "v3_6_workspace_agent_loop",
+            "v4_0_planned_workspace_agent_loop",
         }:
             final_answer = (
                 self.result.get("final_answer")
@@ -1146,6 +1173,15 @@ class MainWindow(QMainWindow):
             stop_reason = self.result.get(
                 "stop_reason",
                 "",
+            )
+
+            verification_report = self.result.get(
+                "verification_report"
+            )
+
+            self.display_verification_report(
+                verification_report,
+                stop_reason=stop_reason,
             )
 
             output_files = self.result.get(
@@ -1287,7 +1323,7 @@ class MainWindow(QMainWindow):
                 )
 
                 self.append_log(
-                    "任务类型：DataPilot v3.7 Workspace Agent"
+                    "任务类型：DataPilot v4.0 Planned Workspace Agent"
                 )
 
                 if task_id:
@@ -1604,14 +1640,38 @@ class MainWindow(QMainWindow):
                     True
                 )
 
-            QMessageBox.information(
-                self,
-                "执行完成",
-                (
+            verification_verified = (
+                isinstance(verification_report, dict)
+                and verification_report.get("verified") is True
+            )
+
+            if verification_verified:
+                completion_title = "验收通过"
+                completion_text = (
+                    "DataPilot v4.0 Completion Gate 已验收通过。\n"
+                    f"工具调用：{tool_count} 次\n"
+                    f"最终交付物：{len(output_files)} 个"
+                )
+            elif isinstance(verification_report, dict):
+                completion_title = "任务结束但未通过验收"
+                completion_text = (
+                    "DataPilot 已结束本次执行，但 Python Completion Gate "
+                    "没有确认任务通过。\n"
+                    f"停止原因：{stop_reason or '未知'}\n"
+                    "请查看下方“v4.0 任务验收”区域。"
+                )
+            else:
+                completion_title = "执行完成"
+                completion_text = (
                     "DataPilot Workspace Agent 已完成任务。\n"
                     f"工具调用：{tool_count} 次\n"
                     f"最终交付物：{len(output_files)} 个"
-                ),
+                )
+
+            QMessageBox.information(
+                self,
+                completion_title,
+                completion_text,
             )
 
             return
@@ -2012,6 +2072,105 @@ class MainWindow(QMainWindow):
             "执行完成",
             "任务执行成功，结果文件已经生成。",
         )
+
+    # ========================================================
+    # v4.0：显示 Python Completion Gate 验收报告
+    # ========================================================
+
+    def display_verification_report(
+        self,
+        verification_report,
+        stop_reason="",
+    ):
+        """
+        只展示 Python 验收层已经给出的 VerificationReport，
+        不根据 Agent 的自然语言 final_answer 自行判断成功。
+        """
+        if not isinstance(verification_report, dict):
+            self.verification_output.clear()
+            self.verification_output.setVisible(False)
+            self.verification_label.setVisible(False)
+            return
+
+        verified = verification_report.get("verified") is True
+        checks = verification_report.get("checks", []) or []
+        failures = verification_report.get("failures", []) or []
+        pending = verification_report.get(
+            "pending_requirements", []
+        ) or []
+        deliverables = verification_report.get(
+            "deliverables", []
+        ) or []
+
+        lines = [
+            (
+                "状态：PASS · Python Completion Gate 验收通过"
+                if verified
+                else "状态：未通过 · Python Completion Gate 未确认完成"
+            )
+        ]
+
+        if stop_reason:
+            lines.append(f"停止原因：{stop_reason}")
+
+        if checks:
+            lines.extend(["", "确定性验收检查："])
+            for check in checks:
+                if not isinstance(check, dict):
+                    continue
+                passed = check.get("passed")
+                message = str(
+                    check.get("message")
+                    or check.get("check_id")
+                    or "未命名检查"
+                ).strip()
+                prefix = (
+                    "PASS" if passed is True
+                    else "FAIL" if passed is False
+                    else "PENDING"
+                )
+                lines.append(f"- [{prefix}] {message}")
+
+        if failures:
+            lines.extend(["", "失败项："])
+            lines.extend(f"- {item}" for item in failures)
+
+        if pending:
+            lines.extend(["", "待验证项："])
+            lines.extend(f"- {item}" for item in pending)
+
+        if deliverables:
+            lines.extend(
+                ["", f"验收涉及交付物：{len(deliverables)} 个"]
+            )
+            for index, file_path in enumerate(
+                deliverables, start=1
+            ):
+                lines.append(f"{index}. {file_path}")
+
+        if not failures and not pending:
+            lines.extend(
+                ["", "未发现未解决的失败项或待验证项。"]
+            )
+
+        self.verification_output.setPlainText(
+            "\n".join(lines)
+        )
+        self.verification_label.setVisible(True)
+        self.verification_output.setVisible(True)
+
+        self.append_log(
+            "v4.0 Completion Gate："
+            + ("PASS" if verified else "未通过")
+        )
+        if failures:
+            self.append_log(
+                f"验收失败项：{len(failures)}"
+            )
+        if pending:
+            self.append_log(
+                f"待验证要求：{len(pending)}"
+            )
 
     # ========================================================
     # 判断结果文件是否有效
