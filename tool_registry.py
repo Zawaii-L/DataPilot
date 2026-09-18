@@ -403,6 +403,10 @@ def create_default_tool_registry() -> ToolRegistry:
     )
     from word_edit_tools import apply_word_edits
     from excel_edit_tools import apply_excel_edits
+    from excel_report_tools import (
+        create_professional_excel_report,
+        inspect_professional_excel_report,
+    )
     from office_data_tools import (
         apply_filters,
         create_pivot_summary,
@@ -857,6 +861,69 @@ def create_default_tool_registry() -> ToolRegistry:
             "output_dir": "下载目录",
         },
         returns="下载后的本地文件路径",
+    )
+
+    # ------------------------------------------------------------
+    # 专业 Excel 报告
+    # ------------------------------------------------------------
+
+    registry.register(
+        "create_professional_excel_report",
+        create_professional_excel_report,
+        (
+            "把已经分析完成的 DataFrame 生成新的专业 .xlsx 报告。"
+            "适合用户要求正式、专业、可直接交付的 Excel 分析报告；"
+            "支持多 Sheet、报告标题、副标题、KPI、确定性表格样式、"
+            "数字格式、自动列宽、冻结窗格、AutoFilter 和 Excel 原生图表。"
+            "本工具用于创建新的报告，不用于高保真修改已有 Excel。"
+        ),
+        category="output",
+        parameters={
+            "output_path": "最终 .xlsx 输出路径；Workspace 任务应写入 deliverables_dir。",
+            "dataframe": "可选。单个已经分析完成的 pandas DataFrame。",
+            "sheets": (
+                "可选。{Sheet名称: pandas DataFrame}；"
+                "dataframe 与 sheets 至少提供一个。"
+            ),
+            "report_title": "可选。报告主标题。",
+            "subtitle": "可选。报告副标题或说明。",
+            "kpis": (
+                "可选。KPI 列表，每项使用 "
+                "{label, value, number_format?}。"
+            ),
+            "charts": (
+                "可选。图表列表；每项使用 "
+                "{type, sheet_name, category_column, value_column, "
+                "title?, anchor?}；type 支持 bar / line / pie。"
+            ),
+            "default_sheet_name": "可选。dataframe 模式下的默认 Sheet 名称。",
+        },
+        returns=(
+            "生成结果字典，包含 success、output_path、sheet_names、"
+            "sheet_count、kpi_count、chart_count、report_title。"
+        ),
+    )
+
+    registry.register(
+        "inspect_professional_excel_report",
+        inspect_professional_excel_report,
+        (
+            "重新打开已经生成的专业 .xlsx 报告并提取结构证据。"
+            "用于交付前核验 Sheet、标题、表头、冻结窗格、AutoFilter、"
+            "图表数量、合并区域和数据预览。"
+            "当 TaskPlan 要求生成后重新读取或检查最终专业 Excel 时，"
+            "应在写入完成后对最终交付文件调用本工具。"
+        ),
+        category="inspection",
+        parameters={
+            "file_path": "需要重新读取检查的最终 .xlsx 文件路径。",
+            "max_preview_rows": "可选。每个 Sheet 最多返回多少行数据预览，默认 10。",
+        },
+        returns=(
+            "结构检查字典，包含 file_path、sheet_names、sheet_count、"
+            "chart_count，以及每个 Sheet 的标题、表头、冻结窗格、"
+            "AutoFilter、图表数量、合并区域和 preview_records。"
+        ),
     )
 
     # ------------------------------------------------------------

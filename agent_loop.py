@@ -13,6 +13,8 @@ from execution_context import ExecutionContext, ReferenceResolver
 from tool_executor import ToolExecutionResult, ToolExecutor
 from tool_registry import ToolRegistry, create_default_tool_registry
 from task_planner import TaskPlan
+from skill_registry import SkillRegistry, create_default_skill_registry
+from skill_selector import SkillSelection, SkillSelector
 from verification_engine import VerificationEngine, VerificationReport
 
 
@@ -78,8 +80,19 @@ class AgentLoop:
         model: Optional[str] = None,
         max_iterations: int = 12,
         verifier: Optional[VerificationEngine] = None,
+        skill_registry: Optional[SkillRegistry] = None,
     ):
         self.registry = registry or create_default_tool_registry()
+        self.skill_registry = (
+            skill_registry or create_default_skill_registry()
+        )
+        self._validate_skill_catalog()
+        self.skill_selector = SkillSelector(
+            self.skill_registry
+        )
+        self._active_skill_selection: Optional[
+            SkillSelection
+        ] = None
         self.progress_callback = progress_callback
 
         self.executor = executor or ToolExecutor(
@@ -118,6 +131,30 @@ class AgentLoop:
             int(max_iterations),
         )
 
+    def _validate_skill_catalog(self):
+        """
+        v4.5：启动时检查 Skill 推荐的 Tool 是否真实存在。
+
+        Skill 只提供方法指导，不获得执行权；如果 Skill Catalog
+        引用了不存在的 Tool，应在 Agent 启动阶段立即暴露架构错误，
+        而不是让 LLM 在运行中尝试调用虚构能力。
+        """
+        missing = self.skill_registry.validate_tools(
+            self.registry
+        )
+
+        if missing:
+            details = "; ".join(
+                f"{skill}: {', '.join(tools)}"
+                for skill, tools in sorted(
+                    missing.items()
+                )
+            )
+            raise ValueError(
+                "Skill Catalog 引用了未注册 Tool："
+                + details
+            )
+
     def report_progress(
         self,
         message: str,
@@ -148,6 +185,33 @@ class AgentLoop:
         runtime_context = self._normalize_task_plan_context(
             runtime_context
         )
+
+        self._active_skill_selection = (
+            self.skill_selector.select(
+                goal=goal,
+                task_plan=runtime_context.get(
+                    "task_plan"
+                ),
+            )
+        )
+        runtime_context["skill_selection"] = (
+            self._active_skill_selection.to_dict()
+        )
+
+        selected_skill_names = (
+            self._active_skill_selection.selected_skills
+        )
+        selection_mode = (
+            "完整目录安全回退"
+            if self._active_skill_selection.fallback_used
+            else "确定性筛选"
+        )
+        self.report_progress(
+            "v4.5 Skill Selector："
+            f"{selection_mode} → "
+            + ", ".join(selected_skill_names)
+        )
+
         decisions: List[Dict[str, Any]] = []
         tool_results: List[ToolExecutionResult] = []
 
@@ -773,6 +837,26 @@ class AgentLoop:
     ) -> str:
         catalog = self.registry.build_llm_catalog_text()
 
+        if self._active_skill_selection is None:
+            skill_catalog = (
+                self.skill_registry.build_llm_catalog_text()
+            )
+            skill_selection_note = (
+                "当前没有运行期 Skill Selection；"
+                "为兼容直接 Prompt 测试，展示完整 Skill Catalog。"
+            )
+        else:
+            skill_catalog = (
+                self.skill_selector
+                .build_selected_catalog_text(
+                    self._active_skill_selection
+                )
+            )
+            skill_selection_note = (
+                "本轮只展示 Skill Selector "
+                "针对当前用户目标 + TaskPlan 选出的相关 Skills。"
+            )
+
         if finish_only:
             budget_rule = """
 20. 当前处于工具预算耗尽后的最终完成判定。
@@ -876,6 +960,28 @@ class AgentLoop:
 64. verification_observation 中的 pending_requirements 表示当前 Python 层尚不能证明的验收要求；不得把 pending 擅自改写成“已验证”。
 65. 只有 Completion Gate 返回 PASS，Python 才会把任务最终标记为 completed。
 {budget_rule}
+
+【v4.5 Office Skill Guidance 规则】
+66. 下方 Office Skill Catalog 是“推荐工作方法”，不是可执行 Tool。
+67. Skill 不拥有 handler，禁止把 Skill 名放进 tool 字段；真实执行仍只能调用 Tool Registry 中存在的 Tool。
+68. 开始或继续办公任务时，应结合用户目标、TaskPlan、真实 Observation 选择适用 Skill 的方法指导。
+69. Skill 的 workflow 是推荐流程，不是不可改变的固定脚本；已经有真实证据支持的步骤不要为了形式重复执行。
+70. Skill 的 recommended_tools 只是候选工具，不代表每个任务都必须全部调用；只调用完成当前任务真正需要的 Tool。
+71. Skill 的 verification 与 safety_rules 用于帮助规划执行和自检，但最终完成权仍属于 Python Verification Engine / Completion Gate。
+72. 如果多个 Skill 同时适用，可以组合其方法，例如先 excel_data_analysis，再 excel_report_delivery；但每一轮仍只允许执行一个真实 Tool。
+73. Skill Guidance 不得覆盖用户明确要求、TaskPlan、Workspace Policy、ToolPreflight 或 Completion Gate；发生冲突时以后者的真实约束为准。
+74. Skill Selector 只减少发送给模型的 Guidance，不会减少 Tool Registry 中真实可用工具；即使某个 Skill 未被选中，仍不得据此声称对应 Tool 不可用。
+75. Skill Selection 基于用户目标 + TaskPlan 在任务启动时确定，不额外调用 LLM；若没有足够明确的匹配信号，Python 会安全回退到完整 Skill Catalog。
+76. 不要为了“遵循 Skill”而改变已经由真实 Observation 证明正确的执行路径；Skill 是方法参考，不是第二套 TaskPlan。
+
+Skill Selection 状态：
+{skill_selection_note}
+
+============================================================
+Selected Office Skill Catalog（方法指导，不可直接执行）
+============================================================
+
+{skill_catalog}
 
 ============================================================
 调用工具时返回
@@ -995,6 +1101,26 @@ class AgentLoop:
         return {
             "goal": goal,
             "task_plan": runtime_context.get("task_plan"),
+            "available_skills": self.skill_registry.summary(),
+            "selected_skills": (
+                runtime_context.get(
+                    "skill_selection",
+                    {}
+                ).get(
+                    "selected_skills",
+                    []
+                )
+                if isinstance(
+                    runtime_context.get(
+                        "skill_selection"
+                    ),
+                    dict,
+                )
+                else []
+            ),
+            "skill_selection": runtime_context.get(
+                "skill_selection"
+            ),
             "runtime_context": runtime_context,
             "completed_tool_steps": observations,
             "tool_step_count": len(tool_results),
