@@ -497,6 +497,28 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
+        # v5.0：执行计划 / TaskPlan
+        # ----------------------------------------------------
+
+        self.task_plan_label = QLabel(
+            "v5.0 执行计划"
+        )
+        self.task_plan_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+        self.task_plan_label.setVisible(False)
+        main_layout.addWidget(self.task_plan_label)
+
+        self.task_plan_output = QTextEdit()
+        self.task_plan_output.setReadOnly(True)
+        self.task_plan_output.setMinimumHeight(170)
+        self.task_plan_output.setPlaceholderText(
+            "Task Planner 生成的任务目标、交付要求、执行要求和验收要求将在这里显示。"
+        )
+        self.task_plan_output.setVisible(False)
+        main_layout.addWidget(self.task_plan_output)
+
+        # ----------------------------------------------------
         # v4.0：任务验收 / Completion Gate
         # ----------------------------------------------------
 
@@ -1020,6 +1042,10 @@ class MainWindow(QMainWindow):
             False
         )
 
+        self.task_plan_output.clear()
+        self.task_plan_output.setVisible(False)
+        self.task_plan_label.setVisible(False)
+
         self.verification_output.clear()
         self.verification_output.setVisible(False)
         self.verification_label.setVisible(False)
@@ -1173,6 +1199,14 @@ class MainWindow(QMainWindow):
             stop_reason = self.result.get(
                 "stop_reason",
                 "",
+            )
+
+            task_plan = self.result.get(
+                "task_plan"
+            ) or {}
+
+            self.display_task_plan(
+                task_plan
             )
 
             verification_report = self.result.get(
@@ -1562,17 +1596,28 @@ class MainWindow(QMainWindow):
 
                 added_paths.add(normalized_path)
 
-                self.result_list.addItem(
-                    f"Agent 输出：{file_path}"
-                )
-
-                self.append_log(
-                    f"Agent 输出文件：{file_path}"
-                )
-
                 suffix = os.path.splitext(
                     file_path
                 )[1].lower()
+
+                if suffix in {".xlsx", ".xls"}:
+                    output_label = "Excel 交付物"
+                elif suffix == ".docx":
+                    output_label = "Word 交付物"
+                elif suffix == ".csv":
+                    output_label = "数据交付物"
+                elif suffix in {".png", ".jpg", ".jpeg"}:
+                    output_label = "图表交付物"
+                else:
+                    output_label = "Agent 输出"
+
+                self.result_list.addItem(
+                    f"{output_label}：{file_path}"
+                )
+
+                self.append_log(
+                    f"{output_label}：{file_path}"
+                )
 
                 if (
                     suffix in {".xlsx", ".xls", ".csv"}
@@ -1645,10 +1690,35 @@ class MainWindow(QMainWindow):
                 and verification_report.get("verified") is True
             )
 
+            output_suffixes = {
+                os.path.splitext(str(file_path))[1].lower()
+                for file_path in output_files
+                if isinstance(file_path, str)
+            }
+            combined_office_delivery = (
+                any(
+                    suffix in output_suffixes
+                    for suffix in {".xlsx", ".xls"}
+                )
+                and ".docx" in output_suffixes
+            )
+
             if verification_verified:
-                completion_title = "验收通过"
+                completion_title = (
+                    "联合交付验收通过"
+                    if combined_office_delivery
+                    else "验收通过"
+                )
                 completion_text = (
+                    (
+                        "DataPilot v5.0 Excel + Word 联合交付已通过 "
+                        "Python Completion Gate。\n"
+                    )
+                    if combined_office_delivery
+                    else
                     "DataPilot v4.0 Completion Gate 已验收通过。\n"
+                )
+                completion_text += (
                     f"工具调用：{tool_count} 次\n"
                     f"最终交付物：{len(output_files)} 个"
                 )
@@ -2071,6 +2141,105 @@ class MainWindow(QMainWindow):
             self,
             "执行完成",
             "任务执行成功，结果文件已经生成。",
+        )
+
+    # ========================================================
+    # v5.0：显示执行前 TaskPlan
+    # ========================================================
+
+    def display_task_plan(
+        self,
+        task_plan,
+    ):
+        """
+        展示 Task Planner 已经生成并实际注入 AgentLoop 的任务合同。
+
+        GUI 只负责呈现，不自行改写 TaskPlan，也不从 final_answer
+        推断执行要求或验收要求。
+        """
+        if not isinstance(task_plan, dict) or not task_plan:
+            self.task_plan_output.clear()
+            self.task_plan_output.setVisible(False)
+            self.task_plan_label.setVisible(False)
+            return
+
+        lines = []
+
+        task_goal = str(
+            task_plan.get("task_goal")
+            or ""
+        ).strip()
+
+        if task_goal:
+            lines.extend([
+                "任务目标：",
+                task_goal,
+            ])
+
+        sections = [
+            (
+                "交付要求",
+                task_plan.get("deliverable_requirements", []),
+            ),
+            (
+                "执行要求",
+                task_plan.get("execution_requirements", []),
+            ),
+            (
+                "验收要求",
+                task_plan.get("verification_requirements", []),
+            ),
+            (
+                "安全要求",
+                task_plan.get("safety_requirements", []),
+            ),
+            (
+                "数据 / 来源要求",
+                task_plan.get("source_requirements", []),
+            ),
+        ]
+
+        for title, items in sections:
+            items = items or []
+            if not isinstance(items, list) or not items:
+                continue
+
+            if lines:
+                lines.append("")
+
+            lines.append(f"{title}：")
+            for index, item in enumerate(items, start=1):
+                item_text = str(item or "").strip()
+                if item_text:
+                    lines.append(
+                        f"{index}. {item_text}"
+                    )
+
+        assumptions = task_plan.get(
+            "assumptions",
+            [],
+        ) or []
+
+        if isinstance(assumptions, list) and assumptions:
+            lines.extend(["", "执行假设："])
+            for index, item in enumerate(
+                assumptions,
+                start=1,
+            ):
+                item_text = str(item or "").strip()
+                if item_text:
+                    lines.append(
+                        f"{index}. {item_text}"
+                    )
+
+        self.task_plan_output.setPlainText(
+            "\n".join(lines)
+        )
+        self.task_plan_label.setVisible(True)
+        self.task_plan_output.setVisible(True)
+
+        self.append_log(
+            "v5.0 TaskPlan：已显示执行前任务合同"
         )
 
     # ========================================================

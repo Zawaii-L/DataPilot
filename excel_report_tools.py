@@ -891,6 +891,51 @@ def inspect_professional_excel_report(
             headers = candidate_headers
             break
 
+        # v5.0：提取专业报告 KPI，供跨交付物 Verification 使用。
+        #
+        # 当前 Professional Excel 布局中：
+        # - KPI 位于数据表头前两行；
+        # - KPI 使用 label/value 成对单元格；
+        # - inspect 必须重新从最终 .xlsx 读取 KPI，而不能相信创建工具入参。
+        kpis = []
+        kpi_map = {}
+
+        if header_row is not None:
+            kpi_row = header_row - 2
+
+            if kpi_row >= 1:
+                column_index = 1
+
+                while column_index <= worksheet.max_column:
+                    label = worksheet.cell(
+                        row=kpi_row,
+                        column=column_index,
+                    ).value
+                    value = (
+                        worksheet.cell(
+                            row=kpi_row,
+                            column=column_index + 1,
+                        ).value
+                        if column_index + 1 <= worksheet.max_column
+                        else None
+                    )
+
+                    label_text = (
+                        str(label).strip()
+                        if label is not None
+                        else ""
+                    )
+
+                    if label_text and value is not None:
+                        item = {
+                            "label": label_text,
+                            "value": value,
+                        }
+                        kpis.append(item)
+                        kpi_map[label_text] = value
+
+                    column_index += 2
+
         preview = []
 
         if header_row is not None:
@@ -930,6 +975,8 @@ def inspect_professional_excel_report(
                     for item in worksheet.merged_cells.ranges
                 ],
                 "preview_records": preview,
+                "kpis": kpis,
+                "kpi_map": kpi_map,
             }
         )
 
@@ -941,6 +988,16 @@ def inspect_professional_excel_report(
         "chart_count": sum(
             len(worksheet._charts)
             for worksheet in workbook.worksheets
+        ),
+        "kpis": (
+            sheets[0].get("kpis", [])
+            if sheets
+            else []
+        ),
+        "kpi_map": (
+            sheets[0].get("kpi_map", {})
+            if sheets
+            else {}
         ),
         "sheets": sheets,
     }

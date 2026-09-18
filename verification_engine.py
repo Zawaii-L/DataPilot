@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from reporting_content_audit import ReportingContentAuditor
 from task_planner import TaskPlan
 from tool_executor import ToolExecutionResult
 
@@ -436,6 +438,74 @@ class VerificationEngine:
             if requirement not in pending:
                 pending.append(requirement)
 
+        reporting_audit = self._audit_final_reporting_content(
+            tool_results=tool_results,
+            deliverables=deliverables,
+        )
+
+        if reporting_audit is not None:
+            audit_passed = bool(reporting_audit.get("passed", False))
+            unsupported_claims = [
+                str(item).strip()
+                for item in (
+                    reporting_audit.get("unsupported_claims")
+                    or []
+                )
+                if str(item).strip()
+            ]
+            advisory_claims = [
+                str(item).strip()
+                for item in (
+                    reporting_audit.get("advisory_claims")
+                    or []
+                )
+                if str(item).strip()
+            ]
+            supported_claims = [
+                str(item).strip()
+                for item in (
+                    reporting_audit.get("supported_claims")
+                    or []
+                )
+                if str(item).strip()
+            ]
+
+            evidence = []
+            if supported_claims:
+                evidence.append(
+                    "supported: "
+                    + "；".join(supported_claims[:5])
+                )
+            if advisory_claims:
+                evidence.append(
+                    "advisory: "
+                    + "；".join(advisory_claims[:5])
+                )
+            if unsupported_claims:
+                evidence.append(
+                    "unsupported: "
+                    + "；".join(unsupported_claims[:5])
+                )
+
+            self._add_check(
+                checks,
+                failures,
+                check_id="reporting_content_grounded",
+                category="reporting_content_audit",
+                passed=audit_passed,
+                message=(
+                    "最终报告内容未发现缺少真实 Observation 支撑的"
+                    "高风险确定性断言。"
+                    if audit_passed
+                    else (
+                        "最终报告存在缺少真实 Observation 支撑的"
+                        "高风险确定性断言："
+                        + "；".join(unsupported_claims[:5])
+                    )
+                ),
+                evidence=evidence,
+            )
+
         verified = (
             not failures
             and not pending
@@ -449,6 +519,114 @@ class VerificationEngine:
             deliverables=deliverables,
             successful_tools=successful_tools,
         )
+
+    @classmethod
+    def _audit_final_reporting_content(
+        cls,
+        *,
+        tool_results: List[ToolExecutionResult],
+        deliverables: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v5.0 Evidence-grounded Reporting Python Gate。
+
+        只审计“最终交付物生成后的最新成功回读 Observation”，并把其他
+        成功、非写入、非最终交付物读取 Observation 作为证据侧输入。
+
+        这样可以避免：
+        1. 把 Agent 自己的 finish 文本当作证据；
+        2. 把写文件参数当作事实来源；
+        3. 用旧版本交付物回读覆盖最终版本；
+        4. 让单期横截面数据支持趋势/因果/市场潜力/资源投入等越界结论。
+
+        如果当前任务没有可审计的文本型最终交付物回读，则返回 None，
+        保持旧流程兼容。
+        """
+        deliverable_keys = {
+            cls._path_key(item)
+            for item in deliverables
+        }
+        if not deliverable_keys:
+            return None
+
+        latest_reads: Dict[
+            str,
+            tuple[int, ToolExecutionResult],
+        ] = {}
+        evidence_texts: List[Any] = []
+
+        for index, result in enumerate(tool_results, start=1):
+            if not getattr(result, "success", False):
+                continue
+
+            tool_name = str(
+                getattr(result, "tool_name", "") or ""
+            ).strip()
+            if not tool_name:
+                continue
+
+            tool_lower = tool_name.lower()
+            observation = getattr(result, "output", None)
+            if not cls._has_substantive_observation(observation):
+                continue
+
+            arguments = getattr(result, "arguments", {}) or {}
+            argument_paths = cls._extract_argument_paths(arguments)
+            touched_deliverables = [
+                cls._path_key(path)
+                for path in argument_paths
+                if cls._path_key(path) in deliverable_keys
+            ]
+
+            is_read = any(
+                hint in tool_lower
+                for hint in cls.READ_TOOL_HINTS
+            )
+            is_write = any(
+                hint in tool_lower
+                for hint in cls.WRITE_TOOL_HINTS
+            )
+
+            if is_read and touched_deliverables:
+                for path_key in touched_deliverables:
+                    latest_reads[path_key] = (index, result)
+                continue
+
+            if is_write or touched_deliverables:
+                continue
+
+            evidence_texts.append(observation)
+
+        report_texts: List[Any] = []
+
+        for path_key, (_, result) in latest_reads.items():
+            suffix = Path(path_key).suffix.lower()
+
+            # 当前内容审计优先覆盖正式文本报告。Excel 的数值/结构一致性
+            # 已由现有 inspect + relational/cross-deliverable chain 验证；
+            # 若未来 Excel inspector 暴露完整 narrative，可再扩展到 .xlsx。
+            if suffix not in {
+                ".docx",
+                ".doc",
+                ".pdf",
+                ".pptx",
+                ".ppt",
+                ".txt",
+                ".md",
+            }:
+                continue
+
+            observation = getattr(result, "output", None)
+            if cls._has_substantive_observation(observation):
+                report_texts.append(observation)
+
+        if not report_texts:
+            return None
+
+        return ReportingContentAuditor.audit(
+            report_texts=report_texts,
+            evidence_texts=evidence_texts,
+        ).to_dict()
 
     @staticmethod
     def _normalize_plan(
@@ -806,18 +984,17 @@ class VerificationEngine:
         deliverables: List[str],
     ) -> Dict[str, Dict[str, Any]]:
         """
-        v4.0 Evidence-backed Semantic Verification（第一阶段）。
+        v5.0 Evidence-backed Semantic Verification。
 
-        目的不是让 LLM “自己宣布通过”，而是判断当前执行记录中是否
-        已经存在足够的真实工具 Observation，使某条自然语言验收要求
-        不再只是无证据的 pending。
+        普通语义要求继续沿用 v4.0 的“真实 Observation 作为证据基础”规则。
+        对“与源数据一致 / 总计核对 / 冠军核对”等关系型要求，新增一个
+        保守的跨 Observation 证据链：
 
-        规则：
-        1. 只使用 success=True 的真实工具结果；
-        2. 优先使用读取/检查/提取/加载类工具作为验收证据；
-        3. 对涉及最终文件/交付物的要求，证据必须来自实际 deliverable；
-        4. 对不涉及文件的业务计算要求，可使用成功的数据处理工具结果；
-        5. 这里只解除“缺少证据”的 pending，不覆盖任何 Python hard FAIL。
+        1. 必须存在最终 deliverable 的成功 read/inspect/extract/load；
+        2. 必须存在至少一个独立的非写入数据 Observation；
+        3. 最终文件 Observation 与独立数据 Observation 必须共享真实标量；
+        4. 涉及冠军/最高值时，还要求共享主体文本与数值；
+        5. 这里只证明“执行记录中已经形成可复核证据链”，不会覆盖 hard FAIL。
         """
         result: Dict[str, Dict[str, Any]] = {}
 
@@ -844,15 +1021,36 @@ class VerificationEngine:
                 for keyword in cls.FILE_KEYWORDS
             )
 
-            # “与源数据一致 / 匹配 / 核对”等跨来源关系要求需要更强证据。
-            # 但如果 requirement 明确指向最终文件，并且存在对真实 deliverable
-            # 的成功回读 Observation，v4.0 semantic bridge 允许把该回读作为
-            # “证据基础”；它并不声称 Python 已逐字段证明关系本身。
             requires_relational_proof = (
                 cls._requires_relational_semantic_proof(
                     lowered
                 )
             )
+            requires_cross_deliverable_proof = (
+                cls._requires_cross_deliverable_proof(
+                    lowered
+                )
+            )
+
+            if requires_cross_deliverable_proof:
+                cross_deliverable = (
+                    cls._resolve_cross_deliverable_evidence_chain(
+                        requirement=text,
+                        successful=successful,
+                        deliverable_keys=deliverable_keys,
+                    )
+                )
+                result[text] = cross_deliverable
+                continue
+
+            if requires_relational_proof and not needs_file_evidence:
+                relational = cls._resolve_relational_evidence_chain(
+                    requirement=text,
+                    successful=successful,
+                    deliverable_keys=deliverable_keys,
+                )
+                result[text] = relational
+                continue
 
             evidence: List[str] = []
 
@@ -914,11 +1112,6 @@ class VerificationEngine:
                     ):
                         continue
                 else:
-                    if requires_relational_proof:
-                        # 没有明确最终文件语义时，普通数据读取/处理 Observation
-                        # 不能证明“与源数据一致”等跨来源关系。
-                        continue
-
                     if any(
                         hint in tool_lower
                         for hint in cls.WRITE_TOOL_HINTS
@@ -939,6 +1132,740 @@ class VerificationEngine:
             }
 
         return result
+
+    @classmethod
+    def _resolve_relational_evidence_chain(
+        cls,
+        *,
+        requirement: str,
+        successful: List[ToolExecutionResult],
+        deliverable_keys: set[str],
+    ) -> Dict[str, Any]:
+        """
+        为跨来源关系要求寻找“独立数据证据 + 最终文件回读证据”。
+
+        这是确定性证据桥，不调用 LLM，也不根据 Agent 的 finish 文本判定。
+        它要求两侧 Observation 至少共享一个数值；冠军/最高值类要求还要求
+        共享一个有意义的中文主体词，从而避免仅凭两个非空 Observation 放行。
+        """
+        final_reads: List[tuple[int, ToolExecutionResult]] = []
+        data_evidence: List[tuple[int, ToolExecutionResult]] = []
+
+        for index, item in enumerate(successful, start=1):
+            tool_name = str(
+                getattr(item, "tool_name", "") or ""
+            ).strip()
+            if not tool_name:
+                continue
+
+            tool_lower = tool_name.lower()
+            observation = getattr(item, "output", None)
+            if not cls._has_substantive_observation(observation):
+                continue
+
+            arguments = getattr(item, "arguments", {}) or {}
+            argument_paths = cls._extract_argument_paths(arguments)
+            touches_deliverable = any(
+                cls._path_key(path) in deliverable_keys
+                for path in argument_paths
+            )
+
+            is_read = any(
+                hint in tool_lower
+                for hint in cls.READ_TOOL_HINTS
+            )
+            is_write = any(
+                hint in tool_lower
+                for hint in cls.WRITE_TOOL_HINTS
+            )
+
+            if is_read and touches_deliverable:
+                final_reads.append((index, item))
+                continue
+
+            if is_write or touches_deliverable:
+                continue
+
+            # 独立数据证据必须来自真实成功工具结果。读取源数据、分组、
+            # 排序、透视、统计等都可以成为关系证明的一侧。
+            data_evidence.append((index, item))
+
+        if not final_reads or not data_evidence:
+            return {
+                "resolved": False,
+                "evidence": [],
+            }
+
+        lowered = str(requirement or "").lower()
+        champion_like = any(
+            keyword in lowered
+            for keyword in (
+                "冠军",
+                "最高",
+                "最大",
+                "第一",
+                "排名",
+            )
+        )
+
+        for read_index, read_result in reversed(final_reads):
+            read_output = getattr(read_result, "output", None)
+            read_numbers = cls._extract_numeric_tokens(read_output)
+            read_terms = cls._extract_subject_tokens(read_output)
+
+            if not read_numbers:
+                continue
+
+            for data_index, data_result in reversed(data_evidence):
+                data_output = getattr(data_result, "output", None)
+                data_numbers = cls._extract_numeric_tokens(data_output)
+                shared_numbers = sorted(
+                    read_numbers.intersection(data_numbers)
+                )
+
+                if not shared_numbers:
+                    continue
+
+                shared_terms: List[str] = []
+                if champion_like:
+                    data_terms = cls._extract_subject_tokens(data_output)
+                    shared_terms = sorted(
+                        read_terms.intersection(data_terms)
+                    )
+                    if not shared_terms:
+                        continue
+
+                read_name = str(
+                    getattr(read_result, "tool_name", "") or ""
+                )
+                data_name = str(
+                    getattr(data_result, "tool_name", "") or ""
+                )
+
+                evidence = [
+                    cls._summarize_tool_evidence(
+                        index=data_index,
+                        tool_name=data_name,
+                        observation=data_output,
+                    ),
+                    cls._summarize_tool_evidence(
+                        index=read_index,
+                        tool_name=read_name,
+                        observation=read_output,
+                    ),
+                    (
+                        "relational_chain: 独立数据 Observation 与最终交付物"
+                        "回读 Observation 共享数值 "
+                        + ", ".join(shared_numbers[:8])
+                        + (
+                            "；共享主体 "
+                            + ", ".join(shared_terms[:8])
+                            if shared_terms
+                            else ""
+                        )
+                    ),
+                ]
+
+                return {
+                    "resolved": True,
+                    "evidence": evidence,
+                }
+
+        return {
+            "resolved": False,
+            "evidence": [],
+        }
+
+    @staticmethod
+    def _observation_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return repr(value)
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def _extract_numeric_tokens(
+        cls,
+        value: Any,
+    ) -> set[str]:
+        """
+        提取可跨 Observation 比对的数值 token。
+        统一去掉千分位，并保留整数/小数/百分比中的数值主体。
+        """
+        text = cls._observation_text(value)
+        text = text.replace(",", "")
+        tokens = set(
+            re.findall(
+                r"(?<![\w.])-?\d+(?:\.\d+)?",
+                text,
+            )
+        )
+        return {
+            token
+            for token in tokens
+            if token not in {"0", "1"}
+        }
+
+    @classmethod
+    def _extract_subject_tokens(
+        cls,
+        value: Any,
+    ) -> set[str]:
+        """
+        提取冠军/排名关系可用的中文主体 token。
+        过滤常见结构词，避免“销售额/城市”等泛词本身造成误通过。
+        """
+        text = cls._observation_text(value)
+        candidates = set(
+            re.findall(
+                r"[\u4e00-\u9fff]{2,12}",
+                text,
+            )
+        )
+
+        stop_terms = {
+            "城市",
+            "销售额",
+            "销售额合计",
+            "销售冠军",
+            "冠军城市",
+            "冠军销售额",
+            "合计",
+            "总计",
+            "全部城市",
+            "汇总",
+            "排名",
+            "第一",
+            "第二",
+            "第三",
+            "最高",
+            "最大值",
+            "数据",
+            "源数据",
+            "工作表",
+            "执行摘要",
+            "核心指标",
+            "数据来源",
+            "统计口径",
+            "有效记录",
+        }
+
+        result = set()
+        for token in candidates:
+            if token in stop_terms:
+                continue
+            if len(token) < 2:
+                continue
+
+            # repr(dict/DataFrame preview) 里常出现较长连续中文，
+            # 同时保留其中常见的地名/主体短词，需要做轻量切片。
+            result.add(token)
+            for length in (2, 3, 4):
+                if len(token) > length:
+                    for start in range(0, len(token) - length + 1):
+                        piece = token[start:start + length]
+                        if piece not in stop_terms:
+                            result.add(piece)
+
+        return result
+
+    @classmethod
+    def _extract_champion_subject_tokens(
+        cls,
+        value: Any,
+    ) -> set[str]:
+        """
+        提取带“冠军/第一/最高主体”关系语义的主体。
+
+        不能因为两个 Observation 都包含同一张完整业务表，
+        就把其中任意共同城市误当成“共同冠军”。
+
+        支持：
+        - {"销售冠军": "澳门"}
+        - {"冠军城市": "澳门"}
+        - "销售冠军\\n澳门"
+        - "冠军城市：澳门"
+        - "排名第一：澳门"
+
+        没有明确关系标签时返回空集合，不猜。
+        """
+        result: set[str] = set()
+
+        relation_key_hints = (
+            "销售冠军",
+            "冠军城市",
+            "冠军",
+            "排名第一",
+            "第一名",
+            "最高城市",
+            "最高地区",
+            "top1",
+            "top_1",
+        )
+        excluded_key_hints = (
+            "销售额",
+            "金额",
+            "数值",
+            "value",
+            "amount",
+        )
+
+        relation_pattern = (
+            r"(?:销售冠军|冠军城市|排名第一|第一名|最高城市|最高地区)"
+            r"\s*(?:[:：\n]|为|是)?\s*"
+            r"([\u4e00-\u9fffA-Za-z]"
+            r"[\u4e00-\u9fffA-Za-z0-9_-]{1,31})"
+        )
+        pure_subject_pattern = (
+            r"[\u4e00-\u9fffA-Za-z]"
+            r"[\u4e00-\u9fffA-Za-z0-9_-]{1,31}"
+        )
+
+        def walk(item: Any):
+            if item is None:
+                return
+
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    key_text = str(key or "").strip().lower()
+                    is_relation_key = any(
+                        hint in key_text
+                        for hint in relation_key_hints
+                    )
+                    is_numeric_key = any(
+                        hint in key_text
+                        for hint in excluded_key_hints
+                    )
+
+                    if (
+                        is_relation_key
+                        and not is_numeric_key
+                        and isinstance(child, (str, int, float))
+                    ):
+                        child_text = str(child).strip()
+                        if re.fullmatch(
+                            pure_subject_pattern,
+                            child_text,
+                        ):
+                            result.add(child_text)
+
+                    walk(child)
+                return
+
+            if isinstance(item, (list, tuple, set)):
+                for child in item:
+                    walk(child)
+                return
+
+            if isinstance(item, str):
+                for match in re.findall(
+                    relation_pattern,
+                    item.strip(),
+                ):
+                    cleaned = str(match).strip()
+                    if cleaned:
+                        result.add(cleaned)
+
+        walk(value)
+        return result
+
+    @classmethod
+    def _extract_champion_subjects_from_result(
+        cls,
+        tool_result: ToolExecutionResult,
+    ) -> set[str]:
+        """
+        从一条真实 ToolExecutionResult 中提取“冠军主体”证据。
+
+        优先使用 Observation 中显式的冠军/KPI 标签。
+        对 sort_data 额外允许一个确定性推导：
+        - ascending=False；
+        - Observation preview 至少有一行；
+        - 第一行中存在非数值业务主体字段。
+
+        这样“按销售额降序排序后的第一行”可以作为独立数据链中的
+        冠军主体证据，但普通未排序表格中的城市名称不能冒充冠军。
+        """
+        observation = getattr(tool_result, "output", None)
+        explicit = cls._extract_champion_subject_tokens(
+            observation
+        )
+        if explicit:
+            return explicit
+
+        tool_name = str(
+            getattr(tool_result, "tool_name", "") or ""
+        ).strip().lower()
+        if tool_name != "sort_data":
+            return set()
+
+        arguments = getattr(tool_result, "arguments", {}) or {}
+        if arguments.get("ascending") is not False:
+            return set()
+
+        if not isinstance(observation, dict):
+            return set()
+
+        preview = observation.get("preview")
+        if (
+            not isinstance(preview, list)
+            or not preview
+            or not isinstance(preview[0], dict)
+        ):
+            return set()
+
+        first_row = preview[0]
+        candidates: set[str] = set()
+
+        for key, value in first_row.items():
+            if not isinstance(value, str):
+                continue
+
+            key_text = str(key or "").strip().lower()
+            if any(
+                token in key_text
+                for token in (
+                    "城市",
+                    "地区",
+                    "区域",
+                    "门店",
+                    "客户",
+                    "产品",
+                    "品类",
+                    "名称",
+                    "name",
+                    "city",
+                    "region",
+                    "category",
+                    "product",
+                )
+            ):
+                value_text = value.strip()
+                if value_text:
+                    candidates.add(value_text)
+
+        return candidates
+
+    @classmethod
+    def _resolve_cross_deliverable_evidence_chain(
+        cls,
+        *,
+        requirement: str,
+        successful: List[ToolExecutionResult],
+        deliverable_keys: set[str],
+    ) -> Dict[str, Any]:
+        """
+        v5.0：为“多个最终交付物彼此一致”建立确定性证据链。
+
+        与普通 relational chain 不同，这里要求：
+        1. 至少两个不同最终 deliverable 都有成功的 read/inspect/extract/load；
+        2. 不同 deliverable 的最终回读 Observation 至少共享一个业务数值；
+        3. 冠军/最高/排名类要求还必须共享业务主体；
+        4. 如果要求同时提到源数据/源文件，还必须存在独立非写入数据
+           Observation，并与最终交付物共享数值；冠军类同样共享主体。
+
+        这仍然只是“证据链存在”的确定性证明，不让 LLM 自己宣布一致。
+        """
+        reads_by_path: Dict[str, tuple[int, ToolExecutionResult]] = {}
+        data_evidence: List[tuple[int, ToolExecutionResult]] = []
+
+        for index, item in enumerate(successful, start=1):
+            tool_name = str(
+                getattr(item, "tool_name", "") or ""
+            ).strip()
+            if not tool_name:
+                continue
+
+            tool_lower = tool_name.lower()
+            observation = getattr(item, "output", None)
+            if not cls._has_substantive_observation(observation):
+                continue
+
+            arguments = getattr(item, "arguments", {}) or {}
+            argument_paths = cls._extract_argument_paths(arguments)
+            touched = [
+                cls._path_key(path)
+                for path in argument_paths
+                if cls._path_key(path) in deliverable_keys
+            ]
+
+            is_read = any(
+                hint in tool_lower
+                for hint in cls.READ_TOOL_HINTS
+            )
+            is_write = any(
+                hint in tool_lower
+                for hint in cls.WRITE_TOOL_HINTS
+            )
+
+            if is_read and touched:
+                for path_key in touched:
+                    # 后出现的成功读取代表更新的最终证据。
+                    reads_by_path[path_key] = (index, item)
+                continue
+
+            if is_write or touched:
+                continue
+
+            data_evidence.append((index, item))
+
+        final_reads = list(reads_by_path.values())
+        if len(final_reads) < 2:
+            return {
+                "resolved": False,
+                "evidence": [],
+            }
+
+        lowered = str(requirement or "").lower()
+        champion_like = any(
+            keyword in lowered
+            for keyword in (
+                "冠军",
+                "最高",
+                "最大",
+                "第一",
+                "排名",
+            )
+        )
+        source_required = any(
+            keyword in lowered
+            for keyword in (
+                "源数据",
+                "原始数据",
+                "正式源",
+                "源文件",
+                "原文件",
+                "输入数据",
+                "source",
+            )
+        )
+
+        # 一个跨交付物 requirement 可能同时包含多种关系：
+        # “城市销售汇总、销售总额与销售冠军彼此一致，并与源数据一致”。
+        # 不能因为其中出现“冠军”二字，就把整条 requirement 的所有
+        # source evidence 都强制解释成“必须单条 Observation 同时含
+        # 冠军主体 + 数值”。真实 Agent 往往是：
+        #   group_statistics -> 城市汇总数值
+        #   sort_data        -> 冠军主体 + 最高值
+        # 因此：
+        # 1. 两个最终 deliverable 之间，冠军类仍严格要求共享主体；
+        # 2. 与 source/data chain 的数值一致性，可以由独立分析
+        #    Observation 的共享数值证明；
+        # 3. 如果该 source Observation 本身能提供冠军主体，则继续
+        #    记录主体证据；否则不让它否定已经由两个最终文件共同
+        #    证明的冠军主体一致性。
+
+        for left_pos in range(len(final_reads)):
+            left_index, left_result = final_reads[left_pos]
+            left_output = getattr(left_result, "output", None)
+            left_numbers = cls._extract_numeric_tokens(left_output)
+            left_terms = (
+                cls._extract_champion_subjects_from_result(
+                    left_result
+                )
+                if champion_like
+                else cls._extract_subject_tokens(left_output)
+            )
+
+            if not left_numbers:
+                continue
+
+            for right_pos in range(left_pos + 1, len(final_reads)):
+                right_index, right_result = final_reads[right_pos]
+                right_output = getattr(right_result, "output", None)
+                right_numbers = cls._extract_numeric_tokens(right_output)
+                shared_numbers = sorted(
+                    left_numbers.intersection(right_numbers)
+                )
+
+                if not shared_numbers:
+                    continue
+
+                shared_terms: List[str] = []
+                if champion_like:
+                    right_terms = (
+                        cls._extract_champion_subjects_from_result(
+                            right_result
+                        )
+                    )
+                    shared_terms = sorted(
+                        left_terms.intersection(right_terms)
+                    )
+                    if not shared_terms:
+                        continue
+
+                source_evidence: Optional[
+                    tuple[int, ToolExecutionResult, List[str], List[str]]
+                ] = None
+
+                if source_required:
+                    for data_index, data_result in reversed(data_evidence):
+                        data_output = getattr(data_result, "output", None)
+                        data_numbers = cls._extract_numeric_tokens(data_output)
+                        source_shared_numbers = sorted(
+                            set(shared_numbers).intersection(data_numbers)
+                        )
+                        if not source_shared_numbers:
+                            continue
+
+                        source_shared_terms: List[str] = []
+                        if champion_like:
+                            data_terms = (
+                                cls._extract_champion_subjects_from_result(
+                                    data_result
+                                )
+                            )
+                            source_shared_terms = sorted(
+                                set(shared_terms).intersection(data_terms)
+                            )
+
+                        source_evidence = (
+                            data_index,
+                            data_result,
+                            source_shared_numbers,
+                            source_shared_terms,
+                        )
+                        break
+
+                    if source_evidence is None:
+                        continue
+
+                left_name = str(
+                    getattr(left_result, "tool_name", "") or ""
+                )
+                right_name = str(
+                    getattr(right_result, "tool_name", "") or ""
+                )
+
+                evidence = [
+                    cls._summarize_tool_evidence(
+                        index=left_index,
+                        tool_name=left_name,
+                        observation=left_output,
+                    ),
+                    cls._summarize_tool_evidence(
+                        index=right_index,
+                        tool_name=right_name,
+                        observation=right_output,
+                    ),
+                    (
+                        "cross_deliverable_chain: 两个不同最终交付物的"
+                        "回读 Observation 共享数值 "
+                        + ", ".join(shared_numbers[:8])
+                        + (
+                            "；共享主体 "
+                            + ", ".join(shared_terms[:8])
+                            if shared_terms
+                            else ""
+                        )
+                    ),
+                ]
+
+                if source_evidence is not None:
+                    (
+                        data_index,
+                        data_result,
+                        source_shared_numbers,
+                        source_shared_terms,
+                    ) = source_evidence
+                    data_name = str(
+                        getattr(data_result, "tool_name", "") or ""
+                    )
+                    data_output = getattr(data_result, "output", None)
+                    evidence.append(
+                        cls._summarize_tool_evidence(
+                            index=data_index,
+                            tool_name=data_name,
+                            observation=data_output,
+                        )
+                    )
+                    evidence.append(
+                        (
+                            "cross_deliverable_source_chain: 两个最终交付物"
+                            "与独立源数据 Observation 共享数值 "
+                            + ", ".join(source_shared_numbers[:8])
+                            + (
+                                "；共享主体 "
+                                + ", ".join(source_shared_terms[:8])
+                                if source_shared_terms
+                                else ""
+                            )
+                        )
+                    )
+
+                return {
+                    "resolved": True,
+                    "evidence": evidence,
+                }
+
+        return {
+            "resolved": False,
+            "evidence": [],
+        }
+
+    @staticmethod
+    def _requires_cross_deliverable_proof(
+        lowered_requirement: str,
+    ) -> bool:
+        """
+        判断要求是否明确声明“多个最终交付物之间需要一致/核对”。
+
+        必须同时具有：
+        - 关系词；
+        - 多交付物信号（例如 Excel + Word、两个文件、彼此/两份交付物）。
+        """
+        text = str(lowered_requirement or "").strip()
+        if not text:
+            return False
+
+        relation_keywords = (
+            "一致",
+            "完全一致",
+            "相符",
+            "匹配",
+            "对应",
+            "核对",
+            "对比",
+            "比较",
+            "相同",
+            "无差异",
+        )
+        has_relation = any(
+            keyword in text
+            for keyword in relation_keywords
+        )
+        if not has_relation:
+            return False
+
+        has_excel = any(
+            keyword in text
+            for keyword in ("excel", "xlsx")
+        )
+        has_word = any(
+            keyword in text
+            for keyword in ("word", "docx")
+        )
+        explicit_multi = any(
+            keyword in text
+            for keyword in (
+                "两个文件",
+                "两个交付物",
+                "两份文件",
+                "两份交付物",
+                "多个文件",
+                "多个交付物",
+                "彼此一致",
+                "交付物之间",
+                "文件之间",
+                "跨交付物",
+            )
+        )
+
+        return (has_excel and has_word) or explicit_multi
 
     @staticmethod
     def _requires_relational_semantic_proof(

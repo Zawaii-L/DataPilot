@@ -154,9 +154,10 @@ def main():
     )
     summary = default_agent.skill_registry.summary()
     assert_true(
-        summary["skill_count"] == 6
+        summary["skill_count"] == 7
         and "excel_data_analysis" in summary["skills"]
-        and "cross_file_office_workflow" in summary["skills"],
+        and "cross_file_office_workflow" in summary["skills"]
+        and "professional_word_delivery" in summary["skills"],
         "默认 Skill Registry 未正确接入 AgentLoop。",
     )
     print("PASS")
@@ -170,7 +171,7 @@ def main():
     print("3. Skill 引用不存在 Tool 会在启动阶段失败")
     print("4. Skill 只指导工作流，不直接执行")
     print("5. Completion Gate 最终完成权保持不变")
-    print("6. 默认六个 Office Skills 已接入 AgentLoop")
+    print("6. 默认七个 Office Skills 已接入 AgentLoop")
     print("=" * 72)
 
 

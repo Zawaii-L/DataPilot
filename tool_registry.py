@@ -407,6 +407,10 @@ def create_default_tool_registry() -> ToolRegistry:
         create_professional_excel_report,
         inspect_professional_excel_report,
     )
+    from professional_word_report_tools import (
+        create_professional_word_report,
+        inspect_professional_word_report,
+    )
     from office_data_tools import (
         apply_filters,
         create_pivot_summary,
@@ -923,6 +927,66 @@ def create_default_tool_registry() -> ToolRegistry:
             "结构检查字典，包含 file_path、sheet_names、sheet_count、"
             "chart_count，以及每个 Sheet 的标题、表头、冻结窗格、"
             "AutoFilter、图表数量、合并区域和 preview_records。"
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # 专业 Word 报告
+    # ------------------------------------------------------------
+
+    registry.register(
+        "create_professional_word_report",
+        create_professional_word_report,
+        (
+            "根据已经验证的真实业务事实创建新的专业 .docx 汇报报告。"
+            "适合正式、专业、可直接发送给领导或客户的 Word 交付；"
+            "支持报告标题、副标题、元数据、执行摘要、KPI、正文段落、"
+            "项目符号、业务表格、页眉页脚和来源说明。"
+            "本工具用于创建新报告，不用于高保真修改已有 Word。"
+        ),
+        category="output",
+        parameters={
+            "output_path": "最终 .docx 输出路径；Workspace 任务应写入 deliverables_dir。",
+            "report_title": "必填。报告主标题。",
+            "subtitle": "可选。报告副标题。",
+            "metadata": "可选。报告对象、统计口径、期间等元数据字典。",
+            "executive_summary": (
+                "可选。基于真实证据形成的执行摘要；不得编造业务事实。"
+            ),
+            "kpis": (
+                "可选。KPI 列表，每项使用 {label, value}；"
+                "KPI 值必须来自已验证 Observation。"
+            ),
+            "sections": (
+                "可选。报告章节列表。每项包含 title、type；"
+                "type 支持 paragraphs / bullets / table。"
+                "paragraphs 使用 content；bullets 使用 items；"
+                "table 使用 columns 和 rows。"
+            ),
+            "source_note": "可选。数据来源、口径或证据说明。",
+        },
+        returns=(
+            "生成结果字典，包含 success、output_path、report_title、"
+            "section_count、kpi_count、has_executive_summary、has_source_note。"
+        ),
+    )
+
+    registry.register(
+        "inspect_professional_word_report",
+        inspect_professional_word_report,
+        (
+            "重新打开已经生成的专业 .docx 报告并提取结构证据。"
+            "用于交付前核验标题层级、正文预览、表格结构、页眉页脚等；"
+            "当 TaskPlan 要求生成后重新读取或检查最终专业 Word 时，"
+            "应在写入完成后对最终交付文件调用本工具。"
+        ),
+        category="inspection",
+        parameters={
+            "file_path": "需要重新读取检查的最终 .docx 文件路径。",
+        },
+        returns=(
+            "结构检查字典，包含 file_path、paragraph_count、table_count、"
+            "headings、paragraph_preview、tables、sections。"
         ),
     )
 

@@ -11,6 +11,7 @@ from openai import OpenAI
 
 from execution_context import ExecutionContext, ReferenceResolver
 from tool_executor import ToolExecutionResult, ToolExecutor
+from tool_failure_recovery import build_recovery_hint
 from tool_registry import ToolRegistry, create_default_tool_registry
 from task_planner import TaskPlan
 from skill_registry import SkillRegistry, create_default_skill_registry
@@ -33,6 +34,7 @@ class AgentLoopResult:
     tool_results: List[ToolExecutionResult] = field(default_factory=list)
     decisions: List[Dict[str, Any]] = field(default_factory=list)
     verification_report: Optional[Dict[str, Any]] = None
+    retry_policy_report: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -47,6 +49,7 @@ class AgentLoopResult:
             ],
             "decisions": self.decisions,
             "verification_report": self.verification_report,
+            "retry_policy_report": self.retry_policy_report,
         }
 
 
@@ -81,6 +84,7 @@ class AgentLoop:
         max_iterations: int = 12,
         verifier: Optional[VerificationEngine] = None,
         skill_registry: Optional[SkillRegistry] = None,
+        max_identical_failures: int = 2,
     ):
         self.registry = registry or create_default_tool_registry()
         self.skill_registry = (
@@ -129,6 +133,10 @@ class AgentLoop:
         self.max_iterations = max(
             1,
             int(max_iterations),
+        )
+        self.max_identical_failures = max(
+            1,
+            int(max_identical_failures),
         )
 
     def _validate_skill_catalog(self):
@@ -344,6 +352,37 @@ class AgentLoop:
             if not isinstance(arguments, dict):
                 raise TypeError(
                     "Agent 工具 arguments 必须是 JSON 对象。"
+                )
+
+            retry_policy = self._evaluate_retry_policy(
+                tool_name=canonical_name,
+                arguments=arguments,
+                tool_results=tool_results,
+            )
+
+            if retry_policy.get("blocked"):
+                self.report_progress(
+                    f"[{step_id}] Recovery Policy：停止重复失败调用。"
+                    f"原因：{retry_policy.get('reason', '')}"
+                )
+
+                return AgentLoopResult(
+                    success=False,
+                    goal=goal,
+                    final_answer="",
+                    stop_reason="recovery_exhausted",
+                    iterations=iteration,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    verification_report=(
+                        dict(latest_verification_report)
+                        if isinstance(
+                            latest_verification_report,
+                            dict,
+                        )
+                        else None
+                    ),
+                    retry_policy_report=retry_policy,
                 )
 
             try:
@@ -974,6 +1013,49 @@ class AgentLoop:
 75. Skill Selection 基于用户目标 + TaskPlan 在任务启动时确定，不额外调用 LLM；若没有足够明确的匹配信号，Python 会安全回退到完整 Skill Catalog。
 76. 不要为了“遵循 Skill”而改变已经由真实 Observation 证明正确的执行路径；Skill 是方法参考，不是第二套 TaskPlan。
 
+【v5.0 多交付物一致性规则】
+77. 当用户同时要求 Excel 和 Word 等多个最终交付物时，应尽量复用同一份已经由真实源数据计算得到的分析结果，不要为每个交付物分别重新计算一套可能产生差异的数据。
+78. 先完成业务分析并形成可复用的真实 Observation，再分别构造各最终交付物；多个交付物中的总计、分组结果、排名、冠军等共同业务字段必须来自同一证据链。
+79. 每个最终交付物最后一次写入后都必须分别 read/inspect；只检查其中一个文件不能证明另一个文件正确。
+80. 用户要求 Excel 与 Word 数据一致时，finish 前必须让两个最终文件的回读 Observation 同时存在，并核对共同业务数字；冠军/最高/排名类结论还必须核对共同业务主体。
+81. 如果 Completion Gate 返回跨交付物一致性 pending，不要重新生成已经正确的文件；优先补齐缺失的最终文件 inspect/read 或独立数据统计 Observation。
+82. 多交付物任务应把每个最终文件直接写入 deliverables_dir；仅供生成过程使用的中间表、临时工作簿或草稿必须留在 temporary_dir。
+
+【v5.0 Evidence-grounded Reporting 规则】
+83. 正式报告内容必须区分三类：事实、计算/比较结论、建议。三类内容的证据要求不同，不得混写成同等确定的事实。
+84. “事实”包括源数据值、KPI、排名、日期、主体、数量、状态等；只有真实 Observation 已读取、计算或验证的内容才能作为事实写入报告。
+85. “计算/比较结论”必须能够由现有真实 Observation 直接推出，例如“澳门销售额最高”必须有城市汇总或排序证据；不得从单个数字扩展出未验证的因果关系、趋势、增长原因或经营表现判断。
+86. “建议”不得伪装成源数据事实。仅凭当前数据不能充分支持的行动建议，必须明确使用“建议”“可考虑”“建议进一步分析”等措辞，并说明它是基于当前有限证据的分析建议，而不是已验证事实。
+87. 不得仅凭单期横截面销售额就声称“持续领先”“增长”“下降”“趋势改善”“市场潜力更高”“应加大资源投入”“原因是”等需要时间序列、因果或额外业务证据才能支持的结论。
+88. 如果用户没有要求建议，正式 Word/Excel 报告不应为了显得完整而主动编造经营建议；优先报告真实发现、数据限制和可验证结论。
+89. 如果用户明确要求建议但现有证据不足，应给出“进一步分析方向”或带条件的建议，并指出还需要哪些数据，例如历史期、目标值、成本、利润、转化率或业务约束。
+90. executive_summary、KPI、sections、图表标题和 final_answer 都受上述证据约束；不能因为内容位于“结论与建议”章节就降低事实准确性要求。
+91. 生成专业 Word 时，模板已经自动生成“执行摘要”和“核心指标”模块；sections 不要再次创建同名或等价重复章节。自定义 sections 应用于业务分析、汇总表、数据说明、分析建议等补充内容。
+92. 当报告同时包含事实与建议时，优先把事实性“关键发现/业务分析”与“分析建议/进一步分析方向”分成不同章节，使读者能够区分已验证事实与模型建议。
+93. 最终文件回读后，如果发现报告把缺乏证据的推测写成确定事实，或把建议包装成已验证结论，不得 finish；应修正报告并重新回读最新版本。
+
+【v5.0 Tool Failure Recovery 规则】
+94. 当失败 Observation 中存在 recovery 时，它是 Python 根据真实 error_type / error_message 生成的确定性恢复提示，优先读取 category、recoverable、recommended_actions 和 avoid_actions。
+95. recovery 只是诊断，不代表工具已经恢复成功；任何修正调用仍必须经过真实 ToolExecutor、ToolPreflight 和 Tool Registry。
+96. recoverable=true 时，优先只修正与本次失败直接相关的参数、引用、路径、来源或工具选择，并复用已经成功取得的 Observation。
+97. avoid_actions 是恢复边界：不得猜测不存在的文件、Sheet、列名、step_id、output 字段或工具参数。
+98. preflight_signature 应重新核对真实 Tool Registry 参数；preflight_type 需要真实 Python 对象时优先通过 $ref 复用成功 Observation。
+99. output_safety 必须保持 protected_input_paths 不变；中间文件使用 temporary_dir，最终交付物使用 deliverables_dir，不得绕过 ToolPreflight。
+100. missing_file、missing_sheet、missing_column 必须先从 Workspace、成功检查结果或真实数据 Observation 取得实际名称，再重新构造调用。
+101. reference_resolution 必须先确认被引用 step 是否成功且 output 字段真实存在；前置步骤失败时先补齐前置步骤。
+102. network、rate_limit 不得无限机械重复相同请求；permission 优先改用 Workspace 中新的可写路径或不冲突文件名。
+103. recoverable=false 或 category=unknown 时保持保守；无法确定安全修复方式时不得猜测参数、伪造成功或声称任务已完成。
+104. 同一工具连续失败时结合 failed_tool_counts 和每次 recovery 改变策略；不得只为了“再试一次”原样重复失败调用。
+
+【v5.0 Recovery Policy / Retry Budget 规则】
+105. 当前 state.retry_policy 是 Python 的确定性重试预算状态；它不是建议，而是执行边界。
+106. “完全相同调用”由 canonical tool + 实际 arguments 的稳定签名确定；只有真实改变参数、路径、引用或工具，才算新的恢复策略。
+107. recoverable=true 不代表可以无限重试；同一失败调用达到 max_identical_failures 后，Python 会以 recovery_exhausted 停止，不再执行第三次相同失败。
+108. recoverable=false 的完全相同调用在首次真实失败后禁止再次盲目执行；必须换用有真实依据的策略，否则应保守停止。
+109. failed_tool_counts 统计工具级失败次数；retry_policy.identical_failure_counts 统计调用签名级失败次数。不要把“同一工具但已修正参数”误判为原样重试。
+110. Retry Budget 不得用于绕过 output_safety、protected_input_paths、ToolPreflight 或 Verification；安全失败只能通过合法的新路径/新参数解决。
+111. 如果已有 RecoveryHint 指出了可验证的修复方向，应优先利用现有 Observation 改变失败调用，而不是消耗剩余 Retry Budget。
+
 Skill Selection 状态：
 {skill_selection_note}
 
@@ -1078,10 +1160,9 @@ Selected Office Skill Catalog（方法指导，不可直接执行）
                             result.output
                         )
                         if result.success
-                        else {
-                            "error_type": result.error_type,
-                            "error_message": result.error_message,
-                        }
+                        else self._build_failure_observation(
+                            result
+                        )
                     ),
                 }
             )
@@ -1126,7 +1207,195 @@ Selected Office Skill Catalog（方法指导，不可直接执行）
             "tool_step_count": len(tool_results),
             "previous_decision_count": len(decisions),
             "failed_tool_counts": failed_tool_counts,
+            "retry_policy": self._build_retry_policy_state(
+                tool_results
+            ),
         }
+
+    def _build_retry_policy_state(
+        self,
+        tool_results: List[ToolExecutionResult],
+    ) -> Dict[str, Any]:
+        """
+        v5.0：向决策层暴露确定性的 Recovery Retry Budget 状态。
+
+        这里不自动重试、不修改参数，也不把失败改写成成功。
+        它只统计“完全相同的失败调用签名”，供 Agent 判断是否必须换策略。
+        """
+        signature_counts: Dict[str, int] = {}
+        unrecoverable_signatures: List[str] = []
+
+        for result in tool_results:
+            if result.success:
+                continue
+
+            signature = self._failure_call_signature(
+                result.tool_name,
+                result.arguments,
+            )
+            signature_counts[signature] = (
+                signature_counts.get(signature, 0) + 1
+            )
+
+            recovery = build_recovery_hint(result)
+            if (
+                isinstance(recovery, dict)
+                and recovery.get("recoverable") is False
+            ):
+                unrecoverable_signatures.append(signature)
+
+        return {
+            "max_identical_failures": self.max_identical_failures,
+            "identical_failure_counts": signature_counts,
+            "unrecoverable_signatures": sorted(
+                set(unrecoverable_signatures)
+            ),
+            "policy": (
+                "相同 tool + arguments 的 recoverable 失败达到预算后，"
+                "禁止再次原样执行；recoverable=false 的完全相同调用"
+                "在首次失败后即禁止盲目重试。改变真实相关参数、路径、"
+                "引用或工具后形成新的调用签名，不视为原样重试。"
+            ),
+        }
+
+    def _evaluate_retry_policy(
+        self,
+        *,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        tool_results: List[ToolExecutionResult],
+    ) -> Dict[str, Any]:
+        """
+        在真实工具执行前执行确定性 Retry Budget 检查。
+
+        - recoverable=true：同一失败调用最多真实执行
+          max_identical_failures 次；
+        - recoverable=false：同一失败调用真实失败一次后，
+          下一次完全相同调用立即阻断；
+        - 参数/路径/引用/工具发生真实变化时，签名改变，
+          允许 Agent 继续自纠；
+        - 不绕过 ToolExecutor / ToolPreflight / ToolRegistry。
+        """
+        signature = self._failure_call_signature(
+            tool_name,
+            arguments,
+        )
+
+        matching_failures: List[ToolExecutionResult] = []
+
+        for result in tool_results:
+            if result.success:
+                continue
+
+            if self._failure_call_signature(
+                result.tool_name,
+                result.arguments,
+            ) == signature:
+                matching_failures.append(result)
+
+        if not matching_failures:
+            return {
+                "blocked": False,
+                "signature": signature,
+                "failure_count": 0,
+                "limit": self.max_identical_failures,
+                "recoverable": None,
+                "reason": "",
+            }
+
+        latest_recovery = build_recovery_hint(
+            matching_failures[-1]
+        )
+        recoverable = (
+            latest_recovery.get("recoverable")
+            if isinstance(latest_recovery, dict)
+            else None
+        )
+
+        failure_count = len(matching_failures)
+        limit = (
+            1
+            if recoverable is False
+            else self.max_identical_failures
+        )
+        blocked = failure_count >= limit
+
+        if recoverable is False:
+            reason = (
+                "该完全相同调用此前已产生 recoverable=false 失败；"
+                "禁止在没有新证据或策略变化时盲目重试。"
+            )
+        else:
+            reason = (
+                f"该完全相同调用已失败 {failure_count} 次，"
+                f"达到 Retry Budget={limit}；必须改变参数、路径、"
+                "引用或工具策略，而不是继续原样重试。"
+            )
+
+        return {
+            "blocked": blocked,
+            "signature": signature,
+            "failure_count": failure_count,
+            "limit": limit,
+            "recoverable": recoverable,
+            "category": (
+                latest_recovery.get("category")
+                if isinstance(latest_recovery, dict)
+                else None
+            ),
+            "reason": reason if blocked else "",
+        }
+
+    @classmethod
+    def _failure_call_signature(
+        cls,
+        tool_name: str,
+        arguments: Dict[str, Any],
+    ) -> str:
+        """
+        构造稳定的“工具 + 参数”调用签名。
+
+        DataFrame 等真实 Python 对象不会被序列化全文，只记录类型与 shape；
+        JSON 参数则稳定排序，保证完全相同调用可被确定性识别。
+        """
+        safe_arguments = cls._json_safe_arguments(
+            dict(arguments or {})
+        )
+
+        payload = {
+            "tool": str(tool_name or "").strip(),
+            "arguments": safe_arguments,
+        }
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    @staticmethod
+    def _build_failure_observation(
+        result: ToolExecutionResult,
+    ) -> Dict[str, Any]:
+        """
+        v5.0：把真实 Tool 失败转换成结构化恢复 Observation。
+
+        RecoveryHint 只提供确定性诊断与恢复边界；
+        不自动修改参数、不自动重试，也不绕过 ToolPreflight。
+        """
+        observation: Dict[str, Any] = {
+            "error_type": result.error_type,
+            "error_message": result.error_message,
+        }
+
+        recovery = build_recovery_hint(result)
+
+        if recovery is not None:
+            observation["recovery"] = recovery
+
+        return observation
 
     @staticmethod
     def _json_safe_arguments(

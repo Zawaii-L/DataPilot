@@ -546,6 +546,61 @@ def create_default_skill_registry() -> SkillRegistry:
     )
 
     registry.register(
+        "professional_word_delivery",
+        (
+            "把已经验证的数据分析结果、业务事实或文档研究结果整理成新的"
+            "专业 Word 汇报交付物。适合正式、汇报型、可直接发送给领导或客户的"
+            "新 Word 报告；优先使用专业 Word 创建工具并在写入后重新检查最终文件。"
+        ),
+        category="office_delivery",
+        use_when=[
+            "用户明确要求生成新的最终 Word 报告、汇报、简报或分析报告。",
+            "用户要求正式、专业、汇报型、可直接发送给领导或客户的 Word 交付物。",
+            "最终 Word 需要执行摘要、KPI、业务表格、来源说明或清晰章节层级。",
+        ],
+        recommended_tools=[
+            "read_office_data",
+            "read_document",
+            "create_professional_word_report",
+            "inspect_professional_word_report",
+        ],
+        workflow=[
+            "先读取完成任务所需的真实数据或文档证据，不能凭文件名、常识或猜测填写报告。",
+            "在写文件前确定报告对象、主标题、执行摘要、关键 KPI、章节结构和来源说明。",
+            "把拟写内容先区分为事实、可直接计算/比较的结论、分析建议三类；所有 KPI、排名、业务数字和事实性结论必须来自前序已验证 Observation。",
+            "计算或比较结论只能写到现有证据能够直接推出的程度；不得把横截面数据扩展成未经验证的趋势、因果、增长原因、市场潜力或资源投入结论。",
+            "用户未要求建议时，不为了报告完整主动添加经营建议；用户要求建议但证据不足时，应改写为带条件的分析建议或进一步分析方向，并明确仍需补充的数据。",
+            "模板会自动生成“执行摘要”和“核心指标”；sections 不再重复创建同名或等价章节，优先用于业务分析、汇总表、数据说明和必要的分析建议。",
+            "事实性关键发现与分析建议应分开组织，避免把模型建议包装成已验证事实。",
+            "使用 create_professional_word_report 创建新的正式 Word；已有 Word 修改任务仍交给 existing_word_edit。",
+            "将最终 Word 写入 Workspace deliverables_dir，不得覆盖 source/reference 输入。",
+            "生成后使用 inspect_professional_word_report 重新打开最终文件，检查标题层级、关键正文、业务表格和报告结构。",
+            "根据 TaskPlan 核对关键事实、内容证据边界与交付要求，再交给 Completion Gate 做最终验收。",
+        ],
+        verification=[
+            "最终 Word 必须真实存在并位于 deliverables_dir。",
+            "最终文件生成后必须存在 inspect_professional_word_report 的成功检查证据。",
+            "报告标题、要求的执行摘要、KPI、关键章节和业务表格应真实存在。",
+            "关键 KPI、排名、数字和事实性结论必须与前序真实证据一致。",
+            "报告不得把缺乏 Observation 支撑的趋势、因果、经营判断或行动建议写成确定事实。",
+            "存在分析建议时，应能从最终回读内容中区分建议与已验证事实；证据不足的建议应使用条件性措辞或明确为进一步分析方向。",
+            "TaskPlan 要求来源说明时，最终报告中必须存在相应来源或口径说明。",
+        ],
+        safety_rules=[
+            "不得覆盖 source/reference 输入文件。",
+            "不得为了报告完整或美观编造 KPI、业务数字、来源或结论。",
+            "不得为了显得专业而自动生成缺乏证据支持的经营建议、因果解释或趋势判断。",
+            "创建新报告使用 professional_word_delivery；修改已有 Word 使用 existing_word_edit，二者不得混淆。",
+            "Skill 只提供工作流指导，真实执行仍必须经过 ToolExecutor、ToolPreflight 和 ToolRegistry。",
+        ],
+        aliases=[
+            "word_delivery",
+            "word_report",
+            "professional_word",
+        ],
+    )
+
+    registry.register(
         "existing_word_edit",
         (
             "在尽量保留原 Word 文档结构与格式的前提下执行"

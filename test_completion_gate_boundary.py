@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from agent import DataPilotAgent
 from agent_loop import AgentLoop
+from skill_registry import SkillRegistry
 from tool_registry import ToolRegistry
 from verification_engine import VerificationCheck, VerificationReport
 
@@ -147,6 +148,7 @@ def test_final_finish_cannot_bypass_gate():
         model="deterministic-model",
         max_iterations=1,
         verifier=verifier,
+        skill_registry=SkillRegistry(),
     )
 
     result = loop.run(
@@ -225,6 +227,7 @@ def test_max_iterations_keeps_latest_gate_report():
         model="deterministic-model",
         max_iterations=2,
         verifier=verifier,
+        skill_registry=SkillRegistry(),
     )
 
     result = loop.run(

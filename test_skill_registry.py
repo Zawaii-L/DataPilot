@@ -103,7 +103,7 @@ def main():
     )
     print("PASS")
 
-    print("\n测试 8：默认 Registry 包含六个通用 Office Skills")
+    print("\n测试 8：默认 Registry 包含七个通用 Office Skills")
     default_registry = create_default_skill_registry()
     expected = {
         "excel_data_analysis",
@@ -112,6 +112,7 @@ def main():
         "existing_word_edit",
         "document_summary",
         "cross_file_office_workflow",
+        "professional_word_delivery",
     }
     actual = {
         item.name
@@ -177,7 +178,7 @@ def main():
     print("1. Skill 与 Tool 的职责分离")
     print("2. SkillDefinition 可结构化描述办公方法")
     print("3. Skill Registry 支持注册、别名、分类与目录输出")
-    print("4. 默认六个通用 Office Skills 已建立")
+    print("4. 默认七个通用 Office Skills 已建立")
     print("5. Skill 推荐 Tool 与现有 ToolRegistry 一致")
     print("6. Skill Layer 不绕过 ToolExecutor / ToolPreflight")
     print("=" * 72)

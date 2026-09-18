@@ -81,6 +81,19 @@ class SkillSelector:
             ),
             6,
         ),
+        "professional_word_delivery": (
+            (
+                "生成word", "生成 word", "导出word", "导出 word",
+                "word报告", "word 报告", "word汇报", "word 汇报",
+                "word简报", "word 简报", "docx",
+                "最终word", "最终 word", "word交付", "word 交付",
+                "专业word", "专业 word", "正式word", "正式 word",
+                "专业报告", "正式报告", "汇报报告", "分析报告",
+                "领导汇报", "管理层", "客户报告", "可直接发送",
+                "执行摘要", "来源说明",
+            ),
+            6,
+        ),
         "existing_word_edit": (
             (
                 "修改word", "修改 word", "更新word", "更新 word",
