@@ -283,6 +283,7 @@ class AgentLoop:
             result = self.executor.execute(
                 canonical_name,
                 resolved_arguments,
+                runtime_context=runtime_context,
             )
 
             self.context.store(

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from tool_registry import ToolRegistry, create_default_tool_registry
+from tool_preflight import ToolPreflight
 
 
 ProgressCallback = Optional[Callable[[str], None]]
@@ -68,23 +69,25 @@ class ToolExecutor:
         self.progress_callback = progress_callback
         self.include_traceback = bool(include_traceback)
         self.history: List[ToolExecutionResult] = []
+        self.preflight = ToolPreflight(self.registry)
 
     def report_progress(self, message: str):
         """
         向命令行或 GUI 回调发送执行进度。
         """
-        print(message)
-
         if self.progress_callback:
             try:
                 self.progress_callback(str(message))
             except Exception as error:
                 print(f"Executor 进度回调失败：{error}")
+        else:
+            print(message)
 
     def execute(
         self,
         tool_name: str,
         arguments: Optional[Dict[str, Any]] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> ToolExecutionResult:
         """
         执行一个注册工具。
@@ -106,12 +109,18 @@ class ToolExecutor:
             )
 
         try:
-            if not self.registry.has(tool_name):
-                raise KeyError(
-                    f"工具未注册，拒绝执行：{tool_name}"
+            preflight = self.preflight.validate(
+                tool_name=tool_name,
+                arguments=call_arguments,
+                runtime_context=runtime_context,
+            )
+
+            if not preflight.success:
+                raise ValueError(
+                    "工具执行前校验失败：" + "；".join(preflight.errors)
                 )
 
-            canonical_name = self.registry.resolve_name(tool_name) or tool_name
+            canonical_name = preflight.tool_name
 
             output = self.registry.call(
                 canonical_name,
