@@ -79,10 +79,14 @@ def _replace_text_in_paragraph(
     new_text: str,
 ) -> int:
     """
-    在一个段落中替换文本。
+    在一个段落中替换文本，并尽量保持原有 Run 格式。
 
-    优先在单个 run 内替换，以尽量保留格式。
-    如果目标文本跨 run，则回退为重建该段落文本。
+    v3.4：
+    - 目标文本位于单个 Run 内时，直接修改该 Run；
+    - 目标文本跨多个 Run 时，只重建目标覆盖区域；
+    - 目标前后的未修改文本继续留在原 Run 中；
+    - 替换文本继承目标起始 Run 的格式；
+    - 不再把整个段落压缩到第一个 Run。
     """
     if not old_text:
         raise ValueError(
@@ -91,6 +95,7 @@ def _replace_text_in_paragraph(
 
     replacement_count = 0
 
+    # 最安全的情况：目标完整位于某个 Run 内。
     for run in paragraph.runs:
         if old_text in run.text:
             count = run.text.count(old_text)
@@ -103,30 +108,148 @@ def _replace_text_in_paragraph(
     if replacement_count > 0:
         return replacement_count
 
-    full_text = paragraph.text
+    runs = list(paragraph.runs)
 
-    if old_text not in full_text:
-        return 0
+    if not runs:
+        full_text = paragraph.text
 
-    count = full_text.count(old_text)
-    replaced_text = full_text.replace(
-        old_text,
-        new_text,
-    )
+        if old_text not in full_text:
+            return 0
 
-    if paragraph.runs:
-        first_run = paragraph.runs[0]
-        first_run.text = replaced_text
-
-        for run in paragraph.runs[1:]:
-            run.text = ""
-    else:
+        count = full_text.count(old_text)
         paragraph.add_run(
-            replaced_text
+            full_text.replace(
+                old_text,
+                new_text,
+            )
+        )
+        return count
+
+    # 跨 Run 替换。逐次处理，避免一次重建整个段落。
+    while True:
+        runs = list(paragraph.runs)
+        run_texts = [
+            run.text
+            for run in runs
+        ]
+        full_text = "".join(run_texts)
+
+        match_start = full_text.find(
+            old_text
         )
 
-    return count
+        if match_start < 0:
+            break
 
+        match_end = (
+            match_start
+            + len(old_text)
+        )
+
+        positions = []
+        cursor = 0
+
+        for run_index, run_text in enumerate(
+            run_texts
+        ):
+            run_start = cursor
+            run_end = cursor + len(
+                run_text
+            )
+
+            positions.append(
+                (
+                    run_index,
+                    run_start,
+                    run_end,
+                )
+            )
+
+            cursor = run_end
+
+        start_run_index = None
+        end_run_index = None
+        start_offset = None
+        end_offset = None
+
+        for (
+            run_index,
+            run_start,
+            run_end,
+        ) in positions:
+            if (
+                start_run_index is None
+                and run_start <= match_start < run_end
+            ):
+                start_run_index = run_index
+                start_offset = (
+                    match_start
+                    - run_start
+                )
+
+            if (
+                run_start < match_end <= run_end
+            ):
+                end_run_index = run_index
+                end_offset = (
+                    match_end
+                    - run_start
+                )
+                break
+
+        if (
+            start_run_index is None
+            or end_run_index is None
+            or start_offset is None
+            or end_offset is None
+        ):
+            # 理论上不应发生；保守退出，避免破坏文档。
+            break
+
+        start_run = runs[
+            start_run_index
+        ]
+        end_run = runs[
+            end_run_index
+        ]
+
+        prefix = start_run.text[
+            :start_offset
+        ]
+        suffix = end_run.text[
+            end_offset:
+        ]
+
+        if start_run_index == end_run_index:
+            start_run.text = (
+                prefix
+                + new_text
+                + suffix
+            )
+        else:
+            # 起始 Run 保留其目标前文本，并承载替换文本，
+            # 因此新文本继承原目标起始位置的格式。
+            start_run.text = (
+                prefix
+                + new_text
+            )
+
+            # 中间被目标完全覆盖的 Run 清空。
+            for run_index in range(
+                start_run_index + 1,
+                end_run_index,
+            ):
+                runs[
+                    run_index
+                ].text = ""
+
+            # 结束 Run 只保留目标之后的文本，
+            # 因而后方未修改文本继续保留原结束 Run 格式。
+            end_run.text = suffix
+
+        replacement_count += 1
+
+    return replacement_count
 
 def replace_text(
     file_path,

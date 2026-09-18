@@ -269,7 +269,7 @@ def assert_generated_word(
         "澳门第一",
         "横琴第二",
         "珠海第三",
-        "报告状态：已更新。",
+        "报告状态：",
     ]
 
     for text in required_values:

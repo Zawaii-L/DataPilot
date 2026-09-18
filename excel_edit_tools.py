@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.formula.translate import Translator
 
 
 def normalize_excel_path(file_path) -> Path:
@@ -507,64 +508,201 @@ def _sort_rows(
     worksheet,
     column,
     ascending=True,
+    header_row=None,
 ) -> int:
-    column_index = _require_column(
-        worksheet,
-        column,
-    )
+    """
+    按指定字段排序数据行，并尽量保持 Excel 业务行的完整属性。
 
-    if worksheet.max_row <= 2:
-        return max(
-            worksheet.max_row - 1,
-            0,
+    v3.4 高保真策略：
+    - 支持顶部标题/合并单元格，表头不再强制位于第 1 行；
+    - header_row 未指定时，会在前若干行自动寻找目标字段；
+    - 值、公式、样式、数字格式随业务行移动；
+    - 超链接、批注随业务行移动；
+    - 行高、隐藏状态、outlineLevel 等行级属性随业务行移动；
+    - 公式使用 openpyxl Translator 按新位置调整相对引用；
+    - 表头以上标题区、合并单元格、列宽、冻结窗格、筛选等不重建。
+    """
+    if header_row is not None:
+        header_row = int(header_row)
+
+        if header_row < 1 or header_row > worksheet.max_row:
+            raise ValueError(
+                f"header_row 超出有效范围：{header_row}"
+            )
+
+        header_cells = worksheet[
+            header_row
+        ]
+        header_map = {}
+
+        for cell in header_cells:
+            if cell.value is None:
+                continue
+
+            name = str(
+                cell.value
+            ).strip()
+
+            if name and name not in header_map:
+                header_map[name] = cell.column
+
+        if column not in header_map:
+            raise ValueError(
+                f"Sheet {worksheet.title} 的第 {header_row} 行"
+                f"不存在字段：{column}。可用字段："
+                + ", ".join(header_map.keys())
+            )
+
+        column_index = header_map[
+            column
+        ]
+
+    else:
+        # 真实办公 Excel 常见：
+        # 第 1 行是合并标题，第 2/3 行才是真正字段名。
+        # 因此针对排序目标字段自动寻找表头行。
+        detected_header_row = None
+        detected_column_index = None
+
+        search_limit = min(
+            worksheet.max_row,
+            20,
         )
 
-    rows = []
+        for candidate_row in range(
+            1,
+            search_limit + 1,
+        ):
+            for cell in worksheet[
+                candidate_row
+            ]:
+                if cell.value is None:
+                    continue
+
+                if str(
+                    cell.value
+                ).strip() == str(
+                    column
+                ).strip():
+                    detected_header_row = (
+                        candidate_row
+                    )
+                    detected_column_index = (
+                        cell.column
+                    )
+                    break
+
+            if detected_header_row is not None:
+                break
+
+        if detected_header_row is None:
+            available = []
+
+            for candidate_row in range(
+                1,
+                search_limit + 1,
+            ):
+                values = [
+                    str(cell.value).strip()
+                    for cell in worksheet[
+                        candidate_row
+                    ]
+                    if cell.value is not None
+                ]
+
+                if values:
+                    available.append(
+                        f"第{candidate_row}行: "
+                        + ", ".join(values)
+                    )
+
+            raise ValueError(
+                f"Sheet {worksheet.title} 中找不到字段：{column}。"
+                "已检查前 "
+                f"{search_limit} 行。"
+                + (
+                    " 检查到的非空内容："
+                    + " | ".join(available)
+                    if available
+                    else ""
+                )
+            )
+
+        header_row = detected_header_row
+        column_index = detected_column_index
+
+    data_start_row = (
+        header_row + 1
+    )
+
+    if worksheet.max_row < data_start_row:
+        return 0
+
+    if worksheet.max_row == data_start_row:
+        return 1
+
+    max_column = worksheet.max_column
+    source_rows = []
 
     for row_index in range(
-        2,
+        data_start_row,
         worksheet.max_row + 1,
     ):
-        values = [
-            worksheet.cell(
+        cells = []
+
+        for column_index_inner in range(
+            1,
+            max_column + 1,
+        ):
+            cell = worksheet.cell(
                 row=row_index,
                 column=column_index_inner,
-            ).value
-            for column_index_inner in range(
-                1,
-                worksheet.max_column + 1,
             )
+
+            cells.append(
+                {
+                    "value": cell.value,
+                    "style": copy(cell._style),
+                    "hyperlink": copy(cell.hyperlink),
+                    "comment": copy(cell.comment),
+                }
+            )
+
+        row_dimension = worksheet.row_dimensions[
+            row_index
         ]
 
-        styles = [
-            copy(
-                worksheet.cell(
-                    row=row_index,
-                    column=column_index_inner,
-                )._style
-            )
-            for column_index_inner in range(
-                1,
-                worksheet.max_column + 1,
-            )
-        ]
-
-        rows.append(
-            (
-                values,
-                styles,
-            )
+        source_rows.append(
+            {
+                "source_row": row_index,
+                "cells": cells,
+                "height": row_dimension.height,
+                "hidden": row_dimension.hidden,
+                "outline_level": row_dimension.outlineLevel,
+                "collapsed": row_dimension.collapsed,
+                "thick_top": row_dimension.thickTop,
+                "thick_bottom": row_dimension.thickBot,
+            }
         )
 
     def sort_key(item):
-        value = item[0][
+        value = item["cells"][
             column_index - 1
-        ]
+        ]["value"]
 
         if value is None:
             return (
-                1,
+                3,
                 "",
+            )
+
+        if isinstance(
+            value,
+            bool,
+        ):
+            return (
+                0,
+                int(value),
             )
 
         if isinstance(
@@ -577,22 +715,24 @@ def _sort_rows(
             )
 
         return (
-            0,
-            str(value),
+            1,
+            str(value).casefold(),
         )
 
     non_empty = [
         item
-        for item in rows
-        if item[0][column_index - 1]
-        is not None
+        for item in source_rows
+        if item["cells"][
+            column_index - 1
+        ]["value"] is not None
     ]
 
     empty = [
         item
-        for item in rows
-        if item[0][column_index - 1]
-        is None
+        for item in source_rows
+        if item["cells"][
+            column_index - 1
+        ]["value"] is None
     ]
 
     non_empty.sort(
@@ -602,37 +742,110 @@ def _sort_rows(
         ),
     )
 
-    sorted_rows = (
+    ordered_rows = (
         non_empty
         + empty
     )
 
-    for row_offset, (
-        values,
-        styles,
-    ) in enumerate(
-        sorted_rows,
-        start=2,
+    # 只清理真正的数据区，不触碰标题区和表头区。
+    for row_index in range(
+        data_start_row,
+        worksheet.max_row + 1,
     ):
-        for column_offset, value in enumerate(
-            values,
+        for column_index_inner in range(
+            1,
+            max_column + 1,
+        ):
+            target_cell = worksheet.cell(
+                row=row_index,
+                column=column_index_inner,
+            )
+            target_cell.hyperlink = None
+            target_cell.comment = None
+
+    for target_row, row_snapshot in enumerate(
+        ordered_rows,
+        start=data_start_row,
+    ):
+        source_row = row_snapshot[
+            "source_row"
+        ]
+
+        for column_index_inner, cell_snapshot in enumerate(
+            row_snapshot["cells"],
             start=1,
         ):
-            cell = worksheet.cell(
-                row=row_offset,
-                column=column_offset,
+            target_cell = worksheet.cell(
+                row=target_row,
+                column=column_index_inner,
             )
-            cell.value = value
-            cell._style = copy(
-                styles[
-                    column_offset - 1
-                ]
+
+            value = cell_snapshot[
+                "value"
+            ]
+
+            if (
+                isinstance(value, str)
+                and value.startswith("=")
+                and source_row != target_row
+            ):
+                source_coordinate = (
+                    f"{get_column_letter(column_index_inner)}"
+                    f"{source_row}"
+                )
+                target_coordinate = (
+                    f"{get_column_letter(column_index_inner)}"
+                    f"{target_row}"
+                )
+
+                try:
+                    value = Translator(
+                        value,
+                        origin=source_coordinate,
+                    ).translate_formula(
+                        target_coordinate
+                    )
+                except Exception:
+                    value = cell_snapshot[
+                        "value"
+                    ]
+
+            target_cell.value = value
+            target_cell._style = copy(
+                cell_snapshot["style"]
             )
+            target_cell.hyperlink = copy(
+                cell_snapshot["hyperlink"]
+            )
+            target_cell.comment = copy(
+                cell_snapshot["comment"]
+            )
+
+        target_dimension = worksheet.row_dimensions[
+            target_row
+        ]
+        target_dimension.height = row_snapshot[
+            "height"
+        ]
+        target_dimension.hidden = row_snapshot[
+            "hidden"
+        ]
+        target_dimension.outlineLevel = row_snapshot[
+            "outline_level"
+        ]
+        target_dimension.collapsed = row_snapshot[
+            "collapsed"
+        ]
+        target_dimension.thickTop = row_snapshot[
+            "thick_top"
+        ]
+        target_dimension.thickBot = row_snapshot[
+            "thick_bottom"
+        ]
 
     return len(
-        sorted_rows
+        ordered_rows
     )
-
 
 def _delete_duplicate_rows(
     worksheet,
@@ -1123,6 +1336,9 @@ def apply_excel_edits(
                 ascending=operation.get(
                     "ascending",
                     True,
+                ),
+                header_row=operation.get(
+                    "header_row"
                 ),
             )
 
