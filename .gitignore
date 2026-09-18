@@ -14,14 +14,22 @@ env/
 # Generated outputs
 outputs/
 
-# Generated data files
+# Generated data / Office files
 *.csv
 *.xlsx
 *.xls
 *.docx
+
+# Generated images
 *.png
 *.jpg
 *.jpeg
+
+# Portfolio assets are intentionally versioned
+!assets/
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
 
 # IDE
 .vscode/

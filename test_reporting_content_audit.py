@@ -213,13 +213,177 @@ def main():
             "unsupported_claims",
             "advisory_claims",
             "supported_claims",
+            "boundary_claims",
         },
         payload,
     )
     print("PASS")
 
+    print("\n测试 13：单期数据不足以支撑趋势属于 evidence boundary")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            "现有单期截面数据不足以支撑增长趋势结论。"
+        ],
+        evidence_texts=[
+            {"城市": "澳门", "月份": "2026-09", "销售额": 186}
+        ],
+    )
+    assert_true(report.passed, report.to_dict())
+    assert_true(
+        any(
+            item.risk_type == "trend"
+            and item.classification == "boundary"
+            for item in report.findings
+        ),
+        report.to_dict(),
+    )
+    assert_true(
+        "现有单期截面数据不足以支撑增长趋势结论。"
+        in report.boundary_claims,
+        report.to_dict(),
+    )
+    print("PASS")
+
+    print("\n测试 14：不对主要原因作判断属于 evidence boundary")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            "本报告不对主要原因作判断。"
+        ],
+        evidence_texts=[
+            {"城市": "澳门", "销售额": 186}
+        ],
+    )
+    assert_true(report.passed, report.to_dict())
+    assert_true(
+        any(
+            item.risk_type == "causal"
+            and item.classification == "boundary"
+            for item in report.findings
+        ),
+        report.to_dict(),
+    )
+    print("PASS")
+
+    print("\n测试 15：未发现市场潜力证据属于 evidence boundary")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            "未发现支持市场潜力判断的证据。"
+        ],
+        evidence_texts=[
+            {"城市": "澳门", "销售额": 186}
+        ],
+    )
+    assert_true(report.passed, report.to_dict())
+    assert_true(
+        any(
+            item.risk_type == "market_potential"
+            and item.classification == "boundary"
+            for item in report.findings
+        ),
+        report.to_dict(),
+    )
+    print("PASS")
+
+    print("\n测试 16：不给出加大资源投入结论属于 evidence boundary")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            "现有数据不足以支持加大资源投入判断，本报告不给出加大资源投入结论。"
+        ],
+        evidence_texts=[
+            {"城市": "澳门", "销售额": 186}
+        ],
+    )
+    assert_true(report.passed, report.to_dict())
+    assert_true(
+        any(
+            item.risk_type == "resource_allocation"
+            and item.classification == "boundary"
+            for item in report.findings
+        ),
+        report.to_dict(),
+    )
+    print("PASS")
+
+    print("\n测试 17：真实趋势确定性断言仍然不能被 boundary 错误放行")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            "澳门销售额持续领先其他城市。"
+        ],
+        evidence_texts=[
+            {"城市": ["澳门", "横琴", "珠海"], "销售额": [186, 154, 128]}
+        ],
+    )
+    assert_true(not report.passed, report.to_dict())
+    assert_true(
+        any(
+            item.risk_type == "trend"
+            and item.classification == "unsupported"
+            for item in report.findings
+        ),
+        report.to_dict(),
+    )
+    assert_true(not report.boundary_claims, report.to_dict())
+    print("PASS")
+
+    print("\n测试 18：因果与市场潜力确定性断言不能借 boundary 规则逃逸")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            "澳门销售额领先是因为市场潜力更高。"
+        ],
+        evidence_texts=[
+            {"城市": "澳门", "销售额": 186, "排名": 1}
+        ],
+    )
+    assert_true(not report.passed, report.to_dict())
+    risk_pairs = {
+        (item.risk_type, item.classification)
+        for item in report.findings
+    }
+    assert_true(
+        ("causal", "unsupported") in risk_pairs,
+        report.to_dict(),
+    )
+    assert_true(
+        ("market_potential", "unsupported") in risk_pairs,
+        report.to_dict(),
+    )
+    assert_true(not report.boundary_claims, report.to_dict())
+    print("PASS")
+
+    print("\n测试 19：真实 GUI 中的完整证据边界句不会再触发 false positive")
+    report = ReportingContentAuditor.audit(
+        report_texts=[
+            (
+                "本报告仅呈现本次已读取数据可直接支持的汇总、排名与对比结论，"
+                "不包含趋势、变化原因、市场潜力或资源投入方面的判断"
+                "（现有单期截面数据不足以支撑此类结论）。"
+            )
+        ],
+        evidence_texts=[
+            {
+                "columns": ["城市", "月份", "销售额", "订单数"],
+                "preview": [
+                    ["珠海", "2026-09", 128, 16],
+                    ["澳门", "2026-09", 186, 21],
+                    ["横琴", "2026-09", 154, 18],
+                ],
+            }
+        ],
+    )
+    assert_true(report.passed, report.to_dict())
+    assert_true(
+        report.findings
+        and all(
+            item.classification == "boundary"
+            for item in report.findings
+        ),
+        report.to_dict(),
+    )
+    assert_true(not report.unsupported_claims, report.to_dict())
+    print("PASS")
+
     print("\n" + "=" * 72)
-    print("Reporting Content Audit：12/12 PASS")
+    print("Reporting Content Audit：19/19 PASS")
     print("=" * 72)
 
 

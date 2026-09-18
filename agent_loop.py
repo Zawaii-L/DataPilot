@@ -85,6 +85,7 @@ class AgentLoop:
         verifier: Optional[VerificationEngine] = None,
         skill_registry: Optional[SkillRegistry] = None,
         max_identical_failures: int = 2,
+        max_completion_recovery_iterations: int = 3,
     ):
         self.registry = registry or create_default_tool_registry()
         self.skill_registry = (
@@ -137,6 +138,10 @@ class AgentLoop:
         self.max_identical_failures = max(
             1,
             int(max_identical_failures),
+        )
+        self.max_completion_recovery_iterations = max(
+            0,
+            int(max_completion_recovery_iterations),
         )
 
     def _validate_skill_catalog(self):
@@ -235,14 +240,48 @@ class AgentLoop:
             "DataPilot Workspace Agent Loop 启动。"
         )
 
-        for iteration in range(
-            1,
-            self.max_iterations + 1,
-        ):
-            self.report_progress(
-                f"[Agent Loop {iteration}/{self.max_iterations}] "
-                "正在根据当前执行状态决定下一步……"
+        # v5.0 Completion Recovery Budget：
+        # max_iterations 仍是正常执行预算；只有 Python Completion Gate
+        # 已经真实拒绝过一次完成申请后，才开放一个很小的额外恢复窗口。
+        #
+        # 这个窗口不是普通“加轮数”：
+        # - 正常任务仍受 max_iterations 约束；
+        # - 没有 Gate FAIL 时绝不会进入恢复预算；
+        # - Gate FAIL 后允许修正最终交付物、重新回读最新版本并再次申请完成；
+        # - Retry Budget / ToolPreflight / Workspace Policy 继续照常生效。
+        max_total_iterations = (
+            self.max_iterations
+            + self.max_completion_recovery_iterations
+        )
+
+        iteration = 1
+
+        while iteration <= max_total_iterations:
+            in_completion_recovery = (
+                iteration > self.max_iterations
             )
+
+            if (
+                in_completion_recovery
+                and latest_verification_report is None
+            ):
+                break
+
+            if in_completion_recovery:
+                recovery_index = (
+                    iteration - self.max_iterations
+                )
+                self.report_progress(
+                    "[Completion Recovery "
+                    f"{recovery_index}/"
+                    f"{self.max_completion_recovery_iterations}] "
+                    "正在根据最新验收失败项继续修正/回读……"
+                )
+            else:
+                self.report_progress(
+                    f"[Agent Loop {iteration}/{self.max_iterations}] "
+                    "正在根据当前执行状态决定下一步……"
+                )
 
             state = self._build_state(
                 goal=goal,
@@ -317,6 +356,7 @@ class AgentLoop:
                     "Agent 将继续修正。"
                 )
 
+                iteration += 1
                 continue
 
             if action_type != "tool":
@@ -421,6 +461,7 @@ class AgentLoop:
                     f"{type(error).__name__}: {error}"
                 )
 
+                iteration += 1
                 continue
 
             self.report_progress(
@@ -463,13 +504,18 @@ class AgentLoop:
                     f"{result.error_type}: {result.error_message}"
                 )
 
+            iteration += 1
+
         # --------------------------------------------------------
         # 工具预算耗尽后的最终完成判定
         # --------------------------------------------------------
         #
-        # max_iterations 表示“最多允许多少轮真实工具执行机会”。
-        # 如果最后一轮工具刚好完成用户目标，旧逻辑会因为没有下一轮
-        # finish 决策机会而直接返回 max_iterations。
+        # max_iterations 表示正常执行轮数预算。
+        # 如果 Completion Gate 曾经失败，则额外允许
+        # max_completion_recovery_iterations 个受限恢复轮次，用于：
+        # 修正最终交付物 → 回读最新版本 → 再次申请完成。
+        # 如果最后一个允许轮次刚好完成用户目标，仍额外允许一次
+        # “只判断、不再调用工具”的最终评估。
         #
         # 这里额外允许一次“只判断、不再调用工具”的最终评估：
         # - finish：说明最后一次 Observation 已经满足目标；
@@ -479,9 +525,24 @@ class AgentLoop:
         # v4.0 起，LLM 的最终 finish 仍只是“申请完成”，必须继续经过
         # Python Completion Gate；Gate FAIL 时返回 verification_failed，
         # 不允许被旧的 max_iterations 收尾逻辑绕过。
-        self.report_progress(
-            "Agent 已用完常规执行轮数，正在进行最终完成判定……"
+        exhausted_iteration_budget = (
+            self.max_iterations
+            + (
+                self.max_completion_recovery_iterations
+                if latest_verification_report is not None
+                else 0
+            )
         )
+
+        if latest_verification_report is not None:
+            self.report_progress(
+                "Agent 已用完正常执行预算与 Completion Recovery Budget，"
+                "正在进行最终完成判定……"
+            )
+        else:
+            self.report_progress(
+                "Agent 已用完常规执行轮数，正在进行最终完成判定……"
+            )
 
         final_state = self._build_state(
             goal=goal,
@@ -511,7 +572,7 @@ class AgentLoop:
             verification_report = self._run_completion_gate(
                 goal=goal,
                 final_answer=final_answer,
-                iteration=self.max_iterations + 1,
+                iteration=exhausted_iteration_budget + 1,
                 runtime_context=runtime_context,
                 tool_results=tool_results,
                 decisions=decisions,
@@ -527,7 +588,7 @@ class AgentLoop:
                     goal=goal,
                     final_answer=final_answer,
                     stop_reason="completed",
-                    iterations=self.max_iterations + 1,
+                    iterations=exhausted_iteration_budget + 1,
                     tool_results=tool_results,
                     decisions=decisions,
                     verification_report=(
@@ -552,7 +613,7 @@ class AgentLoop:
                 goal=goal,
                 final_answer="",
                 stop_reason="verification_failed",
-                iterations=self.max_iterations + 1,
+                iterations=exhausted_iteration_budget + 1,
                 tool_results=tool_results,
                 decisions=decisions,
                 verification_report=(
@@ -569,7 +630,7 @@ class AgentLoop:
             goal=goal,
             final_answer="",
             stop_reason="max_iterations",
-            iterations=self.max_iterations + 1,
+            iterations=exhausted_iteration_budget + 1,
             tool_results=tool_results,
             decisions=decisions,
             verification_report=(
@@ -1056,6 +1117,13 @@ class AgentLoop:
 110. Retry Budget 不得用于绕过 output_safety、protected_input_paths、ToolPreflight 或 Verification；安全失败只能通过合法的新路径/新参数解决。
 111. 如果已有 RecoveryHint 指出了可验证的修复方向，应优先利用现有 Observation 改变失败调用，而不是消耗剩余 Retry Budget。
 
+【v5.0 Completion Recovery Budget 规则】
+112. max_iterations 是正常执行预算，不是允许跳过最终回读验证的理由。
+113. 只有 Python Completion Gate 已真实返回 FAIL 后，系统才可能开放受限的 Completion Recovery Budget；不得把它当作普通额外轮数。
+114. Gate FAIL 后如果修正或重新生成了最终 Word/Excel，之前对该文件的回读证据立即失效，下一步应优先 inspect/read 最新版本。
+115. Completion Recovery 的目标是形成“Gate FAIL → 修正 → 回读最新版本 → 再次 finish”的闭环；不要在恢复窗口中增加非必要分析、美化或重复计算。
+116. Completion Recovery 仍受 Retry Budget、ToolPreflight、Workspace Policy 和 Verification Engine 约束，不得借恢复窗口绕过任何安全或验收规则。
+
 Skill Selection 状态：
 {skill_selection_note}
 
@@ -1210,6 +1278,17 @@ Selected Office Skill Catalog（方法指导，不可直接执行）
             "retry_policy": self._build_retry_policy_state(
                 tool_results
             ),
+            "completion_recovery_budget": {
+                "normal_iteration_limit": self.max_iterations,
+                "max_recovery_iterations": (
+                    self.max_completion_recovery_iterations
+                ),
+                "gate_has_failed": bool(
+                    runtime_context.get(
+                        "verification_observation"
+                    )
+                ),
+            },
         }
 
     def _build_retry_policy_state(

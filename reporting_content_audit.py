@@ -17,6 +17,8 @@ class ReportingAuditFinding:
       当作已经发生的业务事实。
     - unsupported: 文本包含高风险确定性断言，但 evidence_texts 中缺少
       对应类型的证据信号。
+    - boundary: 文本是在明确限制结论边界、声明证据不足或否定某类高风险
+      结论，不把风险关键词本身误判为已经成立的业务事实。
     """
 
     text: str
@@ -47,6 +49,7 @@ class ReportingAuditReport:
     unsupported_claims: List[str] = field(default_factory=list)
     advisory_claims: List[str] = field(default_factory=list)
     supported_claims: List[str] = field(default_factory=list)
+    boundary_claims: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -55,6 +58,7 @@ class ReportingAuditReport:
             "unsupported_claims": list(self.unsupported_claims),
             "advisory_claims": list(self.advisory_claims),
             "supported_claims": list(self.supported_claims),
+            "boundary_claims": list(self.boundary_claims),
         }
 
 
@@ -107,6 +111,51 @@ class ReportingContentAuditor:
         "在...情况下",
         "前提是",
         "视情况",
+    )
+
+    # 明确的“证据边界/否定高风险结论”信号。
+    #
+    # 这些表达不是在声称趋势、因果、市场潜力或资源投入结论已经成立，
+    # 而是在明确说明当前证据不足、结论不成立或报告不作该类判断。
+    # 仅当同一句已经命中 RISK_RULES 时才会调用 _is_evidence_boundary，
+    # 因此不会把普通的“不足/不包含”等句子无条件放行。
+    EVIDENCE_BOUNDARY_MARKERS = (
+        "不足以支持",
+        "不足以支撑",
+        "不足以证明",
+        "不足以判断",
+        "无法支持",
+        "无法支撑",
+        "无法证明",
+        "无法判断",
+        "不能支持",
+        "不能支撑",
+        "不能证明",
+        "不能判断",
+        "不支持此类结论",
+        "不支撑此类结论",
+        "不构成",
+        "不代表",
+        "不意味着",
+        "未发现支持",
+        "没有足够证据",
+        "缺乏足够证据",
+        "证据不足",
+        "数据不足",
+        "样本不足",
+        "不包含趋势",
+        "不包含变化原因",
+        "不包含市场潜力",
+        "不包含资源投入",
+        "不对趋势",
+        "不对变化原因",
+        "不对市场潜力",
+        "不对资源投入",
+        "不给出资源分配结论",
+        "不作判断",
+        "不做判断",
+        "不作结论",
+        "不做结论",
     )
 
     # 单期横截面最容易被错误扩展成“趋势”。
@@ -279,9 +328,27 @@ class ReportingContentAuditor:
             if not risk_matches:
                 continue
 
+            evidence_boundary = cls._is_evidence_boundary(sentence)
             advisory = cls._is_advisory(sentence)
 
             for risk_type, matched_terms in risk_matches.items():
+                if evidence_boundary:
+                    findings.append(
+                        ReportingAuditFinding(
+                            text=sentence,
+                            classification="boundary",
+                            risk_type=risk_type,
+                            matched_terms=matched_terms,
+                            evidence_terms=[],
+                            reason=(
+                                "该句命中了高风险业务判断词，但语义是在明确声明"
+                                "证据不足、限制结论边界或否定该类结论，并未把"
+                                "高风险判断写成已经成立的事实。"
+                            ),
+                        )
+                    )
+                    continue
+
                 if advisory:
                     findings.append(
                         ReportingAuditFinding(
@@ -347,6 +414,11 @@ class ReportingContentAuditor:
             for item in findings
             if item.classification == "supported"
         ]
+        boundary_claims = [
+            item.text
+            for item in findings
+            if item.classification == "boundary"
+        ]
 
         return ReportingAuditReport(
             passed=not unsupported,
@@ -354,6 +426,7 @@ class ReportingContentAuditor:
             unsupported_claims=cls._deduplicate(unsupported),
             advisory_claims=cls._deduplicate(advisory_claims),
             supported_claims=cls._deduplicate(supported),
+            boundary_claims=cls._deduplicate(boundary_claims),
         )
 
     @classmethod
@@ -407,6 +480,49 @@ class ReportingContentAuditor:
                 result[risk_type] = matched
 
         return result
+
+    @classmethod
+    def _is_evidence_boundary(
+        cls,
+        sentence: str,
+    ) -> bool:
+        """
+        判断一句话是否是在表达“证据边界”，而不是声称高风险结论成立。
+
+        例如：
+        - “现有单期截面数据不足以支撑增长趋势结论”
+        - “本报告不对变化原因作判断”
+        - “未发现支持市场潜力判断的证据”
+        - “本报告不给出资源分配结论”
+
+        本方法只在句子已经命中 RISK_RULES 后使用，所以它不会改变普通
+        非风险文本的分类，也不会把“澳门持续领先”之类确定性断言放行。
+        """
+        text = sentence.strip()
+        lowered = text.lower()
+
+        if any(
+            marker.lower() in lowered
+            for marker in cls.EVIDENCE_BOUNDARY_MARKERS
+        ):
+            return True
+
+        # 允许“否定对象”出现在“不对/不就”和“作判断/下结论”之间。
+        # 例如：
+        # - 本报告不对主要原因作判断。
+        # - 本报告不对市场潜力作出判断。
+        # - 本报告不就资源投入下结论。
+        #
+        # 这里要求明确的否定结构，不能仅凭“判断/结论”等普通词放行。
+        boundary_patterns = (
+            r"不(?:对|就).{0,30}(?:作|做)(?:出)?(?:判断|结论)",
+            r"不(?:对|就).{0,30}(?:下|给出)(?:判断|结论)",
+        )
+
+        return any(
+            re.search(pattern, text) is not None
+            for pattern in boundary_patterns
+        )
 
     @classmethod
     def _is_advisory(
