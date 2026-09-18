@@ -213,6 +213,7 @@ class VerificationEngine:
         deliverable_required = bool(
             plan["deliverable_requirements"]
         )
+        response_only = not deliverable_required
 
         if deliverable_required:
             self._add_check(
@@ -432,6 +433,46 @@ class VerificationEngine:
                         "evidence",
                         [],
                     ),
+                )
+                continue
+
+            if response_only:
+                # v5.0+ Response-Only Gate：
+                # 对不要求最终文件的问答/读取/分析任务，
+                # 无法由当前确定性解析器自动证明的“泛化语义验收文本”
+                # 不应永久阻塞 Completion Gate。
+                #
+                # 这类任务仍受以下硬条件约束：
+                # - AgentLoop 必须 completed；
+                # - 不得存在最终未恢复 Tool Failure；
+                # - LLM 的最终回答必须基于真实 Tool Observation。
+                #
+                # 文件交付任务仍保持原有严格 pending 机制。
+                self._add_check(
+                    checks,
+                    failures,
+                    check_id=(
+                        "response_only_semantic_"
+                        + str(
+                            len(
+                                [
+                                    item
+                                    for item in checks
+                                    if item.category
+                                    == "response_only_semantic"
+                                ]
+                            )
+                            + 1
+                        )
+                    ),
+                    category="response_only_semantic",
+                    passed=True,
+                    message=(
+                        "直接回答任务不要求文件交付；"
+                        "该语义要求不作为文件型 Completion Gate 阻塞项："
+                        + requirement
+                    ),
+                    evidence=[],
                 )
                 continue
 

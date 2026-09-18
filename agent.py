@@ -4751,6 +4751,7 @@ JSON 格式：
         file_path=None,
         output_dir="outputs",
         max_iterations: int = 12,
+        cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         使用 Workspace 动态 Agent Loop 执行任务。
@@ -4809,6 +4810,14 @@ JSON 格式：
             context=runtime_context,
         )
 
+        if (
+            cancel_event is not None
+            and getattr(cancel_event, "is_set", lambda: False)()
+        ):
+            self.report_progress(
+                "已收到用户终止请求；任务规划调用已返回，准备安全停止。"
+            )
+
         runtime_context["task_plan"] = task_plan.to_dict()
 
         self.report_progress(
@@ -4839,6 +4848,7 @@ JSON 格式：
             client=self.client,
             model=self.model,
             max_iterations=max_iterations,
+            cancel_event=cancel_event,
         )
 
         loop_result = loop.run(
@@ -5382,7 +5392,17 @@ JSON 格式：
         # 声明来源，因此 search_web 但未实际读取的结果不会进入附录。
         web_source_append_results = []
 
-        if web_sources:
+        cancellation_requested = (
+            cancel_event is not None
+            and getattr(cancel_event, "is_set", lambda: False)()
+        )
+
+        if cancellation_requested:
+            self.report_progress(
+                "任务已终止：跳过新的 Word 网络来源附录写入，仅执行安全收尾。"
+            )
+
+        if web_sources and not cancellation_requested:
             for output_file in output_files:
                 try:
                     output_path = Path(str(output_file))
@@ -5497,7 +5517,56 @@ JSON 格式：
             "answer": loop_result.final_answer,
             "stop_reason": loop_result.stop_reason,
             "iterations": loop_result.iterations,
-            "tool_count": len(loop_result.tool_results),
+            # v5.0+ Execution Metrics
+            #
+            # tool_results 中同时包含：
+            # 1. 真正进入 ToolExecutor 的调用；
+            # 2. 被 Execution Budget / Read-Only Boundary
+            #    拦截、没有真实执行的 Policy Block。
+            #
+            # 因此不能再把 len(tool_results) 直接显示成
+            # “实际工具调用数量”。
+            "tool_count": sum(
+                1
+                for item in loop_result.tool_results
+                if not (
+                    isinstance(item.output, dict)
+                    and item.output.get("policy_blocked")
+                )
+            ),
+            "tool_request_count": len(
+                loop_result.tool_results
+            ),
+            "policy_blocked_count": sum(
+                1
+                for item in loop_result.tool_results
+                if (
+                    isinstance(item.output, dict)
+                    and item.output.get("policy_blocked")
+                )
+            ),
+            "failed_tool_count": sum(
+                1
+                for item in loop_result.tool_results
+                if (
+                    not item.success
+                    and not (
+                        isinstance(item.output, dict)
+                        and item.output.get("policy_blocked")
+                    )
+                )
+            ),
+            "successful_tool_count": sum(
+                1
+                for item in loop_result.tool_results
+                if (
+                    item.success
+                    and not (
+                        isinstance(item.output, dict)
+                        and item.output.get("policy_blocked")
+                    )
+                )
+            ),
             "tool_results": [
                 item.to_dict()
                 for item in loop_result.tool_results

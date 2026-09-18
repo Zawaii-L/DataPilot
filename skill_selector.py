@@ -81,19 +81,6 @@ class SkillSelector:
             ),
             6,
         ),
-        "professional_word_delivery": (
-            (
-                "生成word", "生成 word", "导出word", "导出 word",
-                "word报告", "word 报告", "word汇报", "word 汇报",
-                "word简报", "word 简报", "docx",
-                "最终word", "最终 word", "word交付", "word 交付",
-                "专业word", "专业 word", "正式word", "正式 word",
-                "专业报告", "正式报告", "汇报报告", "分析报告",
-                "领导汇报", "管理层", "客户报告", "可直接发送",
-                "执行摘要", "来源说明",
-            ),
-            6,
-        ),
         "existing_word_edit": (
             (
                 "修改word", "修改 word", "更新word", "更新 word",
@@ -145,6 +132,13 @@ class SkillSelector:
         normalized_text = self._normalize_text(text)
         task_tokens = set(self._tokenize(normalized_text))
 
+        # v5.0+ Intent Isolation
+        # TaskPlan 可以补充执行上下文，但不能反向创造用户意图。
+        # 特定 Skill 的 intent keyword 只允许用户原始 goal 触发。
+        normalized_goal = self._normalize_text(
+            str(goal or "")
+        )
+
         scores: Dict[str, int] = {}
         reasons: Dict[str, List[str]] = {}
 
@@ -153,6 +147,7 @@ class SkillSelector:
                 skill=skill,
                 normalized_task_text=normalized_text,
                 task_tokens=task_tokens,
+                normalized_goal_text=normalized_goal,
             )
 
             if score > 0:
@@ -172,6 +167,42 @@ class SkillSelector:
             for name, score in ranked
             if score >= self.min_score
         ][: self.max_selected]
+
+        # v5.0+ Deterministic Intent Filter
+        # cross-file / document-summary 属于强意图 Skill。
+        # 即使 TaskPlan 或 Skill description 与任务有词汇重合，
+        # 用户没有明确提出该意图时也不得混入。
+        cross_file_keywords = self._INTENT_RULES[
+            "cross_file_office_workflow"
+        ][0]
+        user_requests_cross_file = any(
+            self._normalize_text(keyword)
+            in normalized_goal
+            for keyword in cross_file_keywords
+        )
+
+        document_keywords = self._INTENT_RULES[
+            "document_summary"
+        ][0]
+        user_requests_document_summary = any(
+            self._normalize_text(keyword)
+            in normalized_goal
+            for keyword in document_keywords
+        )
+
+        if not user_requests_cross_file:
+            selected = [
+                name
+                for name in selected
+                if name != "cross_file_office_workflow"
+            ]
+
+        if not user_requests_document_summary:
+            selected = [
+                name
+                for name in selected
+                if name != "document_summary"
+            ]
 
         fallback_used = False
 
@@ -249,6 +280,7 @@ class SkillSelector:
         skill: SkillDefinition,
         normalized_task_text: str,
         task_tokens: set[str],
+        normalized_goal_text: str,
     ) -> Tuple[int, List[str]]:
         score = 0
         reasons: List[str] = []
@@ -260,7 +292,7 @@ class SkillSelector:
                 keyword
                 for keyword in keywords
                 if self._normalize_text(keyword)
-                in normalized_task_text
+                in normalized_goal_text
             ]
 
             if matched:

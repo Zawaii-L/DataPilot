@@ -455,7 +455,7 @@ def create_professional_word_report(
     sections 支持：
     - {"title": "...", "type": "paragraphs", "content": ["...", "..."]}
     - {"title": "...", "type": "bullets", "items": ["...", "..."]}
-    - {"title": "...", "type": "table", "columns": [...], "rows": [{...}]}
+    - {"title": "...", "type": "table", "columns": ["列1", "列2"], "rows": [{"列1": "值1", "列2": "值2"}]}\n      table 的推荐 rows 格式是字典列表，字典键应与 columns 一致。
     """
     target = _normalize_docx_path(output_path)
     if not str(report_title or "").strip():
@@ -506,14 +506,53 @@ def create_professional_word_report(
                 for item in section.get("columns", []) or []
             ]
             rows = section.get("rows", []) or []
-            if not all(isinstance(row, dict) for row in rows):
+
+            # v5.0+ Word Table Argument Normalization
+            #
+            # 标准格式：
+            # rows=[
+            #     {"城市": "澳门", "销售额": 198000},
+            #     {"城市": "珠海", "销售额": 89000},
+            # ]
+            #
+            # 如果 LLM 偶尔给出二维列表，只要每行长度与 columns 一致，
+            # Tool Boundary 就确定性映射成字典，避免浪费一次 Recovery。
+            normalized_rows = []
+
+            for row in rows:
+                if isinstance(row, dict):
+                    normalized_rows.append(
+                        dict(row)
+                    )
+                    continue
+
+                if isinstance(row, (list, tuple)):
+                    if len(row) != len(columns):
+                        raise TypeError(
+                            "table section 的列表行长度必须与 "
+                            "columns 数量一致。"
+                        )
+
+                    normalized_rows.append(
+                        {
+                            column: value
+                            for column, value in zip(
+                                columns,
+                                row,
+                            )
+                        }
+                    )
+                    continue
+
                 raise TypeError(
-                    "table section 的 rows 必须是字典列表。"
+                    "table section 的 rows 必须是字典列表，"
+                    "或可按 columns 映射的二维列表。"
                 )
+
             _add_business_table(
                 document,
                 columns,
-                rows,
+                normalized_rows,
             )
 
     if source_note:

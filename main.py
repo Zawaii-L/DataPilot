@@ -3,6 +3,7 @@ import re
 import sys
 import traceback
 import subprocess
+import threading
 
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
@@ -55,6 +56,7 @@ IGNORED_SCAN_DIRS = {
 class AgentWorker(QThread):
     log_signal = Signal(str)
     success_signal = Signal(dict)
+    cancelled_signal = Signal(dict)
     error_signal = Signal(str)
 
     def __init__(self, task, input_paths, output_dir):
@@ -63,6 +65,11 @@ class AgentWorker(QThread):
         self.task = task
         self.input_paths = input_paths
         self.output_dir = output_dir
+        self.cancel_event = threading.Event()
+
+    def request_cancel(self):
+        """Request a cooperative stop without forcibly killing the worker thread."""
+        self.cancel_event.set()
 
     def report_progress(self, message):
         """
@@ -88,9 +95,16 @@ class AgentWorker(QThread):
                 user_task=self.task,
                 input_paths=self.input_paths,
                 output_dir=self.output_dir,
+                cancel_event=self.cancel_event,
             )
 
-            self.success_signal.emit(result)
+            if (
+                isinstance(result, dict)
+                and result.get("stop_reason") == "user_cancelled"
+            ):
+                self.cancelled_signal.emit(result)
+            else:
+                self.success_signal.emit(result)
 
         except Exception:
             error_message = traceback.format_exc()
@@ -355,6 +369,26 @@ class MainWindow(QMainWindow):
 
         control_layout.addWidget(
             self.start_button
+        )
+
+        self.cancel_button = QPushButton(
+            "终止任务"
+        )
+
+        self.cancel_button.setMinimumHeight(
+            40
+        )
+
+        self.cancel_button.setEnabled(
+            False
+        )
+
+        self.cancel_button.clicked.connect(
+            self.cancel_task
+        )
+
+        control_layout.addWidget(
+            self.cancel_button
         )
 
         self.clear_log_button = QPushButton(
@@ -958,6 +992,10 @@ class MainWindow(QMainWindow):
             enabled
         )
 
+        self.cancel_button.setEnabled(
+            not enabled
+        )
+
         self.select_file_button.setEnabled(
             enabled
         )
@@ -976,6 +1014,26 @@ class MainWindow(QMainWindow):
 
         self.clear_log_button.setEnabled(
             enabled
+        )
+
+    # ========================================================
+    # 安全终止当前任务
+    # ========================================================
+
+    def cancel_task(self):
+        worker = self.worker
+
+        if worker is None or not worker.isRunning():
+            return
+
+        if worker.cancel_event.is_set():
+            return
+
+        worker.request_cancel()
+        self.cancel_button.setEnabled(False)
+
+        self.append_log(
+            "已请求终止任务，正在等待当前 LLM / Tool 调用到达安全检查点……"
         )
 
     # ========================================================
@@ -1138,6 +1196,10 @@ class MainWindow(QMainWindow):
             self.task_success
         )
 
+        self.worker.cancelled_signal.connect(
+            self.task_cancelled
+        )
+
         self.worker.error_signal.connect(
             self.task_error
         )
@@ -1194,6 +1256,30 @@ class MainWindow(QMainWindow):
             tool_count = self.result.get(
                 "tool_count",
                 0,
+            )
+
+            tool_request_count = self.result.get(
+                "tool_request_count",
+                tool_count,
+            )
+
+            policy_blocked_count = self.result.get(
+                "policy_blocked_count",
+                0,
+            )
+
+            failed_tool_count = self.result.get(
+                "failed_tool_count",
+                0,
+            )
+
+            successful_tool_count = self.result.get(
+                "successful_tool_count",
+                max(
+                    int(tool_count or 0)
+                    - int(failed_tool_count or 0),
+                    0,
+                ),
             )
 
             stop_reason = self.result.get(
@@ -1379,7 +1465,23 @@ class MainWindow(QMainWindow):
             )
 
             self.append_log(
-                f"实际工具调用数量：{tool_count}"
+                f"工具请求数量：{tool_request_count}"
+            )
+
+            self.append_log(
+                f"真实工具执行数量：{tool_count}"
+            )
+
+            self.append_log(
+                f"成功工具执行数量：{successful_tool_count}"
+            )
+
+            self.append_log(
+                f"策略拦截数量：{policy_blocked_count}"
+            )
+
+            self.append_log(
+                f"失败工具执行数量：{failed_tool_count}"
             )
 
             self.append_log(
@@ -2548,6 +2650,26 @@ class MainWindow(QMainWindow):
                 "打开失败",
                 f"无法打开输出目录：\n{error}",
             )
+
+    # ========================================================
+    # 用户终止
+    # ========================================================
+
+    def task_cancelled(self, result):
+        self.result = result or {}
+
+        self.append_log(
+            "=" * 60
+        )
+        self.append_log(
+            "任务已由用户终止。"
+        )
+        self.append_log(
+            "已完成的安全写入会保留；不会继续启动新的 Agent 工具调用。"
+        )
+        self.append_log(
+            "=" * 60
+        )
 
     # ========================================================
     # 任务失败

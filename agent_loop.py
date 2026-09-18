@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 import os
 import re
@@ -74,6 +76,264 @@ class AgentLoop:
     AgentLoop 每执行一步都会重新决策。
     """
 
+    # v5.0+ Read-Only Task Boundary
+    #
+    # 对没有最终交付物要求的直接回答任务，允许读取、检查、统计，
+    # 但禁止为了“核实情况”擅自清洗、删除、填充或改写数据。
+    _DATA_MUTATION_TOOLS = {
+        "handle_missing_values",
+        "remove_duplicates",
+        "clean_data",
+        "auto_clean_data",
+        "fill_missing_values",
+        "drop_missing_values",
+    }
+
+    @staticmethod
+    def _task_plan_has_deliverables(
+        runtime_context: Dict[str, Any],
+    ) -> bool:
+        plan = (runtime_context or {}).get("task_plan")
+
+        if isinstance(plan, TaskPlan):
+            plan = plan.to_dict()
+        elif hasattr(plan, "to_dict"):
+            plan = plan.to_dict()
+
+        if not isinstance(plan, dict):
+            return False
+
+        return bool(
+            plan.get("deliverable_requirements") or []
+        )
+
+    @staticmethod
+    def _has_successful_tool(
+        tool_results: List[ToolExecutionResult],
+        tool_names: set[str],
+    ) -> bool:
+        normalized_names = {
+            str(name).strip().lower()
+            for name in tool_names
+        }
+
+        return any(
+            bool(item.success)
+            and str(item.tool_name or "").strip().lower()
+            in normalized_names
+            for item in tool_results
+        )
+
+    @staticmethod
+    def _build_basic_info_final_answer(
+        tool_results: List[ToolExecutionResult],
+    ) -> str:
+        """
+        为 response-only 的“数据基本情况”任务生成确定性最终回答。
+
+        只使用真实成功 Tool Observation，不调用额外工具，不凭预览猜测。
+        """
+        info = None
+        source_path = ""
+        sheet_name = ""
+
+        for item in tool_results:
+            if not getattr(item, "success", False):
+                continue
+
+            name = str(
+                getattr(item, "tool_name", "") or ""
+            ).strip().lower()
+
+            if name == "read_office_data":
+                arguments = getattr(
+                    item,
+                    "arguments",
+                    {},
+                ) or {}
+                source_path = str(
+                    arguments.get("file_path") or source_path
+                )
+                sheet_name = str(
+                    arguments.get("sheet_name") or sheet_name
+                )
+
+            if name == "get_data_info":
+                output = getattr(item, "output", None)
+                if isinstance(output, dict):
+                    info = output
+
+        if not isinstance(info, dict):
+            return (
+                "已完成真实数据读取和基础检查。"
+                "当前已有证据足以回答该只读任务。"
+            )
+
+        rows = info.get("rows")
+        columns = info.get("columns")
+        column_names = info.get("column_names") or []
+        numeric_columns = info.get("numeric_columns") or []
+        non_numeric_columns = (
+            info.get("non_numeric_columns") or []
+        )
+        missing_values = info.get("missing_values")
+        duplicate_rows = info.get("duplicate_rows")
+
+        lines = []
+
+        if source_path:
+            source_name = Path(source_path).name
+            if sheet_name:
+                lines.append(
+                    f"已读取 Excel：{source_name}，"
+                    f"工作表：{sheet_name}。"
+                )
+            else:
+                lines.append(
+                    f"已读取 Excel：{source_name}。"
+                )
+
+        if rows is not None and columns is not None:
+            lines.append(
+                f"数据规模：{rows} 行 × {columns} 列。"
+            )
+
+        if column_names:
+            lines.append(
+                "字段："
+                + "、".join(
+                    str(item)
+                    for item in column_names
+                )
+                + "。"
+            )
+
+        if numeric_columns:
+            lines.append(
+                "数值字段："
+                + "、".join(
+                    str(item)
+                    for item in numeric_columns
+                )
+                + "。"
+            )
+
+        if non_numeric_columns:
+            lines.append(
+                "非数值字段："
+                + "、".join(
+                    str(item)
+                    for item in non_numeric_columns
+                )
+                + "。"
+            )
+
+        if isinstance(missing_values, dict):
+            total_missing = sum(
+                int(value or 0)
+                for value in missing_values.values()
+                if isinstance(value, (int, float))
+            )
+            lines.append(
+                f"缺失值总数：{total_missing}。"
+            )
+
+        if duplicate_rows is not None:
+            lines.append(
+                f"重复行：{duplicate_rows} 行。"
+            )
+
+        return "\n".join(lines).strip()
+
+    @classmethod
+    def _get_execution_budget_block_reason(
+        cls,
+        *,
+        goal: str,
+        tool_name: str,
+        runtime_context: Dict[str, Any],
+        tool_results: List[ToolExecutionResult],
+    ) -> Optional[str]:
+        normalized = str(tool_name or "").strip().lower()
+        goal_text = re.sub(
+            r"\s+",
+            " ",
+            str(goal or "").strip().lower(),
+        )
+
+        response_only = not cls._task_plan_has_deliverables(
+            runtime_context
+        )
+
+        if response_only and normalized in cls._DATA_MUTATION_TOOLS:
+            return (
+                "当前 TaskPlan 没有最终文件交付要求，属于直接回答/只读分析任务；"
+                f"工具 {tool_name} 会改变数据内容，因此被 Read-Only Task Boundary 拦截。"
+                "请使用读取、检查或统计类工具取得证据。"
+            )
+
+        single_excel_request = (
+            "一个" in goal_text
+            and "excel" in goal_text
+        )
+
+        source_locked = cls._has_successful_tool(
+            tool_results,
+            {"read_office_data"},
+        )
+
+        if (
+            response_only
+            and single_excel_request
+            and source_locked
+            and normalized in {
+                "discover_data_files",
+                "inspect_data_files",
+            }
+        ):
+            return (
+                "用户只要求读取一个 Excel，且已经成功读取并锁定一个数据源；"
+                f"后续 {tool_name} 会重新扩大候选范围，违反 Source Lock。"
+                "请继续使用当前 DataFrame，或直接申请 finish。"
+            )
+
+        basic_info_request = any(
+            phrase in goal_text
+            for phrase in (
+                "基本情况",
+                "基本信息",
+                "数据概况",
+                "数据基本情况",
+                "简单看一下",
+                "简单看看",
+            )
+        )
+
+        info_ready = cls._has_successful_tool(
+            tool_results,
+            {"get_data_info"},
+        )
+
+        if (
+            response_only
+            and basic_info_request
+            and info_ready
+            and normalized in {
+                "group_multi_statistics",
+                "group_statistics",
+                "calculate_statistics",
+                "calculate_stats",
+                "describe_data",
+            }
+        ):
+            return (
+                "用户只要求数据基本情况，且 get_data_info 已提供核心结构证据；"
+                f"继续调用 {tool_name} 会把任务无授权升级为深入统计分析。"
+                "请基于现有 Observation 直接申请 finish。"
+            )
+
+        return None
+
     def __init__(
         self,
         registry: Optional[ToolRegistry] = None,
@@ -86,6 +346,7 @@ class AgentLoop:
         skill_registry: Optional[SkillRegistry] = None,
         max_identical_failures: int = 2,
         max_completion_recovery_iterations: int = 3,
+        cancel_event: Optional[Any] = None,
     ):
         self.registry = registry or create_default_tool_registry()
         self.skill_registry = (
@@ -142,6 +403,37 @@ class AgentLoop:
         self.max_completion_recovery_iterations = max(
             0,
             int(max_completion_recovery_iterations),
+        )
+        self.cancel_event = cancel_event
+
+    def _is_cancel_requested(self) -> bool:
+        """Return True when the GUI/user has requested a cooperative stop."""
+        event = self.cancel_event
+        return bool(event is not None and getattr(event, "is_set", lambda: False)())
+
+    def _cancelled_result(
+        self,
+        *,
+        goal: str,
+        iteration: int,
+        tool_results: List[ToolExecutionResult],
+        decisions: List[Dict[str, Any]],
+        latest_verification_report: Optional[Dict[str, Any]] = None,
+    ) -> AgentLoopResult:
+        self.report_progress("已收到用户终止请求，Agent 已在安全检查点停止。")
+        return AgentLoopResult(
+            success=False,
+            goal=goal,
+            final_answer="任务已由用户终止。",
+            stop_reason="user_cancelled",
+            iterations=max(0, int(iteration)),
+            tool_results=tool_results,
+            decisions=decisions,
+            verification_report=(
+                dict(latest_verification_report)
+                if isinstance(latest_verification_report, dict)
+                else None
+            ),
         )
 
     def _validate_skill_catalog(self):
@@ -257,6 +549,15 @@ class AgentLoop:
         iteration = 1
 
         while iteration <= max_total_iterations:
+            if self._is_cancel_requested():
+                return self._cancelled_result(
+                    goal=goal,
+                    iteration=iteration,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    latest_verification_report=latest_verification_report,
+                )
+
             in_completion_recovery = (
                 iteration > self.max_iterations
             )
@@ -295,6 +596,15 @@ class AgentLoop:
                 state=state,
             )
 
+            if self._is_cancel_requested():
+                return self._cancelled_result(
+                    goal=goal,
+                    iteration=iteration,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    latest_verification_report=latest_verification_report,
+                )
+
             decisions.append(decision)
 
             action_type = decision.get(
@@ -310,6 +620,15 @@ class AgentLoop:
                 self.report_progress(
                     "Agent 请求完成任务，正在进入 v4.0 Completion Gate……"
                 )
+
+                if self._is_cancel_requested():
+                    return self._cancelled_result(
+                        goal=goal,
+                        iteration=iteration,
+                        tool_results=tool_results,
+                        decisions=decisions,
+                        latest_verification_report=latest_verification_report,
+                    )
 
                 verification_report = self._run_completion_gate(
                     goal=goal,
@@ -478,6 +797,102 @@ class AgentLoop:
                     f"[{step_id}] 目的：{purpose}"
                 )
 
+            if self._is_cancel_requested():
+                return self._cancelled_result(
+                    goal=goal,
+                    iteration=iteration,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    latest_verification_report=latest_verification_report,
+                )
+
+            execution_budget_block_reason = (
+                self._get_execution_budget_block_reason(
+                    goal=goal,
+                    tool_name=canonical_name,
+                    runtime_context=runtime_context,
+                    tool_results=tool_results,
+                )
+            )
+
+            if execution_budget_block_reason:
+                # v5.0+ Source / Execution Budget Fast Finish
+                #
+                # Policy Block 不是 Tool Failure，也不是一次真实 Tool Call。
+                # 对“读取一个 Excel 并告诉我基本情况”这类 response-only
+                # 任务，如果核心证据已经齐全，LLM 仍试图把任务升级为
+                # 深入统计，则不再把“被拦截的工具”塞进 tool_results，
+                # 也不再浪费下一轮让 LLM 自己 finish。
+                #
+                # Python 直接基于当前真实 Observation 运行 Completion Gate：
+                # PASS  -> 当前轮直接完成；
+                # FAIL  -> 保留 Gate 失败项，继续让 Agent 补齐真正缺失证据。
+                self.report_progress(
+                    f"[{step_id}] Execution Budget Boundary："
+                    f"{execution_budget_block_reason}"
+                )
+                self.report_progress(
+                    f"[{step_id}] Source Selection Budget："
+                    "当前任务的必要读取/基础信息证据已经满足，"
+                    "该扩展工具未真实执行；正在直接进入 Completion Gate。"
+                )
+
+                auto_finish_answer = (
+                    self._build_basic_info_final_answer(
+                        tool_results
+                    )
+                )
+
+                verification_report = self._run_completion_gate(
+                    goal=goal,
+                    final_answer=auto_finish_answer,
+                    iteration=iteration,
+                    runtime_context=runtime_context,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                )
+
+                if verification_report.verified:
+                    self.report_progress(
+                        "Completion Gate：PASS，"
+                        "Source Selection Budget 已直接完成任务。"
+                    )
+
+                    runtime_context.pop(
+                        "verification_observation",
+                        None,
+                    )
+
+                    return AgentLoopResult(
+                        success=True,
+                        goal=goal,
+                        final_answer=auto_finish_answer,
+                        stop_reason="completed",
+                        iterations=iteration,
+                        tool_results=tool_results,
+                        decisions=decisions,
+                        verification_report=(
+                            verification_report.to_dict()
+                        ),
+                    )
+
+                latest_verification_report = (
+                    verification_report.to_dict()
+                )
+                runtime_context[
+                    "verification_observation"
+                ] = dict(
+                    latest_verification_report
+                )
+
+                self.report_progress(
+                    "Completion Gate：当前证据仍不足。"
+                    "验收失败项已注入下一轮，Agent 只允许补齐真正缺失的证据。"
+                )
+
+                iteration += 1
+                continue
+
             result = self.executor.execute(
                 canonical_name,
                 resolved_arguments,
@@ -492,6 +907,15 @@ class AgentLoop:
             tool_results.append(
                 result
             )
+
+            if self._is_cancel_requested():
+                return self._cancelled_result(
+                    goal=goal,
+                    iteration=iteration,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    latest_verification_report=latest_verification_report,
+                )
 
             if result.success:
                 self.report_progress(
@@ -544,6 +968,15 @@ class AgentLoop:
                 "Agent 已用完常规执行轮数，正在进行最终完成判定……"
             )
 
+        if self._is_cancel_requested():
+            return self._cancelled_result(
+                goal=goal,
+                iteration=exhausted_iteration_budget,
+                tool_results=tool_results,
+                decisions=decisions,
+                latest_verification_report=latest_verification_report,
+            )
+
         final_state = self._build_state(
             goal=goal,
             runtime_context=runtime_context,
@@ -557,6 +990,15 @@ class AgentLoop:
             finish_only=True,
         )
 
+        if self._is_cancel_requested():
+            return self._cancelled_result(
+                goal=goal,
+                iteration=exhausted_iteration_budget + 1,
+                tool_results=tool_results,
+                decisions=decisions,
+                latest_verification_report=latest_verification_report,
+            )
+
         decisions.append(final_decision)
 
         if final_decision.get("action_type") == "finish":
@@ -568,6 +1010,15 @@ class AgentLoop:
             self.report_progress(
                 "最终判定请求完成，正在进入 v4.0 Completion Gate……"
             )
+
+            if self._is_cancel_requested():
+                return self._cancelled_result(
+                    goal=goal,
+                    iteration=exhausted_iteration_budget + 1,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    latest_verification_report=latest_verification_report,
+                )
 
             verification_report = self._run_completion_gate(
                 goal=goal,

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,91 @@ SUPPORTED_EXTENSIONS = {
     ".xlsx",
     ".xls",
 }
+
+
+# ============================================================
+# 自动扫描排除规则
+# ============================================================
+
+# 这些目录属于 DataPilot 自身运行环境、构建产物或默认输出目录。
+# 规则只作用于“自动扫描文件夹”；用户明确指定某个具体文件时，
+# inspect_data_file / inspect_data_files 仍然可以正常读取该文件。
+AUTO_SCAN_EXCLUDED_DIRS = {
+    "_internal",
+    ".venv",
+    "venv",
+    "env",
+    "outputs",
+    "output",
+    "__pycache__",
+    ".git",
+    ".github",
+    ".idea",
+    ".vscode",
+    "build",
+    "dist",
+    "node_modules",
+}
+
+AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED = {
+    name.casefold()
+    for name in AUTO_SCAN_EXCLUDED_DIRS
+}
+
+
+def is_auto_scan_excluded_directory(path) -> bool:
+    """判断一个目录是否应从自动递归扫描中排除。"""
+    try:
+        name = Path(path).name.casefold()
+    except Exception:
+        return False
+
+    return name in AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED
+
+
+def is_auto_scan_excluded_path(path, scan_root) -> bool:
+    """
+    判断候选路径相对于扫描根目录是否经过被排除目录。
+
+    注意：
+    - 只检查 scan_root 下面的目录组成部分；
+    - 不做字符串模糊匹配；
+    - 因此不会误伤 2026_internal_sales.xlsx 之类的正常文件名。
+    """
+    candidate = normalize_path(path)
+    root = normalize_path(scan_root)
+
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+
+    parts = relative.parts[:-1] if candidate.is_file() else relative.parts
+
+    return any(
+        part.casefold() in AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED
+        for part in parts
+    )
+
+
+def iter_auto_scan_candidates(folder: Path, recursive: bool):
+    """遍历自动扫描候选项，并在递归阶段直接剪枝污染目录。"""
+    if not recursive:
+        yield from folder.glob("*")
+        return
+
+    for current_root, dir_names, file_names in os.walk(folder):
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if name.casefold() not in AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED
+            and not name.startswith(".")
+        ]
+
+        current = Path(current_root)
+
+        for file_name in file_names:
+            yield current / file_name
 
 
 # ============================================================
@@ -100,14 +186,24 @@ def scan_data_files(
             f"输入路径不是文件夹：{folder}"
         )
 
-    if recursive:
-        candidates = folder.rglob("*")
-    else:
-        candidates = folder.glob("*")
+    candidates = iter_auto_scan_candidates(
+        folder=folder,
+        recursive=recursive,
+    )
 
     files = []
 
     for path in candidates:
+
+        # 自动扫描时忽略隐藏/临时文件。
+        if path.name.startswith(".") or path.name.startswith("~$"):
+            continue
+
+        if is_auto_scan_excluded_path(
+            path=path,
+            scan_root=folder,
+        ):
+            continue
 
         if not is_supported_data_file(
             path

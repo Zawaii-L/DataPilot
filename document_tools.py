@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,73 @@ SUPPORTED_DOCUMENT_EXTENSIONS = (
     | WORD_EXTENSIONS
     | PDF_EXTENSIONS
 )
+
+
+# ============================================================
+# 自动扫描排除规则
+# ============================================================
+
+# 只影响文件夹自动扫描。用户明确选择的 DOCX / PDF / TXT / MD
+# 仍由 validate_document_file / read_document 正常读取。
+AUTO_SCAN_EXCLUDED_DIRS = {
+    "_internal",
+    ".venv",
+    "venv",
+    "env",
+    "outputs",
+    "output",
+    "__pycache__",
+    ".git",
+    ".github",
+    ".idea",
+    ".vscode",
+    "build",
+    "dist",
+    "node_modules",
+}
+
+AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED = {
+    name.casefold()
+    for name in AUTO_SCAN_EXCLUDED_DIRS
+}
+
+
+def is_auto_scan_excluded_path(path, scan_root) -> bool:
+    """按目录组成部分判断自动扫描候选是否位于排除目录中。"""
+    candidate = normalize_document_path(path)
+    root = normalize_document_path(scan_root)
+
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+
+    parts = relative.parts[:-1] if candidate.is_file() else relative.parts
+
+    return any(
+        part.casefold() in AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED
+        for part in parts
+    )
+
+
+def iter_document_scan_candidates(folder: Path, recursive: bool):
+    """遍历文档候选，并在递归阶段直接剪枝程序/输出目录。"""
+    if not recursive:
+        yield from folder.glob("*")
+        return
+
+    for current_root, dir_names, file_names in os.walk(folder):
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if name.casefold() not in AUTO_SCAN_EXCLUDED_DIRS_NORMALIZED
+            and not name.startswith(".")
+        ]
+
+        current = Path(current_root)
+
+        for file_name in file_names:
+            yield current / file_name
 
 
 def normalize_document_path(file_path) -> Path:
@@ -424,10 +492,10 @@ def scan_document_files(
             f"路径不是文件夹：{folder}"
         )
 
-    if recursive:
-        candidates = folder.rglob("*")
-    else:
-        candidates = folder.glob("*")
+    candidates = iter_document_scan_candidates(
+        folder=folder,
+        recursive=recursive,
+    )
 
     files = []
 
@@ -441,6 +509,12 @@ def scan_document_files(
 
         # 忽略隐藏文件
         if path.name.startswith("."):
+            continue
+
+        if is_auto_scan_excluded_path(
+            path=path,
+            scan_root=folder,
+        ):
             continue
 
         if (

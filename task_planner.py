@@ -67,6 +67,37 @@ class TaskPlanner:
         "assumptions",
     )
 
+    # v5.0+ Output Mode Boundary
+    # 只有用户明确要求“生成/导出/保存/制作/另存/交付某种文件”时，
+    # 才允许 TaskPlan 存在最终文件交付要求。
+    _ARTIFACT_ACTION_KEYWORDS = (
+        "生成", "导出", "保存", "另存", "制作", "创建",
+        "输出文件", "交付物", "交付文件", "写入文件",
+        "生成文件", "导出文件", "保存文件",
+    )
+
+    _ARTIFACT_TYPE_KEYWORDS = (
+        "word", "docx", "excel", "xlsx", "csv",
+        "ppt", "pptx", "pdf", "报告文件", "报表文件",
+        "文档", "工作簿", "演示文稿",
+    )
+
+    _EXPLICIT_ARTIFACT_PHRASES = (
+        "生成报告", "制作报告", "导出报告", "保存报告",
+        "生成报表", "制作报表", "导出报表", "保存报表",
+        "生成word", "生成 word", "导出word", "导出 word",
+        "生成excel", "生成 excel", "导出excel", "导出 excel",
+        "生成ppt", "生成 ppt", "生成pdf", "生成 pdf",
+        "最终交付物", "最终文件",
+    )
+
+    _FILE_VERIFICATION_KEYWORDS = (
+        "最终文件", "最终交付物", "交付物", "deliverables_dir",
+        "文件存在", "存在性", "回读", "重新读取最终",
+        "再次读取最终", "写后读取", "写后回读",
+        "生成后的", "导出后的", "保存后的",
+    )
+
     def __init__(
         self,
         progress_callback: ProgressCallback = None,
@@ -129,6 +160,29 @@ class TaskPlanner:
         self.report_progress(
             "DataPilot v4.0 Task Planner 正在建立任务合同……"
         )
+
+        # v5.0+ Deterministic Basic-Info Plan
+        #
+        # 高频且语义明确的“读取一个 Excel + 告诉我基本情况”任务，
+        # 直接由 Python 建立最小任务合同，不消耗 LLM Planner，
+        # 也不会因偶发 JSON 格式问题触发 Planner 重试。
+        #
+        # 复杂分析、统计、比较、文件交付、源数据修改等任务
+        # 仍完整走原有 LLM Task Planner。
+        if self._is_deterministic_excel_basic_info_task(task):
+            plan = self._build_deterministic_excel_basic_info_plan(
+                task
+            )
+
+            self.report_progress(
+                "DataPilot v5.0 Task Planner："
+                "已使用确定性 Basic-Info 任务合同，"
+                "无需 LLM JSON 规划。"
+            )
+            self.report_progress(
+                "DataPilot v4.0 Task Planner 已建立任务合同。"
+            )
+            return plan
 
         plan: Optional[TaskPlan] = None
         last_error: Optional[Exception] = None
@@ -236,6 +290,113 @@ class TaskPlanner:
         return plan
 
     @staticmethod
+    def _is_deterministic_excel_basic_info_task(
+        user_task: str,
+    ) -> bool:
+        """
+        只识别非常窄的 Excel 基本信息 response-only 任务。
+        """
+        text = str(user_task or "").strip().lower()
+
+        if not text:
+            return False
+
+        has_excel = any(
+            token in text
+            for token in (
+                "excel",
+                "xlsx",
+                "xls",
+            )
+        )
+
+        has_read_intent = any(
+            phrase in text
+            for phrase in (
+                "读取",
+                "查看",
+                "看看",
+                "打开",
+                "告诉我",
+                "说明",
+            )
+        )
+
+        has_basic_info = any(
+            phrase in text
+            for phrase in (
+                "基本情况",
+                "基本信息",
+                "数据概况",
+                "数据基本情况",
+                "简单看一下",
+                "简单看看",
+            )
+        )
+
+        has_complex_intent = any(
+            phrase in text
+            for phrase in (
+                "分析销售",
+                "深入分析",
+                "统计",
+                "汇总",
+                "分组",
+                "透视",
+                "比较",
+                "对比",
+                "合并",
+                "生成",
+                "导出",
+                "保存",
+                "报告",
+                "word",
+                "ppt",
+                "pdf",
+                "修改",
+                "清洗",
+                "删除缺失",
+                "填充缺失",
+            )
+        )
+
+        return (
+            has_excel
+            and has_read_intent
+            and has_basic_info
+            and not has_complex_intent
+        )
+
+    @staticmethod
+    def _build_deterministic_excel_basic_info_plan(
+        user_task: str,
+    ) -> TaskPlan:
+        """
+        为 Excel 基本情况任务建立最小、可验证的确定性合同。
+        """
+        return TaskPlan(
+            task_goal=str(user_task or "").strip(),
+            evidence_requirements=[
+                "真实读取一个可用 Excel 工作表。",
+                "取得数据行列规模、字段、字段类型、缺失值与重复行等基础信息。",
+            ],
+            source_requirements=[
+                "识别一个可读取的 Excel 文件及目标工作表。",
+            ],
+            deliverable_requirements=[],
+            execution_requirements=[
+                "发现或定位候选 Excel 数据源。",
+                "读取一个与任务匹配的 Excel 工作表。",
+                "获取该数据的基础结构与质量信息。",
+            ],
+            verification_requirements=[],
+            safety_requirements=[
+                "只读处理，不覆盖、不修改源 Excel 文件。",
+            ],
+            assumptions=[],
+        )
+
+    @staticmethod
     def _build_retry_prompt(
         invalid_content: str,
         error: Optional[Exception],
@@ -318,8 +479,14 @@ JSON 必须包含以下字段：
    中间产物必须进入 temporary_dir。
 10. 不要声称任务已经完成。你只是在制定任务合同。
 11. 每个数组只写具体、可检查的要求，避免空泛口号。
-12. 如果用户任务本身没有要求某类交付物，不要擅自增加 Word、Excel、PPT 等文件。
-13. assumptions 只记录真正无法确定的事项；没有时返回 []。
+12. 如果用户任务本身没有明确要求生成、导出、保存、制作或另存某类文件，
+    deliverable_requirements 必须返回 []，不得把“直接回答用户”“告诉用户结果”
+    “说明情况”“给出结论”写成文件交付物。
+13. “读取/查看/告诉我/说明/分析一下/基本情况/有什么内容”默认是直接回答任务，
+    不是 Word/Excel/PPT/PDF 报告生成任务。
+14. 只有用户明确要求生成、导出、保存、制作、另存或交付文件时，
+    才能把文件写入 deliverable_requirements，并加入文件存在/回读验收。
+15. assumptions 只记录真正无法确定的事项；没有时返回 []。
 """.strip()
 
     def _build_user_prompt(
@@ -406,6 +573,62 @@ JSON 必须包含以下字段：
                 field_name=field_name,
             )
 
+        # v5.0+ Output Mode Boundary
+        # Python 层根据用户原始任务确定是否真的需要最终文件。
+        artifact_required = self._user_explicitly_requests_artifact(
+            user_task
+        )
+
+        if not artifact_required:
+            normalized["deliverable_requirements"] = []
+
+            normalized["verification_requirements"] = [
+                item
+                for item in normalized["verification_requirements"]
+                if not self._looks_like_file_verification_requirement(
+                    item
+                )
+            ]
+
+            # v5.0+ Response-Only Basic-Info Contract
+            #
+            # “读取一个 Excel 并告诉我基本情况”不需要：
+            # - 最终文件回读
+            # - 再次读取源文件
+            # - 深入分组统计
+            # - 为了验收而制造额外 Tool Call
+            #
+            # 真实 read + get_data_info 已经是这一类任务的事实证据。
+            # Completion Gate 继续保留执行成功/工具失败等硬检查，
+            # 但 Planner 不再生成无法终止的语义验收循环。
+            user_task_lower = str(user_task or "").lower()
+            response_only_basic_info = (
+                any(
+                    phrase in user_task_lower
+                    for phrase in (
+                        "基本情况",
+                        "基本信息",
+                        "数据概况",
+                        "数据基本情况",
+                        "简单看一下",
+                        "简单看看",
+                    )
+                )
+                and any(
+                    phrase in user_task_lower
+                    for phrase in (
+                        "读取",
+                        "查看",
+                        "看看",
+                        "告诉我",
+                        "说明",
+                    )
+                )
+            )
+
+            if response_only_basic_info:
+                normalized["verification_requirements"] = []
+
         workspace = context.get("workspace")
 
         if isinstance(workspace, dict):
@@ -434,7 +657,7 @@ JSON 必须包含以下字段：
                     ),
                 )
 
-            if deliverables_dir:
+            if deliverables_dir and artifact_required:
                 self._append_unique(
                     normalized["safety_requirements"],
                     (
@@ -464,6 +687,53 @@ JSON 必须包含以下字段：
                 "safety_requirements"
             ],
             assumptions=normalized["assumptions"],
+        )
+
+    @classmethod
+    def _user_explicitly_requests_artifact(
+        cls,
+        user_task: str,
+    ) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(user_task or "").strip().lower(),
+        )
+
+        if not text:
+            return False
+
+        if any(
+            phrase in text
+            for phrase in cls._EXPLICIT_ARTIFACT_PHRASES
+        ):
+            return True
+
+        has_action = any(
+            keyword in text
+            for keyword in cls._ARTIFACT_ACTION_KEYWORDS
+        )
+        has_type = any(
+            keyword in text
+            for keyword in cls._ARTIFACT_TYPE_KEYWORDS
+        )
+
+        return bool(has_action and has_type)
+
+    @classmethod
+    def _looks_like_file_verification_requirement(
+        cls,
+        requirement: str,
+    ) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(requirement or "").strip().lower(),
+        )
+
+        return any(
+            keyword.lower() in text
+            for keyword in cls._FILE_VERIFICATION_KEYWORDS
         )
 
     @staticmethod

@@ -500,12 +500,36 @@ class WorkspaceManager:
         self,
         file_path: str | Path,
     ) -> Optional[WorkspaceFile]:
+        """
+        登记 Agent 本次任务真实生成的文件。
+
+        v5.0+ Artifact Boundary 修复：
+        只有当前 task_root 内的文件才允许通过“工具输出自动发现”
+        被登记为 Agent 产物。
+
+        原因：
+        discover/read/inspect 类工具经常会把源文件路径放进 output。
+        如果仅凭“这个路径真实存在”就登记为 generated file，
+        Workspace 外部的输入 Excel/CSV/Word 会被误判成 deliverable。
+
+        显式 source/reference 仍由 register_source/register_reference 管理；
+        当前任务真正的 temporary/deliverable 必须位于 task_root 内。
+        """
         path = self._normalize_path(file_path)
 
         if not path.exists() or not path.is_file():
             return None
 
         if self.is_protected_input(path):
+            return None
+
+        # 自动产物登记必须严格限制在本次任务工作区。
+        # Workspace 外部的路径可能只是 discover/read/inspect 返回的源文件，
+        # 不能仅凭出现在 Tool output 中就认定为 Agent 创建。
+        if not self._is_within(
+            path,
+            self.task_root,
+        ):
             return None
 
         role = self.classify_generated_file(
