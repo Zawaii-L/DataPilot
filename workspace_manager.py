@@ -454,6 +454,18 @@ class WorkspaceManager:
         self,
         file_path: str | Path,
     ) -> str:
+        """
+        根据真实文件位置判断 Agent 产物角色。
+
+        v3.9 Artifact Governance：
+        1. temporary_dir 内的文件明确属于 temporary；
+        2. deliverables_dir 内的文件明确属于 deliverable；
+        3. Workspace 外部的历史流程产物继续按 deliverable 兼容处理；
+        4. 不再根据“临时 / 中间 / 基础表 / tmp”等文件名猜测角色。
+
+        这样可以避免合法最终文件因为名称中包含“基础表”等词，
+        被错误登记为 temporary 并在 cleanup 时删除。
+        """
         path = self._normalize_path(file_path)
 
         if self._is_within(
@@ -468,25 +480,9 @@ class WorkspaceManager:
         ):
             return self.DELIVERABLE
 
-        name = path.name.lower()
-
-        temporary_markers = (
-            "_tmp",
-            "tmp_",
-            "_temp",
-            "temp_",
-            "temporary",
-            "临时",
-            "中间",
-            "基础表",
-        )
-
-        if any(
-            marker in name
-            for marker in temporary_markers
-        ):
-            return self.TEMPORARY
-
+        # 兼容旧流程：
+        # WorkspaceManager 仍允许发现并整理 Workspace 外部已经真实生成的文件。
+        # 这类文件不能仅凭文件名推断为 temporary，因此默认视为 deliverable。
         return self.DELIVERABLE
 
     @staticmethod
@@ -670,6 +666,16 @@ class WorkspaceManager:
             if path.is_dir():
                 for child in path.rglob("*"):
                     if not child.is_file():
+                        continue
+
+                    # v3.9 Workspace Policy:
+                    # 当用户把一个包含当前任务工作区的上级目录作为输入时，
+                    # 不能把 task_root 内由 Agent 自己生成的 temporary、
+                    # deliverables、manifest 等文件重新登记成 source/reference。
+                    if self._is_within(
+                        self._normalize_path(child),
+                        self.task_root,
+                    ):
                         continue
 
                     if child.name.startswith("~$"):
