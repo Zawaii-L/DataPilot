@@ -30,6 +30,7 @@ from document_report_tools import (
 )
 
 from agent_loop import AgentLoop
+from workspace_manager import WorkspaceManager
 
 from office_data_tools import (
     read_office_data,
@@ -4695,9 +4696,16 @@ JSON 格式：
         input_paths=None,
         file_path=None,
         output_dir="outputs",
+        workspace_manager: Optional[WorkspaceManager] = None,
     ) -> Dict[str, Any]:
         """
-        为 v3.1 Agent Loop 构造运行时上下文。
+        为动态 Agent Loop 构造运行时上下文。
+
+        v3.6：
+        - 保留 working_directory / input_paths；
+        - output_dir 指向本次任务的 deliverables 目录；
+        - 注入 workspace 信息；
+        - source/reference 输入路径作为受保护输入，禁止 Agent 覆盖。
         """
         normalized_paths = self.normalize_input_paths(
             input_paths=input_paths,
@@ -4709,15 +4717,30 @@ JSON 格式：
         if not output_path.is_absolute():
             output_path = Path.cwd() / output_path
 
+        output_path = output_path.resolve()
+
         output_path.mkdir(
             parents=True,
             exist_ok=True,
         )
 
+        manager = workspace_manager or WorkspaceManager(
+            workspace_root=output_path,
+        )
+
+        manager.register_input_paths(
+            normalized_paths,
+            default_role=WorkspaceManager.SOURCE,
+        )
+
+        workspace_context = manager.to_runtime_context()
+
         return {
             "working_directory": str(Path.cwd().resolve()),
             "input_paths": normalized_paths,
-            "output_dir": str(output_path.resolve()),
+            "output_dir": str(manager.deliverables_dir.resolve()),
+            "requested_output_dir": str(output_path),
+            **workspace_context,
         }
 
     def execute_v31_agent_task(
@@ -4739,14 +4762,49 @@ JSON 格式：
         if not task:
             raise ValueError("用户任务不能为空。")
 
+        requested_output_path = Path(output_dir)
+
+        if not requested_output_path.is_absolute():
+            requested_output_path = (
+                Path.cwd()
+                / requested_output_path
+            )
+
+        requested_output_path = requested_output_path.resolve()
+
+        requested_output_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        workspace_manager = WorkspaceManager(
+            workspace_root=requested_output_path,
+        )
+
         runtime_context = self.build_v31_runtime_context(
             input_paths=input_paths,
             file_path=file_path,
-            output_dir=output_dir,
+            output_dir=requested_output_path,
+            workspace_manager=workspace_manager,
         )
 
         self.report_progress(
-            "已切换到 DataPilot v3.1 动态执行模式。"
+            "已切换到 DataPilot v3.6 Workspace 动态执行模式。"
+        )
+
+        self.report_progress(
+            "本次任务工作区："
+            f"{workspace_manager.task_root}"
+        )
+
+        self.report_progress(
+            "临时文件目录："
+            f"{workspace_manager.temp_dir}"
+        )
+
+        self.report_progress(
+            "最终交付目录："
+            f"{workspace_manager.deliverables_dir}"
         )
 
         loop = AgentLoop(
@@ -4811,6 +4869,23 @@ JSON 格式：
                                 output_files.append(resolved)
                     except Exception:
                         continue
+
+        # v3.6：从真实成功工具输出登记 Workspace 产物。
+        for tool_result in loop_result.tool_results:
+            if not tool_result.success:
+                continue
+
+            workspace_manager.register_generated_paths(
+                tool_result.output
+            )
+
+        workspace_deliverables = (
+            workspace_manager.get_deliverable_paths()
+        )
+
+        for deliverable in workspace_deliverables:
+            if deliverable not in output_files:
+                output_files.append(deliverable)
 
         source_files = runtime_context.get(
             "input_paths",
@@ -5339,6 +5414,34 @@ JSON 格式：
             "DataPilot v3.1 动态执行结束。"
         )
 
+        # v3.6：网络来源附录处理结束后刷新 Workspace。
+        for output_file in list(output_files):
+            workspace_manager.register_generated_file(
+                output_file
+            )
+
+        cleanup_result = (
+            workspace_manager.cleanup_temporary_files()
+        )
+
+        workspace_manager.refresh_exists_state()
+        workspace_manager.save_manifest()
+
+        workspace_summary = workspace_manager.summary()
+
+        for deliverable in (
+            workspace_manager.get_deliverable_paths()
+        ):
+            if deliverable not in output_files:
+                output_files.append(deliverable)
+
+        output_files = [
+            item
+            for item in output_files
+            if Path(item).exists()
+            and Path(item).is_file()
+        ]
+
         return {
             "success": loop_result.success,
             "task": task,
@@ -5354,7 +5457,15 @@ JSON 格式：
                 web_source_append_results
             ),
             "output_dir": runtime_context.get("output_dir"),
+            "requested_output_dir": runtime_context.get(
+                "requested_output_dir"
+            ),
             "output_files": output_files,
+            "workspace": workspace_summary,
+            "workspace_manifest": str(
+                workspace_manager.manifest_path
+            ),
+            "temporary_cleanup": cleanup_result,
             "final_answer": loop_result.final_answer,
             "answer": loop_result.final_answer,
             "stop_reason": loop_result.stop_reason,
@@ -5367,8 +5478,10 @@ JSON 格式：
             "decisions": loop_result.decisions,
             "runtime_context": runtime_context,
             "plan": {
-                "task_type": "v3_1_agent_loop",
-                "description": "DataPilot v3.1 动态工具执行",
+                "task_type": "v3_6_workspace_agent_loop",
+                "description": (
+                    "DataPilot v3.6 Workspace 动态工具执行"
+                ),
             },
         }
 

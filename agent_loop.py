@@ -46,7 +46,7 @@ class AgentLoopResult:
 
 class AgentLoop:
     """
-    DataPilot v3.5 动态 Agent Loop。
+    DataPilot v3.6 Workspace 动态 Agent Loop。
 
     核心循环：
         用户目标
@@ -143,7 +143,7 @@ class AgentLoop:
         tool_results: List[ToolExecutionResult] = []
 
         self.report_progress(
-            "DataPilot v3.5 Agent Loop 启动。"
+            "DataPilot v3.6 Workspace Agent Loop 启动。"
         )
 
         for iteration in range(
@@ -648,7 +648,7 @@ class AgentLoop:
             budget_rule = ""
 
         return f"""
-你是 DataPilot v3.5 的动态执行 Agent。
+你是 DataPilot v3.6 的 Workspace 动态执行 Agent。
 
 你每次只能做一个决定：
 1. 调用一个真实工具；
@@ -703,6 +703,18 @@ class AgentLoop:
 38. 多交付物任务在开始构造输出前，先根据用户要求确定最终交付字段。对于需要“基础数据 + 少量汇总字段”的新 Excel，优先选择能够在较少步骤内形成最终版本的路径；避免对同一数据重复做多个透视表、重复导出半成品，或先生成明显缺字段的最终文件再返工。
 39. 如果必须采用“先导出基础 Excel，再用 apply_excel_edits 补字段”的路径：第一次导出的基础文件应使用临时/中间文件名；随后一次 apply_excel_edits 直接从该中间文件生成最终交付文件，并在最后一次写入后立即回读最终文件。不要先把半成品占用最终文件名，也不要为了绕过覆盖保护重复导出同一基础数据。
 40. 如果已经生成正确交付物，不要仅为了增加非必要字段、美化格式或改变实现方式再次重写它；若确需再次写入，必须预留一次最终回读验证。
+
+【v3.6 Workspace 文件生命周期规则】
+41. runtime_context.workspace 是本次任务唯一可信的工作区信息。必须优先读取其中的 task_root、temporary_dir、deliverables_dir、manifest_path 和 protected_input_paths。
+42. protected_input_paths 中的文件属于受保护输入。除非用户明确要求覆盖且系统工具本身允许，否则不得把任何写入工具的 output_path 指向这些路径。
+43. 中间文件、基础表、临时下载、需要后续再次编辑的半成品，必须优先写入 runtime_context.workspace.temporary_dir；不要把半成品写入 deliverables_dir。
+44. 用户最终需要收到的 Word、Excel、CSV 或其他最终文件，必须优先写入 runtime_context.workspace.deliverables_dir。最终文件名应表达业务含义，不要使用 temp、tmp、临时、中间等名称。
+45. runtime_context.output_dir 在 v3.6 中等于本次任务 deliverables_dir。用户只说“输出到结果目录”而没有指定更具体路径时，直接在该目录下生成最终交付物。
+46. 如果工作流是“先生成基础文件，再编辑成最终文件”，基础文件必须进入 temporary_dir，最后一次编辑的 output_path 必须进入 deliverables_dir。
+47. 不要自行在项目根目录、源文件目录或任意未知目录创建中间文件。只有用户明确指定某个最终路径时，才可优先遵循用户指定路径；但仍不得覆盖 protected_input_paths。
+48. finish 前检查最终交付物路径。若用户要求生成文件，而最终成功写入的文件仍只有 temporary_dir 中的半成品，则任务未完成。
+49. 不要修改 manifest.json。Workspace manifest 由 Python 的 WorkspaceManager 自动维护，Agent 只负责正确使用工作区路径。
+50. 不要把 temporary_dir 中的临时文件当作最终交付物写进 final_answer。final_answer 应优先报告 deliverables_dir 中最后验证成功的文件。
 {budget_rule}
 
 ============================================================
