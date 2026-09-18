@@ -134,8 +134,6 @@ class DataPilotAgent:
         向命令行和 GUI 发送执行进度。
         """
 
-        print(message)
-
         if self.progress_callback:
             try:
                 self.progress_callback(
@@ -145,6 +143,8 @@ class DataPilotAgent:
                 print(
                     f"进度回调执行失败：{error}"
                 )
+        else:
+            print(message)
 
     # ============================================================
     # URL 提取
@@ -4789,7 +4789,7 @@ JSON 格式：
         )
 
         self.report_progress(
-            "已切换到 DataPilot v3.6 Workspace 动态执行模式。"
+            "已切换到 DataPilot Workspace 动态执行模式。"
         )
 
         self.report_progress(
@@ -5411,7 +5411,7 @@ JSON 格式：
                     )
 
         self.report_progress(
-            "DataPilot v3.1 动态执行结束。"
+            "DataPilot Workspace Agent 执行结束。"
         )
 
         # v3.6：网络来源附录处理结束后刷新 Workspace。

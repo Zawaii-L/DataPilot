@@ -81,7 +81,7 @@ class AgentWorker(QThread):
             )
 
             self.report_progress(
-                "开始执行 v3.1 动态 Agent 任务..."
+                "开始执行 DataPilot Workspace Agent 任务..."
             )
 
             result = agent.execute_v31_agent_task(
@@ -176,8 +176,8 @@ class MainWindow(QMainWindow):
         )
 
         subtitle_label = QLabel(
-            "v3.1 动态 Agent：用自然语言描述目标，"
-            "Agent 会逐步选择工具、观察结果并继续执行"
+            "Workspace Agent：用自然语言描述目标，"
+            "Agent 会逐步选择工具、观察结果并管理最终交付物"
         )
 
         subtitle_label.setStyleSheet(
@@ -214,7 +214,7 @@ class MainWindow(QMainWindow):
         self.task_input.setPlaceholderText(
             "例如：读取我选择的 Excel，按城市统计销售额合计，"
             "并把结果导出到 outputs 目录。\n\n"
-            "DataPilot v3.1 会根据真实执行结果逐步决定下一步工具。"
+            "DataPilot Workspace Agent 会根据真实执行结果逐步决定下一步工具。"
         )
 
         self.task_input.setMinimumHeight(
@@ -455,6 +455,48 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
+        # v3.7：任务工作台 / 交付物中心
+        # ----------------------------------------------------
+
+        self.workspace_label = QLabel(
+            "本次任务工作台"
+        )
+
+        self.workspace_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+
+        self.workspace_label.setVisible(
+            False
+        )
+
+        main_layout.addWidget(
+            self.workspace_label
+        )
+
+        self.workspace_output = QTextEdit()
+
+        self.workspace_output.setReadOnly(
+            True
+        )
+
+        self.workspace_output.setMinimumHeight(
+            150
+        )
+
+        self.workspace_output.setPlaceholderText(
+            "Workspace 任务编号、源文件、最终交付物和临时文件清理状态将在这里显示。"
+        )
+
+        self.workspace_output.setVisible(
+            False
+        )
+
+        main_layout.addWidget(
+            self.workspace_output
+        )
+
+        # ----------------------------------------------------
         # 文档综合结果
         # ----------------------------------------------------
 
@@ -497,7 +539,7 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
-        # v3.1：实际使用网页来源
+        # 联网任务：实际使用网页来源
         # ----------------------------------------------------
 
         self.web_sources_label = QLabel(
@@ -615,7 +657,7 @@ class MainWindow(QMainWindow):
         )
 
         self.open_output_button = QPushButton(
-            "打开输出文件夹"
+            "打开交付目录"
         )
 
         self.open_output_button.clicked.connect(
@@ -948,6 +990,14 @@ class MainWindow(QMainWindow):
 
         self.result_list.clear()
 
+        self.workspace_output.clear()
+        self.workspace_output.setVisible(
+            False
+        )
+        self.workspace_label.setVisible(
+            False
+        )
+
         self.document_result_output.clear()
         self.document_result_output.setVisible(
             False
@@ -989,7 +1039,7 @@ class MainWindow(QMainWindow):
         )
 
         self.append_log(
-            "开始执行 DataPilot v3.1 动态 Agent 任务"
+            "开始执行 DataPilot Workspace Agent 任务"
         )
 
         self.append_log(
@@ -1066,14 +1116,17 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
-        # v3.1：动态 Agent Loop 结果
+        # v3.7：Workspace 动态 Agent Loop 结果
         # ----------------------------------------------------
 
         task_type = self.result.get(
             "task_type"
         )
 
-        if task_type == "v3_1_agent_loop":
+        if task_type in {
+            "v3_1_agent_loop",
+            "v3_6_workspace_agent_loop",
+        }:
             final_answer = (
                 self.result.get("final_answer")
                 or self.result.get("answer")
@@ -1100,9 +1153,156 @@ class MainWindow(QMainWindow):
                 [],
             ) or []
 
-            self.append_log(
-                "任务类型：v3.1 动态 Agent Loop"
-            )
+            workspace = self.result.get(
+                "workspace"
+            ) or {}
+
+            if isinstance(workspace, dict) and workspace:
+                task_id = str(
+                    workspace.get("task_id")
+                    or ""
+                ).strip()
+
+                task_root = str(
+                    workspace.get("task_root")
+                    or ""
+                ).strip()
+
+                deliverables_dir = str(
+                    workspace.get("deliverables_dir")
+                    or ""
+                ).strip()
+
+                manifest_path = str(
+                    workspace.get("manifest_path")
+                    or ""
+                ).strip()
+
+                source_files = workspace.get(
+                    "source_files",
+                    [],
+                ) or []
+
+                deliverables = workspace.get(
+                    "deliverables",
+                    [],
+                ) or []
+
+                temporary_files = workspace.get(
+                    "temporary_files",
+                    [],
+                ) or []
+
+                cleanup = self.result.get(
+                    "temporary_cleanup"
+                ) or {}
+
+                removed_temp_files = (
+                    cleanup.get("removed", [])
+                    if isinstance(cleanup, dict)
+                    else []
+                ) or []
+
+                failed_temp_files = (
+                    cleanup.get("failed", [])
+                    if isinstance(cleanup, dict)
+                    else []
+                ) or []
+
+                workspace_lines = []
+
+                if task_id:
+                    workspace_lines.append(
+                        f"任务编号：{task_id}"
+                    )
+
+                if task_root:
+                    workspace_lines.append(
+                        f"任务工作区：{task_root}"
+                    )
+
+                workspace_lines.append(
+                    f"源文件：{len(source_files)} 个"
+                )
+
+                workspace_lines.append(
+                    f"最终交付物：{len(deliverables)} 个"
+                )
+
+                if deliverables:
+                    workspace_lines.append("")
+                    workspace_lines.append(
+                        "交付物："
+                    )
+
+                    for index, file_path in enumerate(
+                        deliverables,
+                        start=1,
+                    ):
+                        workspace_lines.append(
+                            f"{index}. {file_path}"
+                        )
+
+                workspace_lines.append("")
+                workspace_lines.append(
+                    "临时文件状态："
+                    + (
+                        "清理完成"
+                        if not failed_temp_files
+                        else "存在清理失败"
+                    )
+                )
+
+                workspace_lines.append(
+                    "本次清理临时文件："
+                    f"{len(removed_temp_files)} 个"
+                )
+
+                workspace_lines.append(
+                    "当前登记临时文件："
+                    f"{len(temporary_files)} 个"
+                )
+
+                if deliverables_dir:
+                    workspace_lines.append("")
+                    workspace_lines.append(
+                        f"交付目录：{deliverables_dir}"
+                    )
+
+                if manifest_path:
+                    workspace_lines.append(
+                        f"任务清单：{manifest_path}"
+                    )
+
+                self.workspace_output.setPlainText(
+                    "\n".join(workspace_lines)
+                )
+
+                self.workspace_label.setVisible(
+                    True
+                )
+
+                self.workspace_output.setVisible(
+                    True
+                )
+
+                self.append_log(
+                    "任务类型：DataPilot v3.7 Workspace Agent"
+                )
+
+                if task_id:
+                    self.append_log(
+                        f"Workspace 任务编号：{task_id}"
+                    )
+
+                self.append_log(
+                    f"最终交付物数量：{len(deliverables)}"
+                )
+
+            else:
+                self.append_log(
+                    "任务类型：动态 Agent Loop"
+                )
 
             self.append_log(
                 f"Agent 决策轮数：{iterations}"
@@ -1383,10 +1583,17 @@ class MainWindow(QMainWindow):
                 )
             )
 
+            workspace_deliverables_dir = ""
+
+            if isinstance(workspace, dict):
+                workspace_deliverables_dir = str(
+                    workspace.get("deliverables_dir")
+                    or ""
+                ).strip()
+
             output_dir = (
-                self.output_input
-                .text()
-                .strip()
+                workspace_deliverables_dir
+                or self.output_input.text().strip()
             )
 
             if (
@@ -1401,9 +1608,9 @@ class MainWindow(QMainWindow):
                 self,
                 "执行完成",
                 (
-                    "DataPilot v3.1 动态 Agent 已完成任务。\n"
+                    "DataPilot Workspace Agent 已完成任务。\n"
                     f"工具调用：{tool_count} 次\n"
-                    f"输出文件：{len(output_files)} 个"
+                    f"最终交付物：{len(output_files)} 个"
                 ),
             )
 
@@ -1938,10 +2145,21 @@ class MainWindow(QMainWindow):
     # ========================================================
 
     def open_output_folder(self):
+        workspace = self.result.get(
+            "workspace"
+        ) or {}
+
+        deliverables_dir = ""
+
+        if isinstance(workspace, dict):
+            deliverables_dir = str(
+                workspace.get("deliverables_dir")
+                or ""
+            ).strip()
+
         output_dir = (
-            self.output_input
-            .text()
-            .strip()
+            deliverables_dir
+            or self.output_input.text().strip()
         )
 
         if not output_dir:

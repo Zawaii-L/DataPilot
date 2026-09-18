@@ -46,7 +46,7 @@ class AgentLoopResult:
 
 class AgentLoop:
     """
-    DataPilot v3.6 Workspace 动态 Agent Loop。
+    DataPilot Workspace 动态 Agent Loop。
 
     核心循环：
         用户目标
@@ -116,8 +116,6 @@ class AgentLoop:
         self,
         message: str,
     ):
-        print(message)
-
         if self.progress_callback:
             try:
                 self.progress_callback(str(message))
@@ -125,6 +123,8 @@ class AgentLoop:
                 print(
                     f"Agent Loop 进度回调失败：{error}"
                 )
+        else:
+            print(message)
 
     def run(
         self,
@@ -143,7 +143,7 @@ class AgentLoop:
         tool_results: List[ToolExecutionResult] = []
 
         self.report_progress(
-            "DataPilot v3.6 Workspace Agent Loop 启动。"
+            "DataPilot Workspace Agent Loop 启动。"
         )
 
         for iteration in range(
@@ -648,7 +648,7 @@ class AgentLoop:
             budget_rule = ""
 
         return f"""
-你是 DataPilot v3.6 的 Workspace 动态执行 Agent。
+你是 DataPilot 的 Workspace 动态执行 Agent。
 
 你每次只能做一个决定：
 1. 调用一个真实工具；
@@ -709,7 +709,7 @@ class AgentLoop:
 42. protected_input_paths 中的文件属于受保护输入。除非用户明确要求覆盖且系统工具本身允许，否则不得把任何写入工具的 output_path 指向这些路径。
 43. 中间文件、基础表、临时下载、需要后续再次编辑的半成品，必须优先写入 runtime_context.workspace.temporary_dir；不要把半成品写入 deliverables_dir。
 44. 用户最终需要收到的 Word、Excel、CSV 或其他最终文件，必须优先写入 runtime_context.workspace.deliverables_dir。最终文件名应表达业务含义，不要使用 temp、tmp、临时、中间等名称。
-45. runtime_context.output_dir 在 v3.6 中等于本次任务 deliverables_dir。用户只说“输出到结果目录”而没有指定更具体路径时，直接在该目录下生成最终交付物。
+45. runtime_context.output_dir 等于本次任务 deliverables_dir。用户只说“输出到结果目录”而没有指定更具体路径时，直接在该目录下生成最终交付物。
 46. 如果工作流是“先生成基础文件，再编辑成最终文件”，基础文件必须进入 temporary_dir，最后一次编辑的 output_path 必须进入 deliverables_dir。
 47. 不要自行在项目根目录、源文件目录或任意未知目录创建中间文件。只有用户明确指定某个最终路径时，才可优先遵循用户指定路径；但仍不得覆盖 protected_input_paths。
 48. finish 前检查最终交付物路径。若用户要求生成文件，而最终成功写入的文件仍只有 temporary_dir 中的半成品，则任务未完成。
@@ -929,7 +929,7 @@ def main():
     根据真实 Observation 自己决定下一步。
     """
     print("=" * 70)
-    print("DataPilot v3.1 Dynamic Agent Loop")
+    print("DataPilot Workspace Agent Loop")
     print("=" * 70)
 
     working_directory = os.getcwd()
