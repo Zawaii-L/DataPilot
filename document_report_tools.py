@@ -237,3 +237,346 @@ def generate_document_summary_report(
         output_path=output_path,
         title="DataPilot 文档综合报告",
     )
+
+def _safe_int(value, default=0):
+    """将来源元数据安全转换为整数。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default=None):
+    """将来源元数据安全转换为浮点数。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_web_sources(web_sources):
+    """
+    清理并规范化确定性网络来源。
+
+    支持：
+    - HTML 网页：read_webpage
+    - 在线办公文档：download_document_file -> read_document
+
+    同一 final_url / url 只保留一次，保持首次出现顺序。
+    """
+    normalized_sources = []
+    seen_urls = set()
+
+    for source in web_sources or []:
+        if not isinstance(source, dict):
+            continue
+
+        url = str(
+            source.get("final_url")
+            or source.get("url")
+            or ""
+        ).strip()
+
+        if not url:
+            continue
+
+        key = url.lower()
+
+        if key in seen_urls:
+            continue
+
+        seen_urls.add(key)
+
+        title = str(
+            source.get("title")
+            or source.get("file_name")
+            or url
+        ).strip()
+
+        source_type = str(
+            source.get("source_type")
+            or "webpage"
+        ).strip()
+
+        read_count = _safe_int(
+            source.get("read_count"),
+            0,
+        )
+
+        unique_characters_read = _safe_int(
+            source.get("unique_characters_read"),
+            _safe_int(
+                source.get("character_count"),
+                0,
+            ),
+        )
+
+        original_character_count = _safe_int(
+            source.get("original_character_count"),
+            0,
+        )
+
+        remaining_characters = _safe_int(
+            source.get("remaining_characters"),
+            max(
+                0,
+                original_character_count
+                - unique_characters_read,
+            ),
+        )
+
+        coverage_percent = _safe_float(
+            source.get("coverage_percent"),
+            None,
+        )
+
+        if (
+            coverage_percent is None
+            and original_character_count > 0
+        ):
+            coverage_percent = round(
+                min(
+                    1.0,
+                    unique_characters_read
+                    / original_character_count,
+                )
+                * 100,
+                1,
+            )
+
+        has_more = bool(
+            source.get(
+                "has_more",
+                source.get(
+                    "truncated",
+                    False,
+                ),
+            )
+        )
+
+        normalized_sources.append(
+            {
+                "title": title,
+                "url": url,
+                "source_type": source_type,
+                "content_type": str(
+                    source.get("content_type")
+                    or ""
+                ).strip(),
+                "file_name": str(
+                    source.get("file_name")
+                    or ""
+                ).strip(),
+                "local_path": str(
+                    source.get("local_path")
+                    or ""
+                ).strip(),
+                "download_success": bool(
+                    source.get(
+                        "download_success",
+                        source_type != "online_document",
+                    )
+                ),
+                "read_success": bool(
+                    source.get(
+                        "read_success",
+                        read_count > 0,
+                    )
+                ),
+                "read_count": read_count,
+                "unique_characters_read": unique_characters_read,
+                "original_character_count": original_character_count,
+                "remaining_characters": remaining_characters,
+                "coverage_percent": coverage_percent,
+                "has_more": has_more,
+            }
+        )
+
+    return normalized_sources
+
+def append_web_sources_to_word(
+    word_path,
+    web_sources,
+    heading="资料来源",
+):
+    """
+    将 DataPilot 实际成功读取过的网络来源确定性追加到 Word 报告末尾。
+
+    支持普通 HTML 网页，以及通过 download_document_file 下载并随后
+    read_document 成功读取的在线 PDF / DOCX / TXT / Markdown 文档。
+    """
+    word_path = Path(word_path)
+
+    if not word_path.exists():
+        raise FileNotFoundError(
+            f"Word 报告不存在：{word_path}"
+        )
+
+    if word_path.suffix.lower() != ".docx":
+        raise ValueError(
+            "append_web_sources_to_word 只支持 .docx 文件。"
+        )
+
+    sources = _normalize_web_sources(
+        web_sources
+    )
+
+    if not sources:
+        return str(word_path.resolve())
+
+    document = Document(
+        str(word_path)
+    )
+
+    marker = "DataPilot-Web-Sources-Appendix"
+
+    existing_text = "\n".join(
+        paragraph.text
+        for paragraph in document.paragraphs
+    )
+
+    if marker in existing_text:
+        return str(word_path.resolve())
+
+    document.add_paragraph()
+
+    heading_paragraph = document.add_heading(
+        heading,
+        level=1,
+    )
+
+    marker_run = heading_paragraph.add_run(
+        f" [{marker}]"
+    )
+    marker_run.font.size = Pt(1)
+
+    note = document.add_paragraph(
+        "以下来源由 DataPilot 根据本次任务中实际成功执行的网络读取记录"
+        "自动生成。仅搜索但未实际读取的网页或仅下载但未读取的文档不会列入。"
+    )
+
+    if note.runs:
+        note.runs[0].italic = True
+
+    for index, source in enumerate(
+        sources,
+        start=1,
+    ):
+        title_paragraph = document.add_paragraph()
+
+        title_run = title_paragraph.add_run(
+            f"{index}. {source['title']}"
+        )
+        title_run.bold = True
+
+        document.add_paragraph(
+            f"URL：{source['url']}"
+        )
+
+        if source["source_type"] == "online_document":
+            document.add_paragraph(
+                "来源类型：在线办公文档"
+            )
+
+            if source["file_name"]:
+                document.add_paragraph(
+                    f"文件名：{source['file_name']}"
+                )
+
+            if source["content_type"]:
+                document.add_paragraph(
+                    f"文档类型：{source['content_type']}"
+                )
+
+            if source["local_path"]:
+                document.add_paragraph(
+                    f"本地文件：{source['local_path']}"
+                )
+
+            document.add_paragraph(
+                "下载状态："
+                + (
+                    "成功"
+                    if source["download_success"]
+                    else "未确认"
+                )
+            )
+
+            document.add_paragraph(
+                "读取状态："
+                + (
+                    "已实际读取"
+                    if source["read_success"]
+                    else "未确认读取"
+                )
+            )
+
+            if source["read_count"] > 0:
+                document.add_paragraph(
+                    f"读取次数：{source['read_count']}"
+                )
+
+            continue
+
+        document.add_paragraph(
+            "来源类型：HTML 网页"
+        )
+
+        read_count = source["read_count"]
+
+        if read_count > 0:
+            document.add_paragraph(
+                f"读取区段：{read_count}"
+            )
+
+        unique_characters_read = source[
+            "unique_characters_read"
+        ]
+        original_character_count = source[
+            "original_character_count"
+        ]
+
+        if original_character_count > 0:
+            document.add_paragraph(
+                "实际覆盖："
+                f"{unique_characters_read:,} / "
+                f"{original_character_count:,} 字符"
+            )
+        elif unique_characters_read > 0:
+            document.add_paragraph(
+                "实际读取："
+                f"{unique_characters_read:,} 字符"
+            )
+
+        coverage_percent = source[
+            "coverage_percent"
+        ]
+
+        if coverage_percent is not None:
+            document.add_paragraph(
+                f"覆盖率：{coverage_percent:.1f}%"
+            )
+
+        if original_character_count > 0:
+            document.add_paragraph(
+                "剩余未读："
+                f"{source['remaining_characters']:,} 字符"
+            )
+
+            document.add_paragraph(
+                "状态："
+                + (
+                    "部分读取"
+                    if source["has_more"]
+                    else "已读取完整正文"
+                )
+            )
+
+    document.save(
+        str(word_path)
+    )
+
+    return str(
+        word_path.resolve()
+    )
+

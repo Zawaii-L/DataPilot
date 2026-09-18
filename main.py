@@ -81,10 +81,10 @@ class AgentWorker(QThread):
             )
 
             self.report_progress(
-                "开始执行任务..."
+                "开始执行 v3.1 动态 Agent 任务..."
             )
 
-            result = agent.execute_task(
+            result = agent.execute_v31_agent_task(
                 user_task=self.task,
                 input_paths=self.input_paths,
                 output_dir=self.output_dir,
@@ -176,8 +176,8 @@ class MainWindow(QMainWindow):
         )
 
         subtitle_label = QLabel(
-            "用自然语言描述任务，自动完成数据处理、"
-            "办公文档阅读、跨文档总结和报告生成"
+            "v3.1 动态 Agent：用自然语言描述目标，"
+            "Agent 会逐步选择工具、观察结果并继续执行"
         )
 
         subtitle_label.setStyleSheet(
@@ -212,10 +212,9 @@ class MainWindow(QMainWindow):
         self.task_input = QTextEdit()
 
         self.task_input.setPlaceholderText(
-            "例如：请批量分析我选择的数据文件，检查数据质量，"
-            "清洗数据，生成统计图和 Word 报告。\n\n"
-            "也可以选择 Word / PDF / TXT / Markdown 文档，"
-            "让 Agent 阅读相关内容并进行跨文档综合总结。"
+            "例如：读取我选择的 Excel，按城市统计销售额合计，"
+            "并把结果导出到 outputs 目录。\n\n"
+            "DataPilot v3.1 会根据真实执行结果逐步决定下一步工具。"
         )
 
         self.task_input.setMinimumHeight(
@@ -495,6 +494,48 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(
             self.document_result_output
+        )
+
+        # ----------------------------------------------------
+        # v3.1：实际使用网页来源
+        # ----------------------------------------------------
+
+        self.web_sources_label = QLabel(
+            "本次实际使用网页来源"
+        )
+
+        self.web_sources_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+
+        self.web_sources_label.setVisible(
+            False
+        )
+
+        main_layout.addWidget(
+            self.web_sources_label
+        )
+
+        self.web_sources_output = QTextEdit()
+
+        self.web_sources_output.setReadOnly(
+            True
+        )
+
+        self.web_sources_output.setMinimumHeight(
+            120
+        )
+
+        self.web_sources_output.setPlaceholderText(
+            "联网研究任务实际成功读取过的网页来源将在这里显示。"
+        )
+
+        self.web_sources_output.setVisible(
+            False
+        )
+
+        main_layout.addWidget(
+            self.web_sources_output
         )
 
         # ----------------------------------------------------
@@ -915,6 +956,14 @@ class MainWindow(QMainWindow):
             False
         )
 
+        self.web_sources_output.clear()
+        self.web_sources_output.setVisible(
+            False
+        )
+        self.web_sources_label.setVisible(
+            False
+        )
+
         self.open_excel_button.setEnabled(
             False
         )
@@ -940,7 +989,7 @@ class MainWindow(QMainWindow):
         )
 
         self.append_log(
-            "开始执行 DataPilot 任务"
+            "开始执行 DataPilot v3.1 动态 Agent 任务"
         )
 
         self.append_log(
@@ -1017,12 +1066,352 @@ class MainWindow(QMainWindow):
         )
 
         # ----------------------------------------------------
-        # v3.0：办公文档 / 跨格式混合办公任务
+        # v3.1：动态 Agent Loop 结果
         # ----------------------------------------------------
 
         task_type = self.result.get(
             "task_type"
         )
+
+        if task_type == "v3_1_agent_loop":
+            final_answer = (
+                self.result.get("final_answer")
+                or self.result.get("answer")
+                or ""
+            )
+
+            iterations = self.result.get(
+                "iterations",
+                0,
+            )
+
+            tool_count = self.result.get(
+                "tool_count",
+                0,
+            )
+
+            stop_reason = self.result.get(
+                "stop_reason",
+                "",
+            )
+
+            output_files = self.result.get(
+                "output_files",
+                [],
+            ) or []
+
+            self.append_log(
+                "任务类型：v3.1 动态 Agent Loop"
+            )
+
+            self.append_log(
+                f"Agent 决策轮数：{iterations}"
+            )
+
+            self.append_log(
+                f"实际工具调用数量：{tool_count}"
+            )
+
+            self.append_log(
+                f"停止原因：{stop_reason}"
+            )
+
+            web_sources = self.result.get(
+                "web_sources",
+                [],
+            ) or []
+
+            if web_sources:
+                source_lines = []
+                valid_source_count = 0
+
+                for source in web_sources:
+                    if not isinstance(source, dict):
+                        continue
+
+                    valid_source_count += 1
+
+                    title = str(
+                        source.get("title")
+                        or source.get("final_url")
+                        or source.get("url")
+                        or "未命名网页"
+                    ).strip()
+
+                    url = str(
+                        source.get("final_url")
+                        or source.get("url")
+                        or ""
+                    ).strip()
+
+                    try:
+                        read_count = int(
+                            source.get("read_count")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        read_count = 0
+
+                    try:
+                        unique_characters_read = int(
+                            source.get(
+                                "unique_characters_read"
+                            )
+                            or source.get(
+                                "character_count"
+                            )
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        unique_characters_read = 0
+
+                    try:
+                        original_character_count = int(
+                            source.get(
+                                "original_character_count"
+                            )
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        original_character_count = 0
+
+                    try:
+                        remaining_characters = int(
+                            source.get(
+                                "remaining_characters"
+                            )
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        remaining_characters = 0
+
+                    coverage_percent = source.get(
+                        "coverage_percent"
+                    )
+
+                    if coverage_percent is None:
+                        if original_character_count > 0:
+                            coverage_percent = round(
+                                (
+                                    unique_characters_read
+                                    / original_character_count
+                                )
+                                * 100,
+                                1,
+                            )
+                    else:
+                        try:
+                            coverage_percent = float(
+                                coverage_percent
+                            )
+                        except (TypeError, ValueError):
+                            coverage_percent = None
+
+                    has_more = bool(
+                        source.get(
+                            "has_more",
+                            source.get(
+                                "truncated",
+                                False,
+                            ),
+                        )
+                    )
+
+                    source_lines.append(
+                        f"{valid_source_count}. {title}"
+                    )
+
+                    if read_count > 0:
+                        source_lines.append(
+                            f"   读取区段：{read_count}"
+                        )
+
+                    if original_character_count > 0:
+                        source_lines.append(
+                            "   实际覆盖："
+                            f"{unique_characters_read:,} / "
+                            f"{original_character_count:,} 字符"
+                        )
+                    elif unique_characters_read > 0:
+                        source_lines.append(
+                            "   实际读取："
+                            f"{unique_characters_read:,} 字符"
+                        )
+
+                    if coverage_percent is not None:
+                        source_lines.append(
+                            "   覆盖率："
+                            f"{coverage_percent:.1f}%"
+                        )
+
+                    if original_character_count > 0:
+                        source_lines.append(
+                            "   剩余未读："
+                            f"{remaining_characters:,} 字符"
+                        )
+
+                        source_lines.append(
+                            "   状态："
+                            + (
+                                "部分读取"
+                                if has_more
+                                else "已读取完整正文"
+                            )
+                        )
+
+                    if url:
+                        source_lines.append(
+                            f"   {url}"
+                        )
+
+                    source_lines.append("")
+
+                if source_lines and valid_source_count > 0:
+                    self.web_sources_label.setText(
+                        "本次实际使用网页来源"
+                        f"（{valid_source_count}）"
+                    )
+
+                    self.web_sources_output.setPlainText(
+                        "\n".join(
+                            source_lines
+                        ).rstrip()
+                    )
+
+                    self.web_sources_label.setVisible(
+                        True
+                    )
+
+                    self.web_sources_output.setVisible(
+                        True
+                    )
+
+                    self.append_log(
+                        "实际读取网页来源数量："
+                        f"{valid_source_count}"
+                    )
+
+            if final_answer:
+                self.document_result_label.setText(
+                    "Agent 最终结果"
+                )
+
+                self.document_result_output.setPlainText(
+                    final_answer
+                )
+
+                self.document_result_label.setVisible(
+                    True
+                )
+
+                self.document_result_output.setVisible(
+                    True
+                )
+
+            added_paths = set()
+
+            for file_path in output_files:
+                if not isinstance(file_path, str):
+                    continue
+
+                if not os.path.exists(file_path):
+                    continue
+
+                normalized_path = os.path.normcase(
+                    os.path.abspath(file_path)
+                )
+
+                if normalized_path in added_paths:
+                    continue
+
+                added_paths.add(normalized_path)
+
+                self.result_list.addItem(
+                    f"Agent 输出：{file_path}"
+                )
+
+                self.append_log(
+                    f"Agent 输出文件：{file_path}"
+                )
+
+                suffix = os.path.splitext(
+                    file_path
+                )[1].lower()
+
+                if (
+                    suffix in {".xlsx", ".xls", ".csv"}
+                    and not self.result.get("excel_path")
+                ):
+                    self.result["excel_path"] = file_path
+
+                elif (
+                    suffix == ".docx"
+                    and not self.result.get("word_path")
+                ):
+                    self.result["word_path"] = file_path
+
+                elif (
+                    suffix in {".png", ".jpg", ".jpeg"}
+                    and not self.result.get("chart_path")
+                ):
+                    self.result["chart_path"] = file_path
+
+            self.open_excel_button.setEnabled(
+                self.is_valid_result_file(
+                    "excel_path"
+                )
+            )
+
+            self.open_statistics_button.setEnabled(
+                self.is_valid_result_file(
+                    "statistics_path"
+                )
+            )
+
+            self.open_chart_button.setEnabled(
+                self.is_valid_result_file(
+                    "chart_path"
+                )
+                or self.is_valid_result_file(
+                    "plot_path"
+                )
+            )
+
+            self.open_word_button.setEnabled(
+                self.is_valid_result_file(
+                    "word_path"
+                )
+            )
+
+            output_dir = (
+                self.output_input
+                .text()
+                .strip()
+            )
+
+            if (
+                output_dir
+                and os.path.isdir(output_dir)
+            ):
+                self.open_output_button.setEnabled(
+                    True
+                )
+
+            QMessageBox.information(
+                self,
+                "执行完成",
+                (
+                    "DataPilot v3.1 动态 Agent 已完成任务。\n"
+                    f"工具调用：{tool_count} 次\n"
+                    f"输出文件：{len(output_files)} 个"
+                ),
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # v3.0：办公文档 / 跨格式混合办公任务
+        # ----------------------------------------------------
 
         if task_type in {
             "document_task",

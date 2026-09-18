@@ -24,7 +24,12 @@ from document_tools import (
     scan_document_files,
 )
 from document_selector import select_documents_with_llm
-from document_report_tools import generate_document_summary_report
+from document_report_tools import (
+    generate_document_summary_report,
+    append_web_sources_to_word,
+)
+
+from agent_loop import AgentLoop
 
 from office_data_tools import (
     read_office_data,
@@ -4677,6 +4682,693 @@ JSON 格式：
                     "synthesize_documents",
                     "generate_document_word_report",
                 ],
+            },
+        }
+
+
+    # ============================================================
+    # v3.1：动态 Agent Loop 入口
+    # ============================================================
+
+    def build_v31_runtime_context(
+        self,
+        input_paths=None,
+        file_path=None,
+        output_dir="outputs",
+    ) -> Dict[str, Any]:
+        """
+        为 v3.1 Agent Loop 构造运行时上下文。
+        """
+        normalized_paths = self.normalize_input_paths(
+            input_paths=input_paths,
+            file_path=file_path,
+        )
+
+        output_path = Path(output_dir)
+
+        if not output_path.is_absolute():
+            output_path = Path.cwd() / output_path
+
+        output_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        return {
+            "working_directory": str(Path.cwd().resolve()),
+            "input_paths": normalized_paths,
+            "output_dir": str(output_path.resolve()),
+        }
+
+    def execute_v31_agent_task(
+        self,
+        user_task: str,
+        input_paths=None,
+        file_path=None,
+        output_dir="outputs",
+        max_iterations: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        使用 v3.1 动态 Agent Loop 执行任务。
+
+        v3.0 原有 execute_task() 保持不变，
+        避免破坏已经封版的旧流程。
+        """
+        task = str(user_task or "").strip()
+
+        if not task:
+            raise ValueError("用户任务不能为空。")
+
+        runtime_context = self.build_v31_runtime_context(
+            input_paths=input_paths,
+            file_path=file_path,
+            output_dir=output_dir,
+        )
+
+        self.report_progress(
+            "已切换到 DataPilot v3.1 动态执行模式。"
+        )
+
+        loop = AgentLoop(
+            progress_callback=self.progress_callback,
+            client=self.client,
+            model=self.model,
+            max_iterations=max_iterations,
+        )
+
+        loop_result = loop.run(
+            task,
+            context=runtime_context,
+        )
+
+        output_files = []
+
+        for tool_result in loop_result.tool_results:
+            if not tool_result.success:
+                continue
+
+            output = tool_result.output
+
+            if isinstance(output, (str, Path)):
+                candidate = Path(str(output))
+
+                try:
+                    if candidate.exists() and candidate.is_file():
+                        resolved = str(candidate.resolve())
+
+                        if resolved not in output_files:
+                            output_files.append(resolved)
+                except Exception:
+                    pass
+
+            elif isinstance(output, dict):
+                for key, value in output.items():
+                    key_text = str(key).lower()
+
+                    if not any(
+                        token in key_text
+                        for token in [
+                            "path",
+                            "file",
+                            "excel",
+                            "word",
+                            "chart",
+                            "plot",
+                        ]
+                    ):
+                        continue
+
+                    if not isinstance(value, (str, Path)):
+                        continue
+
+                    try:
+                        candidate = Path(str(value))
+
+                        if candidate.exists() and candidate.is_file():
+                            resolved = str(candidate.resolve())
+
+                            if resolved not in output_files:
+                                output_files.append(resolved)
+                    except Exception:
+                        continue
+
+        source_files = runtime_context.get(
+            "input_paths",
+            [],
+        )
+
+        # --------------------------------------------------------
+        # v3.1：确定性收集实际成功读取过的网络来源
+        # --------------------------------------------------------
+        #
+        # 两类来源：
+        # 1. HTML：成功执行 read_webpage 才计入；
+        # 2. 在线办公文档：必须先成功 download_document_file，
+        #    且下载得到的本地路径随后确实被 read_document 成功读取，
+        #    才计入来源。
+        #
+        # search_web 结果不计入来源；仅下载但未读取的文档也不计入。
+        web_source_map = {}
+        web_source_order = []
+
+        successful_document_downloads = {}
+        successful_document_reads = {}
+
+        for tool_result in loop_result.tool_results:
+            if not tool_result.success:
+                continue
+
+            tool_name = str(
+                getattr(tool_result, "tool_name", "")
+                or ""
+            )
+
+            output = tool_result.output
+
+            if tool_name == "download_document_file":
+                if not isinstance(output, (str, Path)):
+                    continue
+
+                try:
+                    local_path = str(
+                        Path(str(output)).resolve()
+                    )
+                except Exception:
+                    local_path = str(output)
+
+                input_args = getattr(
+                    tool_result,
+                    "input_args",
+                    None,
+                )
+
+                if not isinstance(input_args, dict):
+                    input_args = getattr(
+                        tool_result,
+                        "arguments",
+                        {},
+                    )
+
+                if not isinstance(input_args, dict):
+                    input_args = {}
+
+                url = str(
+                    input_args.get("url")
+                    or ""
+                ).strip()
+
+                if not url:
+                    continue
+
+                successful_document_downloads[
+                    os.path.normcase(local_path)
+                ] = {
+                    "url": url,
+                    "local_path": local_path,
+                }
+
+            elif tool_name == "read_document":
+                input_args = getattr(
+                    tool_result,
+                    "input_args",
+                    None,
+                )
+
+                if not isinstance(input_args, dict):
+                    input_args = getattr(
+                        tool_result,
+                        "arguments",
+                        {},
+                    )
+
+                if not isinstance(input_args, dict):
+                    input_args = {}
+
+                file_path_value = str(
+                    input_args.get("file_path")
+                    or ""
+                ).strip()
+
+                if not file_path_value:
+                    continue
+
+                try:
+                    local_path = str(
+                        Path(file_path_value).resolve()
+                    )
+                except Exception:
+                    local_path = file_path_value
+
+                successful_document_reads[
+                    os.path.normcase(local_path)
+                ] = (
+                    successful_document_reads.get(
+                        os.path.normcase(local_path),
+                        0,
+                    )
+                    + 1
+                )
+
+        for tool_result in loop_result.tool_results:
+            if not tool_result.success:
+                continue
+
+            tool_name = str(
+                getattr(tool_result, "tool_name", "")
+                or ""
+            )
+
+            output = tool_result.output
+
+            if tool_name == "read_webpage":
+                if not isinstance(output, dict):
+                    continue
+
+                final_url = str(
+                    output.get("final_url")
+                    or output.get("url")
+                    or ""
+                ).strip()
+
+                if not final_url:
+                    continue
+
+                source_key = final_url.lower()
+
+                if source_key not in web_source_map:
+                    web_source_map[source_key] = {
+                        "source_type": "webpage",
+                        "title": str(
+                            output.get("title")
+                            or final_url
+                        ).strip(),
+                        "url": str(
+                            output.get("url")
+                            or final_url
+                        ).strip(),
+                        "final_url": final_url,
+                        "content_type": str(
+                            output.get("content_type")
+                            or ""
+                        ).strip(),
+                        "character_count": 0,
+                        "original_character_count": None,
+                        "read_count": 0,
+                        "read_ranges": [],
+                        "unique_characters_read": 0,
+                        "coverage_ratio": None,
+                        "coverage_percent": None,
+                        "remaining_characters": None,
+                        "has_more": False,
+                        "truncated": False,
+                        "download_success": False,
+                        "read_success": True,
+                    }
+                    web_source_order.append(source_key)
+
+                source = web_source_map[source_key]
+
+                title = str(
+                    output.get("title")
+                    or ""
+                ).strip()
+
+                if title:
+                    source["title"] = title
+
+                content_type = str(
+                    output.get("content_type")
+                    or ""
+                ).strip()
+
+                if content_type:
+                    source["content_type"] = content_type
+
+                try:
+                    character_count = int(
+                        output.get("character_count")
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    character_count = 0
+
+                source["character_count"] += max(
+                    character_count,
+                    0,
+                )
+                source["read_count"] += 1
+
+                try:
+                    original_character_count = int(
+                        output.get(
+                            "original_character_count"
+                        )
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    original_character_count = 0
+
+                if original_character_count > 0:
+                    source["original_character_count"] = max(
+                        source.get(
+                            "original_character_count"
+                        )
+                        or 0,
+                        original_character_count,
+                    )
+
+                try:
+                    start_character = int(
+                        output.get("start_character")
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    start_character = 0
+
+                try:
+                    end_character = int(
+                        output.get("end_character")
+                        if output.get("end_character")
+                        is not None
+                        else (
+                            start_character
+                            + max(character_count, 0)
+                        )
+                    )
+                except (TypeError, ValueError):
+                    end_character = (
+                        start_character
+                        + max(character_count, 0)
+                    )
+
+                start_character = max(
+                    start_character,
+                    0,
+                )
+                end_character = max(
+                    end_character,
+                    start_character,
+                )
+
+                source["read_ranges"].append(
+                    {
+                        "start_character": start_character,
+                        "end_character": end_character,
+                        "character_count": max(
+                            end_character
+                            - start_character,
+                            0,
+                        ),
+                    }
+                )
+
+                source["truncated"] = bool(
+                    source["truncated"]
+                    or output.get(
+                        "truncated",
+                        False,
+                    )
+                )
+
+        # 将“成功下载 + 随后成功 read_document”的在线文档
+        # 转换成确定性网络来源。
+        for path_key, download_info in (
+            successful_document_downloads.items()
+        ):
+            read_count = successful_document_reads.get(
+                path_key,
+                0,
+            )
+
+            if read_count <= 0:
+                continue
+
+            url = str(
+                download_info.get("url")
+                or ""
+            ).strip()
+
+            local_path = str(
+                download_info.get("local_path")
+                or ""
+            ).strip()
+
+            if not url or not local_path:
+                continue
+
+            source_key = url.lower()
+
+            file_path_object = Path(local_path)
+            extension = file_path_object.suffix.lower()
+
+            content_type_map = {
+                ".pdf": "application/pdf",
+                ".docx": (
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                ".txt": "text/plain",
+                ".md": "text/markdown",
+            }
+
+            if source_key not in web_source_map:
+                web_source_map[source_key] = {
+                    "source_type": "online_document",
+                    "title": file_path_object.name,
+                    "file_name": file_path_object.name,
+                    "url": url,
+                    "final_url": url,
+                    "content_type": content_type_map.get(
+                        extension,
+                        extension.lstrip("."),
+                    ),
+                    "local_path": local_path,
+                    "download_success": True,
+                    "read_success": True,
+                    "read_count": read_count,
+                    "character_count": 0,
+                    "original_character_count": None,
+                    "read_ranges": [],
+                    "unique_characters_read": 0,
+                    "coverage_ratio": None,
+                    "coverage_percent": None,
+                    "remaining_characters": None,
+                    "has_more": False,
+                    "truncated": False,
+                }
+                web_source_order.append(source_key)
+
+        web_sources = []
+
+        for source_key in web_source_order:
+            source = web_source_map[source_key]
+
+            if source.get("source_type") == "online_document":
+                web_sources.append(source)
+                continue
+
+            intervals = sorted(
+                [
+                    (
+                        int(item["start_character"]),
+                        int(item["end_character"]),
+                    )
+                    for item in source["read_ranges"]
+                    if (
+                        isinstance(item, dict)
+                        and int(
+                            item.get("end_character", 0)
+                        )
+                        > int(
+                            item.get("start_character", 0)
+                        )
+                    )
+                ],
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                ),
+            )
+
+            merged_intervals = []
+
+            for (
+                start_character,
+                end_character,
+            ) in intervals:
+                if (
+                    not merged_intervals
+                    or start_character
+                    > merged_intervals[-1][1]
+                ):
+                    merged_intervals.append(
+                        [
+                            start_character,
+                            end_character,
+                        ]
+                    )
+                else:
+                    merged_intervals[-1][1] = max(
+                        merged_intervals[-1][1],
+                        end_character,
+                    )
+
+            unique_characters_read = sum(
+                end_character - start_character
+                for (
+                    start_character,
+                    end_character,
+                ) in merged_intervals
+            )
+
+            source["unique_characters_read"] = (
+                unique_characters_read
+            )
+
+            original_character_count = (
+                source.get(
+                    "original_character_count"
+                )
+                or 0
+            )
+
+            if original_character_count > 0:
+                coverage_ratio = min(
+                    unique_characters_read
+                    / original_character_count,
+                    1.0,
+                )
+
+                source["coverage_ratio"] = round(
+                    coverage_ratio,
+                    6,
+                )
+                source["coverage_percent"] = round(
+                    coverage_ratio * 100,
+                    1,
+                )
+                source["remaining_characters"] = max(
+                    original_character_count
+                    - unique_characters_read,
+                    0,
+                )
+                source["has_more"] = (
+                    unique_characters_read
+                    < original_character_count
+                )
+            else:
+                source["has_more"] = bool(
+                    source.get(
+                        "truncated",
+                        False,
+                    )
+                )
+
+            web_sources.append(source)
+
+        # --------------------------------------------------------
+        # v3.1：将真实网络来源确定性追加到本次生成的 Word 报告
+        # --------------------------------------------------------
+        #
+        # 只有同时满足以下条件才处理：
+        # 1. 本次确实成功读取过网页；
+        # 2. Agent Loop 本次确实生成了 .docx 文件；
+        # 3. Word 文件真实存在。
+        #
+        # 来源附录完全基于上面由 Python 从成功 read_webpage
+        # 工具结果中构建的 web_sources，不依赖 LLM 自己在正文中
+        # 声明来源，因此 search_web 但未实际读取的结果不会进入附录。
+        web_source_append_results = []
+
+        if web_sources:
+            for output_file in output_files:
+                try:
+                    output_path = Path(str(output_file))
+
+                    if (
+                        output_path.suffix.lower() != ".docx"
+                        or not output_path.exists()
+                        or not output_path.is_file()
+                    ):
+                        continue
+
+                    self.report_progress(
+                        "正在向 Word 报告追加确定性网络来源附录："
+                        f"{output_path.name}"
+                    )
+
+                    updated_word_path = append_web_sources_to_word(
+                        word_path=output_path,
+                        web_sources=web_sources,
+                    )
+
+                    web_source_append_results.append(
+                        {
+                            "success": True,
+                            "word_path": str(
+                                Path(updated_word_path).resolve()
+                            ),
+                            "source_count": len(web_sources),
+                        }
+                    )
+
+                    self.report_progress(
+                        "网络来源附录已写入 Word："
+                        f"{updated_word_path}"
+                    )
+
+                except Exception as error:
+                    web_source_append_results.append(
+                        {
+                            "success": False,
+                            "word_path": str(output_file),
+                            "source_count": len(web_sources),
+                            "error": (
+                                f"{type(error).__name__}: {error}"
+                            ),
+                        }
+                    )
+
+                    self.report_progress(
+                        "Word 网络来源附录追加失败，"
+                        "主任务结果仍然保留："
+                        f"{type(error).__name__}: {error}"
+                    )
+
+        self.report_progress(
+            "DataPilot v3.1 动态执行结束。"
+        )
+
+        return {
+            "success": loop_result.success,
+            "task": task,
+            "task_type": "v3_1_agent_loop",
+            "is_v31_agent": True,
+            "is_batch": len(source_files) > 1,
+            "is_office_task": False,
+            "source_files": source_files,
+            "file_count": len(source_files),
+            "web_sources": web_sources,
+            "web_source_count": len(web_sources),
+            "web_source_append_results": (
+                web_source_append_results
+            ),
+            "output_dir": runtime_context.get("output_dir"),
+            "output_files": output_files,
+            "final_answer": loop_result.final_answer,
+            "answer": loop_result.final_answer,
+            "stop_reason": loop_result.stop_reason,
+            "iterations": loop_result.iterations,
+            "tool_count": len(loop_result.tool_results),
+            "tool_results": [
+                item.to_dict()
+                for item in loop_result.tool_results
+            ],
+            "decisions": loop_result.decisions,
+            "runtime_context": runtime_context,
+            "plan": {
+                "task_type": "v3_1_agent_loop",
+                "description": "DataPilot v3.1 动态工具执行",
             },
         }
 
