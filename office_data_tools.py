@@ -7,9 +7,21 @@ import pandas as pd
 # 1. 读取办公数据文件
 # ============================================================
 
-def read_office_data(file_path):
+def read_office_data(
+    file_path,
+    sheet_name=None,
+):
     """
     读取 CSV / XLSX / XLS 文件。
+
+    参数：
+    - file_path：数据文件路径。
+    - sheet_name：Excel 工作表名称或索引。
+      不传时默认读取第一个工作表。
+
+    这样 Agent 在发现一个 Excel 含有“说明”“审核记录”
+    等辅助工作表时，可以继续读取这些工作表中的业务证据，
+    而不是只能读取第一个数据 Sheet。
     """
     file_path = Path(file_path)
 
@@ -21,6 +33,12 @@ def read_office_data(file_path):
     suffix = file_path.suffix.lower()
 
     if suffix == ".csv":
+        if sheet_name is not None:
+            raise ValueError(
+                "CSV 文件没有工作表，"
+                "读取 CSV 时请不要提供 sheet_name。"
+            )
+
         try:
             return pd.read_csv(
                 file_path,
@@ -33,9 +51,22 @@ def read_office_data(file_path):
             )
 
     if suffix in [".xlsx", ".xls"]:
-        return pd.read_excel(
-            file_path
+        selected_sheet = (
+            0
+            if sheet_name is None
+            else sheet_name
         )
+
+        try:
+            return pd.read_excel(
+                file_path,
+                sheet_name=selected_sheet,
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"无法读取 Excel 工作表 "
+                f"{sheet_name!r}：{error}"
+            ) from error
 
     raise ValueError(
         f"暂不支持该文件格式：{suffix}"

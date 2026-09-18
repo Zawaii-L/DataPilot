@@ -386,10 +386,7 @@ def create_default_tool_registry() -> ToolRegistry:
 
     from data_tools import run_data_pipeline
     from batch_data_tools import run_batch_pipeline
-    from web_data_tools import (
-        download_data_file,
-        download_document_file,
-    )
+    from web_data_tools import download_data_file
     from web_search_tools import search_web, read_webpage
     from office_report_tools import generate_office_deliverables
     from file_discovery_tools import (
@@ -490,95 +487,6 @@ def create_default_tool_registry() -> ToolRegistry:
         returns="文档完整文本",
     )
 
-    registry.register(
-        "apply_word_edits",
-        apply_word_edits,
-        (
-            "对现有 DOCX Word 文件执行一个或多个确定性编辑操作，并另存为新文件。"
-            "适用于用户要求修改已有 Word，例如全文替换、整段替换、追加段落、"
-            "删除段落、修改表格单元格。"
-            "默认禁止覆盖源文件。"
-            "当任务要求修改现有 Word 时，通常先使用 read_document 理解原文，"
-            "再调用本工具；编辑完成后，应优先再次使用 read_document 读取"
-            "本工具返回的 output_path，核对修改结果后再 finish。"
-        ),
-        category="document",
-        parameters={
-            "file_path": (
-                "需要编辑的本地 DOCX 文件路径。"
-                "如果来自在线 Word，应先 download_document_file，"
-                "再通过 $ref 传入下载后的本地路径。"
-            ),
-            "operations": (
-                "编辑操作列表。每项必须包含 action。支持："
-                "replace_text（old_text, new_text, include_tables 可选）；"
-                "replace_paragraph（search_text, new_text, match_mode 可选，"
-                "replace_all 可选）；"
-                "append_paragraph（text, style 可选）；"
-                "delete_paragraphs（search_text, match_mode 可选，delete_all 可选）；"
-                "update_table_cell（table_index, row_index, column_index, new_text）。"
-                "表格索引、行索引、列索引均从 0 开始。"
-            ),
-            "output_path": (
-                "可选的新 DOCX 输出路径。"
-                "通常省略，让工具自动生成 *_DataPilot编辑.docx；"
-                "不得与源文件路径相同。"
-            ),
-        },
-        returns=(
-            "Word 编辑结果字典，包含 success、source_path、output_path、"
-            "operation_count 和 operations。"
-            "后续应把 output_path 通过 $ref 交给 read_document 做结果核验。"
-        ),
-    )
-
-    registry.register(
-        "apply_excel_edits",
-        apply_excel_edits,
-        (
-            "对现有 XLSX Excel 工作簿执行一个或多个确定性编辑操作，并另存为新文件。"
-            "适用于用户要求修改已有 Excel，例如批量替换值、新增或删除字段、"
-            "重命名字段、排序、去重、填充缺失值、追加数据行和修改指定单元格。"
-            "每个操作都可以通过 sheet_name 指定工作表；未修改的其他 Sheet 会保留。"
-            "默认禁止覆盖源文件。"
-            "当任务要求修改已有 Excel 时，应先使用 inspect_data_files 或 "
-            "read_office_data 理解原文件结构和数据，再调用本工具；编辑完成后，"
-            "应再次读取或检查本工具返回的 output_path，核对修改结果后再 finish。"
-        ),
-        category="document",
-        parameters={
-            "file_path": (
-                "需要编辑的本地 .xlsx 文件路径。"
-                "当前编辑层只支持 .xlsx；如果来自在线 Excel，应先下载到本地。"
-            ),
-            "operations": (
-                "编辑操作列表，每项必须包含 action，可单独指定 sheet_name。"
-                "支持：replace_values（old_value, new_value, column 可选）；"
-                "add_column（column_name, value 或 values）；"
-                "delete_columns（columns）；"
-                "rename_columns（rename_map）；"
-                "sort_rows（column, ascending 可选）；"
-                "delete_duplicate_rows（columns 可选, keep 可选）；"
-                "fill_missing_values（columns 可选, fill_value 可选）；"
-                "append_rows（rows）；"
-                "update_cell（row, column_name 或 column, value）。"
-                "update_cell 的 Excel 数据行 row 从 2 开始，因为第 1 行是表头；"
-                "column 数字索引从 1 开始。"
-            ),
-            "output_path": (
-                "可选的新 .xlsx 输出路径。"
-                "通常省略，让工具自动生成 *_DataPilot编辑.xlsx；"
-                "不得与源文件路径相同。"
-            ),
-        },
-        returns=(
-            "Excel 编辑结果字典，包含 success、source_path、output_path、"
-            "sheet_names、operation_count 和 operations。"
-            "后续应使用 output_path 再次读取或检查新 Excel，"
-            "确认编辑结果后再结束任务。"
-        ),
-    )
-
     # ------------------------------------------------------------
     # 数据读取 / 清洗 /统计
     # ------------------------------------------------------------
@@ -586,10 +494,20 @@ def create_default_tool_registry() -> ToolRegistry:
     registry.register(
         "read_office_data",
         read_office_data,
-        "读取单个 CSV / Excel 数据文件为 DataFrame。",
+        (
+            "读取单个 CSV / Excel 数据文件为 DataFrame。"
+            "Excel 可通过 sheet_name 指定要读取的工作表；"
+            "当审核状态、说明、备注等业务证据位于其他 Sheet 时，"
+            "应读取对应 Sheet 后再做数据源判断。"
+        ),
         category="data",
         parameters={
             "file_path": "CSV / Excel 文件路径",
+            "sheet_name": (
+                "可选。Excel 工作表名称或索引；"
+                "不传时默认读取第一个工作表。"
+                "CSV 不支持该参数。"
+            ),
         },
         returns="pandas DataFrame",
     )
@@ -778,6 +696,76 @@ def create_default_tool_registry() -> ToolRegistry:
     )
 
     # ------------------------------------------------------------
+    # 高保真 Office 编辑
+    # ------------------------------------------------------------
+
+    registry.register(
+        "apply_word_edits",
+        apply_word_edits,
+        (
+            "在现有 .docx Word 文件基础上执行高保真批量编辑并另存新文件。"
+            "当用户要求修改、更新、同步已有 Word 时优先使用本工具，"
+            "不要用重新生成整份报告替代原文档编辑。"
+            "支持 replace_text、replace_paragraph、append_paragraph、"
+            "delete_paragraphs、update_table_cell。"
+        ),
+        category="office_edit",
+        parameters={
+            "file_path": "需要编辑的源 Word .docx 文件路径",
+            "operations": (
+                "编辑操作列表。每项必须包含 action 及该 action 所需参数；"
+                "replace_text 可含 old_text/new_text/include_tables；"
+                "delete_paragraphs 可含 search_text/match_mode/delete_all；"
+                "append_paragraph 使用 text；update_table_cell 使用 table_index、"
+                "row_index、column_index、new_text。"
+            ),
+            "output_path": (
+                "可选的新 Word 输出路径；不传时自动另存，默认不覆盖源文件。"
+            ),
+        },
+        returns=(
+            "编辑结果字典，包含 success、source_path、output_path、"
+            "operation_count、operations。"
+        ),
+    )
+
+    registry.register(
+        "apply_excel_edits",
+        apply_excel_edits,
+        (
+            "在现有 .xlsx 工作簿基础上执行高保真批量编辑并另存新文件。"
+            "当用户要求修改、更新、同步已有 Excel 时优先使用本工具；"
+            "未操作的其他 Sheet 会保留。"
+            "支持 replace_values、add_column、delete_columns、rename_columns、"
+            "sort_rows、delete_duplicate_rows、fill_missing_values、append_rows、"
+            "update_cell。注意：Excel 值替换属于本工具的 replace_values action，"
+            "不是一个单独注册的 replace_values 工具。"
+        ),
+        category="office_edit",
+        parameters={
+            "file_path": "需要编辑的源 Excel .xlsx 文件路径",
+            "operations": (
+                "编辑操作列表。每项包含 action，可单独指定 sheet_name。"
+                "replace_values：old_value、new_value，可选 column；"
+                "add_column：必须使用 column_name 指定新列名，并使用 value 为所有数据行填同一值，或使用 values 传入与数据行数一致的列表；注意参数名是 column_name，不是 column；"
+                "delete_columns：columns；rename_columns：rename_map；"
+                "sort_rows：column、ascending，可选 header_row；"
+                "delete_duplicate_rows：可选 columns、keep；"
+                "fill_missing_values：column、value；append_rows：rows；"
+                "update_cell：cell 或 row/column 与 value（以工具实际支持参数为准）。"
+                "output_path 必须与 file_path 不同；本工具默认禁止直接覆盖源 Excel。"
+            ),
+            "output_path": (
+                "可选的新 Excel 输出路径；不传时自动另存，默认不覆盖源文件。"
+            ),
+        },
+        returns=(
+            "编辑结果字典，包含 success、source_path、output_path、sheet_names、"
+            "operation_count、operations。"
+        ),
+    )
+
+    # ------------------------------------------------------------
     # 原有完整 Pipeline
     # ------------------------------------------------------------
 
@@ -871,35 +859,6 @@ def create_default_tool_registry() -> ToolRegistry:
         returns="下载后的本地文件路径",
     )
 
-    registry.register(
-        "download_document_file",
-        download_document_file,
-        (
-            "从明确的 http/https 文件 URL 下载 PDF、DOCX、TXT 或 Markdown "
-            "办公文档到本地。"
-            "当用户提供的是在线 PDF/Word/文本文件，而不是普通 HTML 网页时，"
-            "应先使用本工具下载，再把返回的本地路径交给 read_document。"
-            "不要使用 read_webpage 直接解析 PDF、DOCX 等二进制文件。"
-        ),
-        category="web",
-        parameters={
-            "url": "需要下载的 PDF / DOCX / TXT / Markdown 完整 URL",
-            "output_dir": (
-                "保存目录，通常使用 runtime_context 中的 output_dir "
-                "下的 downloads 目录；默认 outputs/downloads"
-            ),
-            "file_name": (
-                "可选，自定义保存文件名；通常无需填写，"
-                "工具会根据 URL、Content-Disposition 和 Content-Type 自动判断"
-            ),
-            "timeout": "请求超时秒数，默认 30",
-        },
-        returns=(
-            "下载后的本地文档绝对路径。"
-            "下一步通常把这个路径通过 $ref 传给 read_document 的 file_path。"
-        ),
-    )
-
     # ------------------------------------------------------------
     # 输出
     # ------------------------------------------------------------
@@ -989,7 +948,7 @@ def main():
     summary = registry.summary()
 
     print("=" * 70)
-    print("DataPilot v3.2 Tool Registry")
+    print("DataPilot v3.1 Tool Registry")
     print("=" * 70)
     print(f"已注册工具数量：{summary['tool_count']}")
     print("工具类别：", ", ".join(summary["categories"]))
