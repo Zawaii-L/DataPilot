@@ -404,6 +404,8 @@ def create_default_tool_registry() -> ToolRegistry:
     from document_report_tools import (
         generate_document_summary_report,
     )
+    from word_edit_tools import apply_word_edits
+    from excel_edit_tools import apply_excel_edits
     from office_data_tools import (
         apply_filters,
         create_pivot_summary,
@@ -486,6 +488,95 @@ def create_default_tool_registry() -> ToolRegistry:
             "file_path": "文档路径",
         },
         returns="文档完整文本",
+    )
+
+    registry.register(
+        "apply_word_edits",
+        apply_word_edits,
+        (
+            "对现有 DOCX Word 文件执行一个或多个确定性编辑操作，并另存为新文件。"
+            "适用于用户要求修改已有 Word，例如全文替换、整段替换、追加段落、"
+            "删除段落、修改表格单元格。"
+            "默认禁止覆盖源文件。"
+            "当任务要求修改现有 Word 时，通常先使用 read_document 理解原文，"
+            "再调用本工具；编辑完成后，应优先再次使用 read_document 读取"
+            "本工具返回的 output_path，核对修改结果后再 finish。"
+        ),
+        category="document",
+        parameters={
+            "file_path": (
+                "需要编辑的本地 DOCX 文件路径。"
+                "如果来自在线 Word，应先 download_document_file，"
+                "再通过 $ref 传入下载后的本地路径。"
+            ),
+            "operations": (
+                "编辑操作列表。每项必须包含 action。支持："
+                "replace_text（old_text, new_text, include_tables 可选）；"
+                "replace_paragraph（search_text, new_text, match_mode 可选，"
+                "replace_all 可选）；"
+                "append_paragraph（text, style 可选）；"
+                "delete_paragraphs（search_text, match_mode 可选，delete_all 可选）；"
+                "update_table_cell（table_index, row_index, column_index, new_text）。"
+                "表格索引、行索引、列索引均从 0 开始。"
+            ),
+            "output_path": (
+                "可选的新 DOCX 输出路径。"
+                "通常省略，让工具自动生成 *_DataPilot编辑.docx；"
+                "不得与源文件路径相同。"
+            ),
+        },
+        returns=(
+            "Word 编辑结果字典，包含 success、source_path、output_path、"
+            "operation_count 和 operations。"
+            "后续应把 output_path 通过 $ref 交给 read_document 做结果核验。"
+        ),
+    )
+
+    registry.register(
+        "apply_excel_edits",
+        apply_excel_edits,
+        (
+            "对现有 XLSX Excel 工作簿执行一个或多个确定性编辑操作，并另存为新文件。"
+            "适用于用户要求修改已有 Excel，例如批量替换值、新增或删除字段、"
+            "重命名字段、排序、去重、填充缺失值、追加数据行和修改指定单元格。"
+            "每个操作都可以通过 sheet_name 指定工作表；未修改的其他 Sheet 会保留。"
+            "默认禁止覆盖源文件。"
+            "当任务要求修改已有 Excel 时，应先使用 inspect_data_files 或 "
+            "read_office_data 理解原文件结构和数据，再调用本工具；编辑完成后，"
+            "应再次读取或检查本工具返回的 output_path，核对修改结果后再 finish。"
+        ),
+        category="document",
+        parameters={
+            "file_path": (
+                "需要编辑的本地 .xlsx 文件路径。"
+                "当前编辑层只支持 .xlsx；如果来自在线 Excel，应先下载到本地。"
+            ),
+            "operations": (
+                "编辑操作列表，每项必须包含 action，可单独指定 sheet_name。"
+                "支持：replace_values（old_value, new_value, column 可选）；"
+                "add_column（column_name, value 或 values）；"
+                "delete_columns（columns）；"
+                "rename_columns（rename_map）；"
+                "sort_rows（column, ascending 可选）；"
+                "delete_duplicate_rows（columns 可选, keep 可选）；"
+                "fill_missing_values（columns 可选, fill_value 可选）；"
+                "append_rows（rows）；"
+                "update_cell（row, column_name 或 column, value）。"
+                "update_cell 的 Excel 数据行 row 从 2 开始，因为第 1 行是表头；"
+                "column 数字索引从 1 开始。"
+            ),
+            "output_path": (
+                "可选的新 .xlsx 输出路径。"
+                "通常省略，让工具自动生成 *_DataPilot编辑.xlsx；"
+                "不得与源文件路径相同。"
+            ),
+        },
+        returns=(
+            "Excel 编辑结果字典，包含 success、source_path、output_path、"
+            "sheet_names、operation_count 和 operations。"
+            "后续应使用 output_path 再次读取或检查新 Excel，"
+            "确认编辑结果后再结束任务。"
+        ),
     )
 
     # ------------------------------------------------------------
@@ -898,7 +989,7 @@ def main():
     summary = registry.summary()
 
     print("=" * 70)
-    print("DataPilot v3.1 Tool Registry")
+    print("DataPilot v3.2 Tool Registry")
     print("=" * 70)
     print(f"已注册工具数量：{summary['tool_count']}")
     print("工具类别：", ", ".join(summary["categories"]))
