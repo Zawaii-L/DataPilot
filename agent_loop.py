@@ -378,6 +378,16 @@ class AgentLoop:
         state: Dict[str, Any],
         finish_only: bool = False,
     ) -> Dict[str, Any]:
+        """
+        让 LLM 决定下一步动作。
+
+        v3.3 增强：
+        - 对偶发的空响应、非 JSON、非法 action_type、非法工具名、
+          非对象 arguments 做有限次数的格式纠错重试；
+        - 重试只重新请求“决策 JSON”，不会重复执行已经成功的工具；
+        - 因此类似 Word 已经编辑并回读成功后，若模型某一轮输出格式异常，
+          Agent 不会直接崩溃，也不会丢失已有 ExecutionContext。
+        """
         system_prompt = self._build_system_prompt(
             finish_only=finish_only,
         )
@@ -394,7 +404,7 @@ class AgentLoop:
         else:
             decision_instruction = "\n\n请决定下一步。"
 
-        user_prompt = (
+        base_user_prompt = (
             f"用户最终目标：\n{goal}\n\n"
             "当前真实执行状态：\n"
             + json.dumps(
@@ -406,96 +416,148 @@ class AgentLoop:
             + decision_instruction
         )
 
-        response = (
-            self.client
-            .chat
-            .completions
-            .create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt,
+        max_format_attempts = 3
+        last_error: Optional[Exception] = None
+        correction_message = ""
+
+        for attempt in range(
+            1,
+            max_format_attempts + 1,
+        ):
+            user_prompt = base_user_prompt
+
+            if correction_message:
+                user_prompt += (
+                    "\n\n上一次返回格式不合法。"
+                    "请纠正格式后重新返回一个且仅一个合法 JSON 对象。"
+                    f"\n具体问题：{correction_message}"
+                    "\n不要添加 Markdown、解释文字、代码围栏或第二个 JSON。"
+                )
+
+            response = (
+                self.client
+                .chat
+                .completions
+                .create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_prompt,
+                        },
+                    ],
+                    temperature=0.0,
+                    response_format={
+                        "type": "json_object"
                     },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ],
-                temperature=0.0,
-                response_format={
-                    "type": "json_object"
-                },
-            )
-        )
-
-        content = (
-            response
-            .choices[0]
-            .message
-            .content
-        )
-
-        if not content:
-            raise ValueError(
-                "Agent Loop 没有返回下一步决策。"
+                )
             )
 
-        decision = self._extract_json_object(
-            content
-        )
-
-        if not isinstance(decision, dict):
-            raise TypeError(
-                "Agent Loop 决策不是 JSON 对象。"
+            content = (
+                response
+                .choices[0]
+                .message
+                .content
             )
 
-        action_type = decision.get(
-            "action_type"
-        )
+            try:
+                if not content:
+                    raise ValueError(
+                        "Agent Loop 没有返回下一步决策。"
+                    )
 
-        if action_type not in {
-            "tool",
-            "finish",
-        }:
-            raise ValueError(
-                "action_type 只允许 tool 或 finish。"
-            )
-
-        if action_type == "tool":
-            tool_name = str(
-                decision.get("tool")
-                or ""
-            ).strip()
-
-            if not tool_name:
-                raise ValueError(
-                    "tool 决策缺少工具名。"
+                decision = self._extract_json_object(
+                    content
                 )
 
-            if not self.registry.has(
-                tool_name
-            ):
-                raise ValueError(
-                    f"Agent 选择了未注册工具：{tool_name}"
+                if not isinstance(decision, dict):
+                    raise TypeError(
+                        "Agent Loop 决策不是 JSON 对象。"
+                    )
+
+                action_type = decision.get(
+                    "action_type"
                 )
 
-            arguments = decision.get(
-                "arguments",
-                {},
-            )
+                if action_type not in {
+                    "tool",
+                    "finish",
+                }:
+                    raise ValueError(
+                        "action_type 只允许 tool 或 finish。"
+                    )
 
-            if arguments is None:
-                arguments = {}
+                if action_type == "tool":
+                    tool_name = str(
+                        decision.get("tool")
+                        or ""
+                    ).strip()
 
-            if not isinstance(arguments, dict):
-                raise TypeError(
-                    "arguments 必须是 JSON 对象。"
+                    if not tool_name:
+                        raise ValueError(
+                            "tool 决策缺少工具名。"
+                        )
+
+                    canonical_name = self.registry.resolve_name(
+                        tool_name
+                    )
+
+                    if canonical_name is None:
+                        raise ValueError(
+                            f"Agent 选择了未注册工具：{tool_name}"
+                        )
+
+                    arguments = decision.get(
+                        "arguments",
+                        {},
+                    )
+
+                    if arguments is None:
+                        arguments = {}
+
+                    if not isinstance(arguments, dict):
+                        raise TypeError(
+                            "arguments 必须是 JSON 对象。"
+                        )
+
+                    decision["tool"] = canonical_name
+                    decision["arguments"] = arguments
+
+                if attempt > 1:
+                    self.report_progress(
+                        "Agent 决策 JSON 格式纠错成功，继续执行。"
+                    )
+
+                return decision
+
+            except (
+                ValueError,
+                TypeError,
+                json.JSONDecodeError,
+            ) as error:
+                last_error = error
+                correction_message = (
+                    f"{type(error).__name__}: {error}"
                 )
 
-            decision["arguments"] = arguments
+                if attempt >= max_format_attempts:
+                    break
 
-        return decision
+                self.report_progress(
+                    "Agent 决策返回格式异常，"
+                    f"正在自动纠错重试 "
+                    f"({attempt}/{max_format_attempts - 1})："
+                    f"{correction_message}"
+                )
+
+        raise ValueError(
+            "Agent Loop 连续多次未返回合法决策 JSON。"
+            f"最后错误：{type(last_error).__name__}: {last_error}"
+        )
 
     @staticmethod
     def _extract_json_object(
