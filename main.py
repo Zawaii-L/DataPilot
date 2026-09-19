@@ -21,9 +21,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QLineEdit,
+    QInputDialog,
 )
 
 from agent import DataPilotAgent
+from clarification_gate import ClarificationGate
 
 # 文件夹扫描时默认忽略程序环境、版本控制、缓存和历史输出目录。
 # 这些目录通常包含第三方许可证、缓存文件或 Agent 自己生成的结果，
@@ -56,6 +58,7 @@ IGNORED_SCAN_DIRS = {
 class AgentWorker(QThread):
     log_signal = Signal(str)
     success_signal = Signal(dict)
+    incomplete_signal = Signal(dict)
     cancelled_signal = Signal(dict)
     error_signal = Signal(str)
 
@@ -103,8 +106,21 @@ class AgentWorker(QThread):
                 and result.get("stop_reason") == "user_cancelled"
             ):
                 self.cancelled_signal.emit(result)
-            else:
+            elif (
+                isinstance(result, dict)
+                and result.get("success") is True
+            ):
                 self.success_signal.emit(result)
+            else:
+                # max_iterations / verification_failed / 其他未完成状态
+                # 不是程序异常，但也绝不能进入“任务执行成功”UI。
+                self.incomplete_signal.emit(
+                    result if isinstance(result, dict) else {
+                        "success": False,
+                        "stop_reason": "incomplete",
+                        "final_answer": "",
+                    }
+                )
 
         except Exception:
             error_message = traceback.format_exc()
@@ -1037,6 +1053,114 @@ class MainWindow(QMainWindow):
         )
 
     # ========================================================
+    # Clarification Gate
+    # ========================================================
+
+    def resolve_task_clarifications(self, task):
+        """
+        在真正创建后台 AgentWorker 之前执行按需澄清。
+
+        设计原则：
+        - 有合理默认值时直接执行，不打断用户；
+        - 只有 ClarificationGate 判断歧义会实质改变执行方式时才询问；
+        - 澄清答案直接写回自然语言任务合同，随后 TaskPlanner 会把它
+          当作用户明确约束，而不是隐藏的 GUI 状态；
+        - 用户取消澄清时，不启动任务、不消耗 LLM / Tool 预算。
+        """
+        gate_result = ClarificationGate.evaluate(task)
+
+        if not gate_result.needs_clarification:
+            return task
+
+        resolved_task = str(task).strip()
+
+        self.append_log(
+            "Clarification Gate：检测到会实质影响执行方式的歧义，"
+            "任务暂不启动。"
+        )
+
+        for question in gate_result.questions:
+            options = list(question.options or [])
+
+            if options:
+                selected, accepted = QInputDialog.getItem(
+                    self,
+                    "DataPilot · 需求澄清",
+                    question.question,
+                    options,
+                    0,
+                    False,
+                )
+
+                if not accepted:
+                    self.append_log(
+                        "Clarification Gate：用户取消澄清，任务未启动。"
+                    )
+                    return None
+
+                answer = str(selected).strip()
+
+                if answer == "自定义":
+                    custom, accepted = QInputDialog.getText(
+                        self,
+                        "DataPilot · 自定义要求",
+                        "请输入你的具体要求：",
+                    )
+
+                    if not accepted:
+                        self.append_log(
+                            "Clarification Gate：用户取消澄清，任务未启动。"
+                        )
+                        return None
+
+                    custom = str(custom).strip()
+                    if not custom:
+                        QMessageBox.warning(
+                            self,
+                            "提示",
+                            "自定义要求不能为空。",
+                        )
+                        return None
+
+                    answer = custom
+            else:
+                answer, accepted = QInputDialog.getText(
+                    self,
+                    "DataPilot · 需求澄清",
+                    question.question,
+                )
+
+                if not accepted:
+                    self.append_log(
+                        "Clarification Gate：用户取消澄清，任务未启动。"
+                    )
+                    return None
+
+                answer = str(answer).strip()
+                if not answer:
+                    QMessageBox.warning(
+                        self,
+                        "提示",
+                        "澄清内容不能为空。",
+                    )
+                    return None
+
+            resolved_task += (
+                "\n\n【用户澄清约束】\n"
+                f"- {question.key}: {answer}"
+            )
+
+            self.append_log(
+                "Clarification Gate：已记录用户澄清："
+                f"{question.key} = {answer}"
+            )
+
+        self.append_log(
+            "Clarification Gate：澄清完成，继续建立 TaskPlan。"
+        )
+        return resolved_task
+
+    # ========================================================
     # 开始执行
     # ========================================================
 
@@ -1055,6 +1179,12 @@ class MainWindow(QMainWindow):
             )
 
             return
+
+        clarified_task = self.resolve_task_clarifications(task)
+        if clarified_task is None:
+            return
+
+        task = clarified_task
 
         input_paths = (
             self.get_input_paths()
@@ -1196,6 +1326,10 @@ class MainWindow(QMainWindow):
             self.task_success
         )
 
+        self.worker.incomplete_signal.connect(
+            self.task_incomplete
+        )
+
         self.worker.cancelled_signal.connect(
             self.task_cancelled
         )
@@ -1213,6 +1347,84 @@ class MainWindow(QMainWindow):
     # ========================================================
     # 任务成功
     # ========================================================
+
+    def task_incomplete(self, result):
+        """
+        Agent 正常结束，但 Completion Gate 未确认完成。
+
+        这是“未完成”而不是 Python 异常：
+        - max_iterations：预算耗尽且仍需要工具；
+        - verification_failed：最终验收未通过；
+        - 其他 success=False 的正常 Agent 结束状态。
+
+        已经真实生成的文件仍保留，便于诊断和后续恢复，
+        但 UI 不再把它们包装成“任务执行成功”。
+        """
+        self.result = result or {}
+
+        self.append_log("=" * 60)
+        self.append_log("任务未完成。")
+
+        stop_reason = str(
+            self.result.get("stop_reason") or "incomplete"
+        ).strip()
+
+        reason_map = {
+            "max_iterations": (
+                "已达到本次工具执行预算上限，但任务仍需要继续调用工具。"
+            ),
+            "verification_failed": (
+                "最终 Completion Gate 未通过，任务结果尚未满足验收条件。"
+            ),
+            "incomplete": "任务尚未满足完成条件。",
+        }
+
+        self.append_log(
+            "状态："
+            + reason_map.get(
+                stop_reason,
+                f"Agent 返回未完成状态：{stop_reason}",
+            )
+        )
+
+        iterations = self.result.get("iterations", 0)
+        tool_count = self.result.get("tool_count", 0)
+
+        self.append_log(f"停止原因：{stop_reason}")
+        self.append_log(f"决策轮数：{iterations}")
+        self.append_log(f"工具执行数：{tool_count}")
+
+        verification_report = self.result.get(
+            "verification_report"
+        )
+        if verification_report:
+            self.display_verification_report(
+                verification_report,
+                stop_reason=stop_reason,
+            )
+
+        output_files = self.result.get(
+            "output_files",
+            [],
+        ) or []
+
+        if output_files:
+            self.append_log(
+                "已生成的中间/部分成果仍保留，但不视为完整交付："
+            )
+            for path in output_files:
+                self.append_log(f"- {path}")
+
+        final_answer = (
+            self.result.get("final_answer")
+            or self.result.get("answer")
+            or ""
+        )
+        if final_answer:
+            self.append_log("Agent 当前说明：")
+            self.append_log(str(final_answer))
+
+        self.append_log("=" * 60)
 
     def task_success(self, result):
         self.result = result or {}
@@ -1256,30 +1468,6 @@ class MainWindow(QMainWindow):
             tool_count = self.result.get(
                 "tool_count",
                 0,
-            )
-
-            tool_request_count = self.result.get(
-                "tool_request_count",
-                tool_count,
-            )
-
-            policy_blocked_count = self.result.get(
-                "policy_blocked_count",
-                0,
-            )
-
-            failed_tool_count = self.result.get(
-                "failed_tool_count",
-                0,
-            )
-
-            successful_tool_count = self.result.get(
-                "successful_tool_count",
-                max(
-                    int(tool_count or 0)
-                    - int(failed_tool_count or 0),
-                    0,
-                ),
             )
 
             stop_reason = self.result.get(
@@ -1465,23 +1653,7 @@ class MainWindow(QMainWindow):
             )
 
             self.append_log(
-                f"工具请求数量：{tool_request_count}"
-            )
-
-            self.append_log(
-                f"真实工具执行数量：{tool_count}"
-            )
-
-            self.append_log(
-                f"成功工具执行数量：{successful_tool_count}"
-            )
-
-            self.append_log(
-                f"策略拦截数量：{policy_blocked_count}"
-            )
-
-            self.append_log(
-                f"失败工具执行数量：{failed_tool_count}"
+                f"实际工具调用数量：{tool_count}"
             )
 
             self.append_log(

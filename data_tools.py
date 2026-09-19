@@ -3,6 +3,11 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from semantic_data_tools import (
+    analyze_dataframe_semantics,
+    normalize_semantic_dataframe,
+)
+
 
 # ============================================================
 # 中文字体设置
@@ -163,129 +168,189 @@ def data_quality_check(df):
 # 3. 自动清洗数据
 # ============================================================
 
-def clean_data(df):
+def clean_data(
+    df,
+    semantic_aware=False,
+    semantic_profile=None,
+):
     """
-    自动清洗数据：
+    自动清洗数据。
 
-    1. 将正负无穷值替换为缺失值
-    2. 删除完全重复行
-    3. 数值列使用中位数填充缺失值
-    4. 非数值列使用众数填充缺失值
+    默认 semantic_aware=False：
+        保持 DataPilot 旧版兼容行为：
+        - ±inf -> 缺失
+        - 删除完全重复行
+        - 数值缺失 -> 中位数
+        - 非数值缺失 -> 众数 / "未知"
+
+    semantic_aware=True：
+        使用保守的语义感知清洗：
+        - ±inf -> 缺失，并记录
+        - 删除完全重复行
+        - identifier / datetime / category / measure 默认不凭空插补
+        - 不把未知降水当 0
+        - 不用中位数处理风向
+        - 不为订单号、金额等字段制造值
+        - 保留无法安全自动处理的缺失，并在日志中逐字段说明
 
     返回：
         cleaned_df, cleaning_result
     """
     if not isinstance(df, pd.DataFrame):
-        raise TypeError(
-            "clean_data() 要求传入 pandas.DataFrame"
-        )
+        raise TypeError("clean_data() 要求传入 pandas.DataFrame")
 
     cleaned_df = df.copy()
+    original_rows = int(cleaned_df.shape[0])
+    original_missing = int(cleaned_df.isnull().sum().sum())
 
-    original_rows = int(
-        cleaned_df.shape[0]
-    )
+    # 先记录无穷值，再统一转成缺失。
+    inf_replaced = 0
+    numeric_before = cleaned_df.select_dtypes(include="number").columns.tolist()
+    for column in numeric_before:
+        series = cleaned_df[column]
+        count = int(
+            ((series == float("inf")) | (series == float("-inf"))).sum()
+        )
+        inf_replaced += count
 
-    # 将正负无穷值替换成缺失值
     cleaned_df = cleaned_df.replace(
         [float("inf"), float("-inf")],
         pd.NA,
     )
 
-    # 删除重复行
     before_duplicate = len(cleaned_df)
-
     cleaned_df = cleaned_df.drop_duplicates()
+    duplicate_removed = int(before_duplicate - len(cleaned_df))
 
-    duplicate_removed = (
-        before_duplicate - len(cleaned_df)
-    )
+    # ------------------------------
+    # 旧版兼容模式
+    # ------------------------------
+    if not semantic_aware:
+        numeric_filled = 0
+        non_numeric_filled = 0
 
-    numeric_filled = 0
-    non_numeric_filled = 0
-
-    numeric_columns = (
-        cleaned_df.select_dtypes(
-            include="number"
+        numeric_columns = (
+            cleaned_df.select_dtypes(include="number").columns.tolist()
         )
-        .columns
-        .tolist()
-    )
+        non_numeric_columns = [
+            column
+            for column in cleaned_df.columns
+            if column not in numeric_columns
+        ]
 
-    non_numeric_columns = [
-        column
-        for column in cleaned_df.columns
-        if column not in numeric_columns
-    ]
+        for column in numeric_columns:
+            missing_count = int(cleaned_df[column].isnull().sum())
+            if missing_count <= 0:
+                continue
 
-    # 数值列：使用中位数填充
-    for column in numeric_columns:
-        missing_count = int(
-            cleaned_df[column].isnull().sum()
-        )
-
-        if missing_count > 0:
-            median_value = cleaned_df[
-                column
-            ].median()
-
+            median_value = cleaned_df[column].median()
             if pd.isna(median_value):
                 median_value = 0
 
-            cleaned_df[column] = (
-                cleaned_df[column]
-                .fillna(median_value)
-            )
-
+            cleaned_df[column] = cleaned_df[column].fillna(median_value)
             numeric_filled += missing_count
 
-    # 非数值列：使用众数填充
-    for column in non_numeric_columns:
-        missing_count = int(
-            cleaned_df[column].isnull().sum()
-        )
+        for column in non_numeric_columns:
+            missing_count = int(cleaned_df[column].isnull().sum())
+            if missing_count <= 0:
+                continue
 
-        if missing_count > 0:
-            mode_values = (
-                cleaned_df[column]
-                .mode()
+            mode_values = cleaned_df[column].mode(dropna=True)
+            fill_value = (
+                mode_values.iloc[0]
+                if not mode_values.empty
+                else "未知"
             )
-
-            if len(mode_values) > 0:
-                fill_value = mode_values.iloc[0]
-            else:
-                fill_value = "未知"
-
-            cleaned_df[column] = (
-                cleaned_df[column]
-                .fillna(fill_value)
-            )
-
+            cleaned_df[column] = cleaned_df[column].fillna(fill_value)
             non_numeric_filled += missing_count
 
-    final_rows = int(
-        cleaned_df.shape[0]
-    )
+        cleaning_result = {
+            "original_rows": original_rows,
+            "final_rows": int(cleaned_df.shape[0]),
+            "duplicate_removed": duplicate_removed,
+            "numeric_missing_filled": int(numeric_filled),
+            "non_numeric_missing_filled": int(non_numeric_filled),
+            "total_missing_filled": int(
+                numeric_filled + non_numeric_filled
+            ),
+        }
+        return cleaned_df, cleaning_result
+
+    # ------------------------------
+    # Semantic-Aware 保守模式
+    # ------------------------------
+    if semantic_profile is None:
+        semantic_profile = analyze_dataframe_semantics(cleaned_df)
+
+    semantic_by_column = {
+        str(item.get("original_name")): item
+        for item in semantic_profile.get("columns", [])
+    }
+
+    preserved_missing_by_column = {}
+    decisions = []
+
+    for column in cleaned_df.columns:
+        missing_count = int(cleaned_df[column].isnull().sum())
+        if missing_count <= 0:
+            continue
+
+        info = semantic_by_column.get(str(column), {})
+        role = str(info.get("role") or "unknown")
+        semantic_type = str(info.get("semantic_type") or "")
+        confidence = str(info.get("confidence") or "low")
+
+        # v5.1 的正式策略是保守：没有可靠业务规则就不制造数据。
+        if role == "identifier":
+            reason = "标识字段缺失不能自动生成或用众数替代"
+        elif role == "datetime":
+            reason = "时间字段缺失不能在缺乏时序规则时自动插补"
+        elif semantic_type == "wind_direction":
+            reason = "风向属于环形变量，不能使用普通中位数自动填充"
+        elif semantic_type == "precipitation":
+            reason = "降水缺失不等于无降水，不能自动填 0 或中位数"
+        elif role == "measure":
+            reason = "数值指标缺失会影响事实结果，缺乏明确业务规则时保留缺失"
+        elif role == "category":
+            reason = "分类字段缺失不应默认用众数制造类别"
+        else:
+            reason = "字段语义或插补规则不充分，保留缺失值"
+
+        preserved_missing_by_column[str(column)] = missing_count
+        decisions.append({
+            "字段": str(column),
+            "字段角色": role,
+            "语义类型": semantic_type,
+            "语义置信度": confidence,
+            "缺失数量": missing_count,
+            "处理方式": "保留缺失",
+            "原因": reason,
+        })
+
+    remaining_missing = int(cleaned_df.isnull().sum().sum())
 
     cleaning_result = {
         "original_rows": original_rows,
-        "final_rows": final_rows,
-        "duplicate_removed": int(
-            duplicate_removed
-        ),
-        "numeric_missing_filled": int(
-            numeric_filled
-        ),
-        "non_numeric_missing_filled": int(
-            non_numeric_filled
-        ),
-        "total_missing_filled": int(
-            numeric_filled + non_numeric_filled
+        "final_rows": int(cleaned_df.shape[0]),
+        "duplicate_removed": duplicate_removed,
+        # 保留旧键，避免旧调用方 KeyError；semantic 模式下不会盲目填充。
+        "numeric_missing_filled": 0,
+        "non_numeric_missing_filled": 0,
+        "total_missing_filled": 0,
+        # v5.1 新增审计信息
+        "semantic_aware": True,
+        "inf_replaced_with_missing": int(inf_replaced),
+        "original_missing_values": original_missing,
+        "remaining_missing_values": remaining_missing,
+        "preserved_missing_by_column": preserved_missing_by_column,
+        "semantic_cleaning_decisions": decisions,
+        "cleaning_policy": (
+            "保守语义清洗：仅执行确定性安全操作；"
+            "没有明确业务规则时不自动插补缺失值。"
         ),
     }
 
     return cleaned_df, cleaning_result
-
 
 # 兼容旧函数名
 def clean_dataset(df):
@@ -412,258 +477,134 @@ def detect_column_types(df):
 # 6. 通用数据自动可视化
 # ============================================================
 
-def plot_trend(
-    df,
-    output_dir="outputs",
-):
+def plot_trend(df, output_dir="outputs"):
     """
-    根据数据结构自动选择合理的可视化方式。
-
-    规则：
-
-    1. 有日期列 + 数值列：
-       生成时间趋势图
-
-    2. 有低基数分类列 + 数值列：
-       按分类计算数值平均值，生成柱状图
-
-    3. 有多个数值列：
-       生成数值特征均值柱状图
-
-    4. 只有一个数值列：
-       生成该列的数据趋势图
-
-    为兼容现有 Agent，函数名继续保留为 plot_trend()。
-
-    返回：
-        PNG 文件路径
+    生成语义感知图表。
+    气象数据优先展示气温/露点、湿度、风速、降水；
+    通用数据最多展示 4 个独立指标，避免不同单位共用 Y 轴。
     """
     if not isinstance(df, pd.DataFrame):
-        raise TypeError(
-            "plot_trend() 要求传入 pandas.DataFrame"
-        )
-
-    output_dir = Path(output_dir)
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+        raise TypeError("plot_trend() 要求传入 pandas.DataFrame")
+    if df.empty:
+        raise ValueError("数据为空，无法生成图表。")
 
     set_chinese_font()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chart_path = output_dir / "DataPilot_数据分析图.png"
 
-    column_types = detect_column_types(df)
+    profile = analyze_dataframe_semantics(df)
+    semantic_by_name = {
+        str(item.get("original_name")): item
+        for item in profile.get("columns", [])
+    }
 
-    numeric_columns = column_types[
-        "numeric_columns"
+    datetime_columns = [
+        c for c, info in semantic_by_name.items()
+        if info.get("role") == "datetime" and c in df.columns
     ]
-
-    categorical_columns = column_types[
-        "categorical_columns"
+    measure_columns = [
+        c for c, info in semantic_by_name.items()
+        if info.get("role") == "measure"
+        and c in df.columns
+        and pd.api.types.is_numeric_dtype(df[c])
     ]
+    if not measure_columns:
+        measure_columns = df.select_dtypes(include="number").columns.tolist()
+    if not measure_columns:
+        raise ValueError("没有可用于绘图的数值指标。")
 
-    datetime_columns = column_types[
-        "datetime_columns"
-    ]
-
-    if len(numeric_columns) == 0:
-        raise ValueError(
-            "数据中没有可用于绘图的数值列。"
-        )
-
-    # 最多绘制前 6 个数值字段，避免图表过于拥挤
-    selected_numeric_columns = (
-        numeric_columns[:6]
-    )
-
-    plt.figure(
-        figsize=(10, 6)
-    )
-
-    chart_title = "DataPilot 数据分析图"
-
-    # ========================================================
-    # 情况 1：日期时间 + 数值字段
-    # ========================================================
-
-    if datetime_columns:
-        datetime_column = datetime_columns[0]
-
-        temp_df = df.copy()
-
-        temp_df[datetime_column] = pd.to_datetime(
-            temp_df[datetime_column],
-            errors="coerce",
-        )
-
-        temp_df = (
-            temp_df
-            .dropna(
-                subset=[datetime_column]
-            )
-            .sort_values(
-                datetime_column
-            )
-        )
-
-        if not temp_df.empty:
-            for column in selected_numeric_columns:
-                plt.plot(
-                    temp_df[datetime_column],
-                    temp_df[column],
-                    label=str(column),
-                )
-
-            chart_title = "时间序列趋势图"
-
-            plt.xlabel(
-                str(datetime_column)
-            )
-
-            plt.ylabel("数值")
-
-            plt.legend()
-
+    time_column = datetime_columns[0] if datetime_columns else None
+    if time_column:
+        parsed_time = pd.to_datetime(df[time_column], errors="coerce")
+        if parsed_time.notna().any():
+            x_values = parsed_time
+            x_label = str(time_column)
         else:
-            # 日期解析后为空时，退回通用图
-            means = (
-                df[selected_numeric_columns]
-                .mean()
-            )
-
-            means.plot(
-                kind="bar"
-            )
-
-            chart_title = "数值特征平均值"
-
-            plt.xlabel("数值字段")
-            plt.ylabel("平均值")
-
-    # ========================================================
-    # 情况 2：分类字段 + 数值字段
-    # ========================================================
-
+            x_values = range(len(df))
+            x_label = "记录序号"
     else:
-        suitable_category = None
+        x_values = range(len(df))
+        x_label = "记录序号"
 
-        for column in categorical_columns:
-            unique_count = (
-                df[column]
-                .nunique(
-                    dropna=True
-                )
-            )
+    def stype(column):
+        return str(
+            semantic_by_name.get(column, {}).get("semantic_type") or ""
+        )
 
+    def detected(columns, semantic_types, name_tokens):
+        result = []
+        for column in columns:
+            name = str(column).lower()
             if (
-                unique_count >= 2
-                and unique_count <= 20
+                stype(column) in semantic_types
+                or any(token in name for token in name_tokens)
             ):
-                suitable_category = column
-                break
+                result.append(column)
+        return result
 
-        if suitable_category is not None:
-            selected_column = (
-                selected_numeric_columns[0]
-            )
-
-            grouped = (
-                df.groupby(
-                    suitable_category,
-                    dropna=False,
-                )[selected_column]
-                .mean()
-                .sort_values(
-                    ascending=False
-                )
-            )
-
-            grouped.plot(
-                kind="bar"
-            )
-
-            chart_title = (
-                f"{selected_column} "
-                f"按 {suitable_category} 分类平均值"
-            )
-
-            plt.xlabel(
-                str(suitable_category)
-            )
-
-            plt.ylabel(
-                f"{selected_column} 平均值"
-            )
-
-        # ====================================================
-        # 情况 3：多个数值字段
-        # ====================================================
-
-        elif len(selected_numeric_columns) >= 2:
-            means = (
-                df[selected_numeric_columns]
-                .mean()
-            )
-
-            means.plot(
-                kind="bar"
-            )
-
-            chart_title = (
-                "数值特征平均值对比"
-            )
-
-            plt.xlabel("数值字段")
-            plt.ylabel("平均值")
-
-        # ====================================================
-        # 情况 4：只有一个数值字段
-        # ====================================================
-
-        else:
-            column = selected_numeric_columns[0]
-
-            plt.plot(
-                range(len(df)),
-                df[column],
-            )
-
-            chart_title = (
-                f"{column} 数据趋势图"
-            )
-
-            plt.xlabel("数据行号")
-            plt.ylabel(str(column))
-
-    plt.title(chart_title)
-
-    plt.grid(
-        True,
-        alpha=0.3,
+    temperatures = detected(
+        measure_columns,
+        {"temperature", "dew_point"},
+        ("气温", "温度", "露点"),
+    )
+    humidities = detected(
+        measure_columns,
+        {"humidity", "relative_humidity"},
+        ("湿度",),
+    )
+    wind_speeds = detected(
+        measure_columns,
+        {"wind_speed"},
+        ("风速",),
+    )
+    precipitations = detected(
+        measure_columns,
+        {"precipitation"},
+        ("降水",),
     )
 
-    plt.xticks(
-        rotation=30,
-        ha="right",
+    weather_detected = bool(
+        temperatures or humidities or wind_speeds or precipitations
     )
 
-    plt.tight_layout()
+    groups = []
+    if weather_detected:
+        if temperatures:
+            groups.append(("气温与露点温度变化", temperatures[:2], "℃"))
+        if humidities:
+            groups.append(("相对湿度变化", humidities[:1], "%"))
+        if wind_speeds:
+            groups.append(("风速变化", wind_speeds[:1], "m/s"))
+        if precipitations:
+            groups.append(("逐时降水量变化", precipitations[:1], "mm"))
+    else:
+        for column in measure_columns[:4]:
+            groups.append((f"{column}变化", [column], str(column)))
 
-    plot_path = (
-        output_dir
-        / "DataPilot_数据分析图.png"
+    groups = groups[:4]
+    fig, axes = plt.subplots(
+        len(groups),
+        1,
+        figsize=(11, max(4, 3.2 * len(groups))),
+        squeeze=False,
     )
 
-    plt.savefig(
-        plot_path,
-        dpi=150,
-        bbox_inches="tight",
-    )
+    for index, (title, columns, ylabel) in enumerate(groups):
+        ax = axes[index][0]
+        for column in columns:
+            ax.plot(x_values, df[column], label=str(column))
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        if len(columns) > 1:
+            ax.legend()
 
-    plt.close()
-
-    return str(plot_path)
-
+    fig.tight_layout()
+    fig.savefig(chart_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return str(chart_path)
 
 # 兼容旧函数名
 def generate_trend_plot(
@@ -680,114 +621,139 @@ def generate_trend_plot(
 # 7. 导出 Excel
 # ============================================================
 
+def _translate_field_references_for_excel(value, display_name_map):
+    """仅转换 Excel 展示层字段名，不修改内部质量检查结果。"""
+    if isinstance(value, list):
+        return [
+            display_name_map.get(str(item), str(item))
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            display_name_map.get(str(key), str(key)): item
+            for key, item in value.items()
+        }
+    return value
+
+
 def export_to_excel(
     cleaned_df,
     quality_result,
     cleaning_result,
     statistics_result,
     output_dir="outputs",
+    *,
+    field_dictionary=None,
+    conversion_log=None,
 ):
-    """
-    将清洗数据、质量检查、清洗记录和统计结果
-    导出到 Excel。
-
-    返回：
-        Excel 文件路径
-    """
+    """导出用户可读 Excel，并可追加字段说明与单位转换记录。"""
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    excel_path = output_dir / "DataPilot_数据分析结果.xlsx"
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    quality_labels = {
+        "rows": "数据行数",
+        "columns": "字段数量",
+        "missing_values": "缺失值总数",
+        "missing_by_column": "各字段缺失值",
+        "duplicate_rows": "重复记录数",
+        "numeric_columns": "数值字段",
+        "abnormal_values": "异常值",
+    }
+    cleaning_labels = {
+        "original_rows": "原始行数",
+        "final_rows": "清洗后行数",
+        "duplicate_removed": "删除重复记录数",
+        "numeric_missing_filled": "数值缺失填充数",
+        "non_numeric_missing_filled": "非数值缺失填充数",
+        "total_missing_filled": "缺失值填充总数",
+    }
 
-    excel_path = (
-        output_dir
-        / "DataPilot_数据分析结果.xlsx"
-    )
+    display_name_map = {}
+    if isinstance(field_dictionary, list):
+        for item in field_dictionary:
+            if not isinstance(item, dict):
+                continue
+            original = str(item.get("原字段") or "").strip()
+            display = str(item.get("展示字段") or "").strip()
+            if original and display:
+                display_name_map[original] = display
 
     quality_rows = []
-
     for key, value in quality_result.items():
-        if isinstance(value, dict):
-            value = str(value)
-
-        if isinstance(value, list):
-            value = ", ".join(
-                str(item)
-                for item in value
-            )
-
-        quality_rows.append(
-            {
-                "检查项目": key,
-                "检查结果": value,
-            }
+        display_value = _translate_field_references_for_excel(
+            value,
+            display_name_map,
         )
+        if isinstance(display_value, dict):
+            display_value = str(display_value)
+        elif isinstance(display_value, list):
+            display_value = ", ".join(str(x) for x in display_value)
+        quality_rows.append({
+            "检查项目": quality_labels.get(key, key),
+            "检查结果": display_value,
+        })
 
     cleaning_rows = []
-
     for key, value in cleaning_result.items():
-        cleaning_rows.append(
-            {
-                "清洗项目": key,
-                "处理结果": value,
-            }
-        )
+        display_value = value
 
-    quality_df = pd.DataFrame(
-        quality_rows
-    )
-
-    cleaning_df = pd.DataFrame(
-        cleaning_rows
-    )
-
-    with pd.ExcelWriter(
-        excel_path,
-        engine="openpyxl",
-    ) as writer:
-
-        cleaned_df.to_excel(
-            writer,
-            sheet_name="清洗后数据",
-            index=False,
-        )
-
-        quality_df.to_excel(
-            writer,
-            sheet_name="数据质量检查",
-            index=False,
-        )
-
-        cleaning_df.to_excel(
-            writer,
-            sheet_name="数据清洗记录",
-            index=False,
-        )
-
-        if isinstance(
-            statistics_result,
-            pd.DataFrame,
-        ):
-            statistics_result.to_excel(
-                writer,
-                sheet_name="统计分析",
+        if key == "preserved_missing_by_column":
+            display_value = _translate_field_references_for_excel(
+                value,
+                display_name_map,
             )
+        elif key == "semantic_cleaning_decisions" and isinstance(value, list):
+            translated = []
+            for decision in value:
+                if not isinstance(decision, dict):
+                    translated.append(decision)
+                    continue
+                item = dict(decision)
+                raw_field = str(item.get("字段") or "")
+                if raw_field:
+                    item["字段"] = display_name_map.get(
+                        raw_field,
+                        raw_field,
+                    )
+                translated.append(item)
+            display_value = translated
 
+        if isinstance(display_value, (dict, list)):
+            display_value = str(display_value)
+
+        cleaning_rows.append({
+            "清洗项目": cleaning_labels.get(key, key),
+            "处理结果": display_value,
+        })
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        cleaned_df.to_excel(writer, sheet_name="清洗后数据", index=False)
+        pd.DataFrame(quality_rows).to_excel(
+            writer, sheet_name="数据质量检查", index=False
+        )
+        pd.DataFrame(cleaning_rows).to_excel(
+            writer, sheet_name="数据清洗记录", index=False
+        )
+
+        if isinstance(statistics_result, pd.DataFrame):
+            statistics_result.to_excel(writer, sheet_name="统计分析")
         else:
-            statistics_df = pd.DataFrame(
-                statistics_result
+            pd.DataFrame(statistics_result).to_excel(
+                writer, sheet_name="统计分析", index=False
             )
 
-            statistics_df.to_excel(
-                writer,
-                sheet_name="统计分析",
-                index=False,
+        if field_dictionary:
+            pd.DataFrame(field_dictionary).to_excel(
+                writer, sheet_name="字段说明", index=False
+            )
+
+        if conversion_log:
+            pd.DataFrame(conversion_log).to_excel(
+                writer, sheet_name="单位转换记录", index=False
             )
 
     return str(excel_path)
-
 
 # 兼容旧函数名
 def save_excel(
@@ -816,142 +782,66 @@ def run_data_pipeline(
     output_directory=None,
 ):
     """
-    执行完整的数据处理流程。
-
-    同时兼容：
-
-        run_data_pipeline(
-            file_path="test_weather.csv",
-            output_dir="outputs"
-        )
-
-    和：
-
-        run_data_pipeline(
-            file_path="test_weather.csv",
-            output_directory="outputs"
-        )
-
-    返回字段继续兼容现有 Agent：
-
-        before_quality
-        after_quality
-        cleaning_log
-        statistics
-        chart_path
-        plot_path
-        excel_path
-        original_df
-        cleaned_df
-        quality_result
-        cleaning_result
-        statistics_result
+    Semantic-Aware 统一数据处理流程。
+    original_df 保留原始证据；analysis_df 用于最终统计、图表和 Excel。
     """
-
-    # 兼容 output_dir 和 output_directory
     if output_dir is None:
-        output_dir = output_directory
+        output_dir = output_directory or "outputs"
 
-    if output_dir is None:
-        output_dir = "outputs"
+    original_df = read_data(file_path)
+    before_quality = check_data_quality(original_df)
 
-    output_dir = str(output_dir)
-
-    Path(output_dir).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # ========================================================
-    # 1. 读取原始数据
-    # ========================================================
-
-    original_df = read_data(
-        file_path
-    )
-
-    # ========================================================
-    # 2. 清洗前质量检查
-    # ========================================================
-
-    before_quality = check_data_quality(
-        original_df
-    )
-
-    # ========================================================
-    # 3. 自动清洗
-    # ========================================================
+    initial_semantic_profile = analyze_dataframe_semantics(original_df)
 
     cleaned_df, cleaning_log = clean_data(
-        original_df
+        original_df,
+        semantic_aware=True,
+        semantic_profile=initial_semantic_profile,
     )
+    after_quality = check_data_quality(cleaned_df)
 
-    # ========================================================
-    # 4. 清洗后质量检查
-    # ========================================================
-
-    after_quality = check_data_quality(
-        cleaned_df
-    )
-
-    # ========================================================
-    # 5. 统计分析
-    # ========================================================
-
-    statistics = calculate_statistics(
-        cleaned_df
-    )
-
-    # ========================================================
-    # 6. 自动生成通用数据图表
-    # ========================================================
-
-    plot_path = plot_trend(
+    semantic_profile = analyze_dataframe_semantics(cleaned_df)
+    normalized = normalize_semantic_dataframe(
         cleaned_df,
-        output_dir,
+        semantic_profile=semantic_profile,
+        decimals=2,
     )
 
-    # ========================================================
-    # 7. 导出 Excel
-    # ========================================================
+    analysis_df = normalized["analysis_df"]
+    field_dictionary = normalized["field_dictionary"]
+    conversion_log = normalized["conversion_log"]
+
+    statistics_result = calculate_statistics(analysis_df)
+    chart_path = plot_trend(analysis_df, output_dir=output_dir)
 
     excel_path = export_to_excel(
-        cleaned_df=cleaned_df,
+        cleaned_df=analysis_df,
         quality_result=before_quality,
         cleaning_result=cleaning_log,
-        statistics_result=statistics,
+        statistics_result=statistics_result,
         output_dir=output_dir,
+        field_dictionary=field_dictionary,
+        conversion_log=conversion_log,
     )
 
-    # ========================================================
-    # 8. 返回完整结果
-    # ========================================================
-
-    result = {
+    return {
         "before_quality": before_quality,
         "after_quality": after_quality,
         "cleaning_log": cleaning_log,
-        "statistics": statistics,
-
-        # 保持两个键，避免破坏 agent.py
-        "chart_path": plot_path,
-        "plot_path": plot_path,
-
+        "statistics": statistics_result,
+        "chart_path": chart_path,
+        "plot_path": chart_path,
         "excel_path": excel_path,
-
         "original_df": original_df,
         "cleaned_df": cleaned_df,
         "quality_result": before_quality,
         "cleaning_result": cleaning_log,
-        "statistics_result": statistics,
+        "statistics_result": statistics_result,
+        "semantic_profile": semantic_profile,
+        "analysis_df": analysis_df,
+        "field_dictionary": field_dictionary,
+        "conversion_log": conversion_log,
     }
-
-    return result
-
-
-# ============================================================
-# 9. 兼容性测试
-# ============================================================
 
 if __name__ == "__main__":
     print("data_tools.py 已加载成功。")

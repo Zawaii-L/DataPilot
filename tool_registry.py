@@ -385,6 +385,11 @@ def create_default_tool_registry() -> ToolRegistry:
     """
 
     from data_tools import run_data_pipeline
+    from semantic_data_tools import (
+        analyze_dataframe_semantics,
+        normalize_semantic_dataframe,
+        recommend_visualizations,
+    )
     from batch_data_tools import run_batch_pipeline
     from web_data_tools import download_data_file
     from web_search_tools import search_web, read_webpage
@@ -701,6 +706,79 @@ def create_default_tool_registry() -> ToolRegistry:
             "margins_name": "总计名称",
         },
         returns="透视汇总 DataFrame",
+    )
+
+    # ------------------------------------------------------------
+    # v5.1 数据语义理解
+    # ------------------------------------------------------------
+
+    registry.register(
+        "analyze_dataframe_semantics",
+        analyze_dataframe_semantics,
+        (
+            "对已读取的 DataFrame 建立只读语义画像：识别时间、标识、分类、"
+            "测量、坐标等字段角色，并在有可靠证据时给出字段含义、显示名和单位。"
+            "不会修改原始 DataFrame，也不会擅自进行单位换算。"
+        ),
+        category="semantic_analysis",
+        parameters={
+            "df": "pandas DataFrame，通常使用 read_office_data 等读取工具的真实输出引用",
+        },
+        returns=(
+            "语义画像 dict，包含 columns、datetime_columns、identifier_columns、"
+            "category_columns、measure_columns、coordinate_columns 等"
+        ),
+        aliases=[
+            "analyze_data_semantics",
+            "infer_data_semantics",
+        ],
+    )
+
+    registry.register(
+        "normalize_semantic_dataframe",
+        normalize_semantic_dataframe,
+        (
+            "基于已确认的字段语义创建标准化分析副本。仅对高置信度、原单位、目标单位和白名单换算规则都明确的已知字段执行确定性单位换算；"
+            "同时生成字段说明和单位转换记录，不修改原始 DataFrame。"
+        ),
+        category="semantic_analysis",
+        parameters={
+            "df": "pandas DataFrame，必须是需要标准化的真实数据对象",
+            "semantic_profile": (
+                "可选；analyze_dataframe_semantics 的输出。未提供时自动建立语义画像"
+            ),
+            "decimals": "可选；换算后的数值保留小数位数，默认 2",
+        },
+        returns=(
+            "标准化结果 dict，包含 analysis_df、conversion_log、field_dictionary、semantic_profile；原始 DataFrame 保持不变"
+        ),
+        aliases=[
+            "normalize_data_semantics",
+            "standardize_semantic_dataframe",
+        ],
+    )
+
+    registry.register(
+        "recommend_visualizations",
+        recommend_visualizations,
+        (
+            "根据 DataFrame 的字段语义和单位兼容性给出可视化建议。"
+            "存在时间字段时优先时间序列；不同或未知单位的指标默认不强行共用同一 Y 轴。"
+            "本工具只返回图表方案，不直接绘图。"
+        ),
+        category="semantic_analysis",
+        parameters={
+            "df": "pandas DataFrame",
+            "semantic_profile": (
+                "可选；analyze_dataframe_semantics 的输出。"
+                "未提供时工具会对当前 DataFrame 自行建立语义画像"
+            ),
+        },
+        returns="图表建议列表，每项包含 chart_type、字段、标题和选择原因",
+        aliases=[
+            "recommend_charts",
+            "suggest_visualizations",
+        ],
     )
 
     # ------------------------------------------------------------

@@ -326,6 +326,34 @@ class VerificationEngine:
                 evidence=protected,
             )
 
+        temporal_requirements = [
+            str(item).strip()
+            for item in plan["verification_requirements"]
+            if str(item).strip().startswith("时间范围验收：")
+        ]
+        handled_temporal_requirements = set()
+        for requirement in temporal_requirements:
+            match = re.search(r"不得早于\s*(\d{4}-\d{2}-\d{2}).*不得晚于\s*(\d{4}-\d{2}-\d{2})", requirement)
+            if not match:
+                continue
+            start_date, end_date = match.group(1), match.group(2)
+            observed_dates = self._extract_dates_from_successful_data_reads(tool_results)
+            out_of_range = sorted({d for d in observed_dates if d < start_date or d > end_date})
+            passed = bool(observed_dates) and not out_of_range
+            self._add_check(
+                checks, failures,
+                check_id="temporal_scope_respected",
+                category="temporal_verification",
+                passed=passed,
+                message=(
+                    f"最终分析数据的已观测时间证据位于 {start_date} 至 {end_date} 范围内。"
+                    if passed else
+                    (f"发现超出用户时间意图的数据日期：{', '.join(out_of_range[:8])}" if out_of_range else "缺少可用于证明最终分析数据时间范围的真实读取 Observation。")
+                ),
+                evidence=observed_dates[:20],
+            )
+            handled_temporal_requirements.add(requirement)
+
         reread_requirements = [
             item
             for item in plan["verification_requirements"]
@@ -374,9 +402,7 @@ class VerificationEngine:
                 evidence=evidence,
             )
 
-        handled_requirements = set(
-            reread_requirements
-        )
+        handled_requirements = set(reread_requirements) | handled_temporal_requirements
 
         semantic_requirements = [
             str(requirement).strip()
@@ -668,6 +694,24 @@ class VerificationEngine:
             report_texts=report_texts,
             evidence_texts=evidence_texts,
         ).to_dict()
+
+    @classmethod
+    def _extract_dates_from_successful_data_reads(cls, tool_results: List[ToolExecutionResult]) -> List[str]:
+        """只从真实数据读取/语义处理 Observation 中提取 ISO 日期，避免搜索网页日期污染时间验收。"""
+        allowed = {
+            "read_office_data", "get_data_info", "analyze_dataframe_semantics",
+            "normalize_semantic_dataframe", "run_data_pipeline",
+        }
+        dates = set()
+        for result in tool_results:
+            if not getattr(result, "success", False):
+                continue
+            name = str(getattr(result, "tool_name", "") or "").strip().lower()
+            if name not in allowed:
+                continue
+            text = repr(getattr(result, "output", None))
+            dates.update(re.findall(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)", text))
+        return sorted(dates)
 
     @staticmethod
     def _normalize_plan(

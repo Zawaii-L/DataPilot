@@ -500,36 +500,12 @@ class WorkspaceManager:
         self,
         file_path: str | Path,
     ) -> Optional[WorkspaceFile]:
-        """
-        登记 Agent 本次任务真实生成的文件。
-
-        v5.0+ Artifact Boundary 修复：
-        只有当前 task_root 内的文件才允许通过“工具输出自动发现”
-        被登记为 Agent 产物。
-
-        原因：
-        discover/read/inspect 类工具经常会把源文件路径放进 output。
-        如果仅凭“这个路径真实存在”就登记为 generated file，
-        Workspace 外部的输入 Excel/CSV/Word 会被误判成 deliverable。
-
-        显式 source/reference 仍由 register_source/register_reference 管理；
-        当前任务真正的 temporary/deliverable 必须位于 task_root 内。
-        """
         path = self._normalize_path(file_path)
 
         if not path.exists() or not path.is_file():
             return None
 
         if self.is_protected_input(path):
-            return None
-
-        # 自动产物登记必须严格限制在本次任务工作区。
-        # Workspace 外部的路径可能只是 discover/read/inspect 返回的源文件，
-        # 不能仅凭出现在 Tool output 中就认定为 Agent 创建。
-        if not self._is_within(
-            path,
-            self.task_root,
-        ):
             return None
 
         role = self.classify_generated_file(
@@ -718,6 +694,61 @@ class WorkspaceManager:
                     )
 
         return registered
+
+    def promote_temporary_file_to_deliverable(
+        self,
+        file_path: str | Path,
+        *,
+        filename: Optional[str] = None,
+        copy_file: bool = True,
+    ) -> str:
+        """
+        将 Workspace temporary 中已经真实存在的文件晋升为正式交付物。
+
+        仅允许 temporary_dir 内文件晋升，避免把任意外部文件复制进交付目录。
+        默认 copy 而不是 move：
+        - 保留当前工具链对 temporary 路径的引用直到任务安全收尾；
+        - cleanup_temporary_files() 随后可正常删除 staging 文件；
+        - deliverables 中保留可追溯原始下载副本。
+        """
+        source = self._normalize_path(file_path)
+
+        if not source.exists() or not source.is_file():
+            raise FileNotFoundError(
+                f"待晋升临时文件不存在：{source}"
+            )
+
+        if not self._is_within(source, self.temp_dir):
+            raise ValueError(
+                "仅允许晋升当前 Workspace temporary 目录中的文件："
+                f"{source}"
+            )
+
+        target_name = self._safe_filename(
+            filename or source.name
+        )
+        target = Path(
+            self.build_deliverable_path(
+                target_name,
+                deduplicate=True,
+            )
+        )
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if copy_file:
+            shutil.copy2(source, target)
+        else:
+            shutil.move(str(source), str(target))
+
+        self.register_file(
+            target,
+            self.DELIVERABLE,
+            created_by_agent=True,
+            require_exists=True,
+        )
+
+        return str(target.resolve())
 
     def cleanup_temporary_files(
         self,
