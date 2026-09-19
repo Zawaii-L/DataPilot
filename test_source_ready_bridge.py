@@ -1,4 +1,4 @@
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from stage_orchestrator import DataState
 from tool_executor import ToolExecutionResult
 

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from task_planner import TaskPlanner
+from core.task_planner import TaskPlanner
 
 
 VALID_PLAN = """{

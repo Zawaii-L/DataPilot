@@ -2,7 +2,7 @@ from pathlib import Path
 
 from docx import Document
 
-from agent import DataPilotAgent
+from core.agent import DataPilotAgent
 from document_tools import read_word_file
 
 

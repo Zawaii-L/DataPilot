@@ -5,8 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent import DataPilotAgent
-from task_planner import TaskPlan
+from core.agent import DataPilotAgent
+from core.task_planner import TaskPlan
 
 
 class FakeTaskPlanner:

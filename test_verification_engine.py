@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from task_planner import TaskPlan
+from core.task_planner import TaskPlan
 from tool_executor import ToolExecutionResult
 from verification_engine import VerificationEngine
 

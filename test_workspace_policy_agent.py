@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from tool_registry import create_default_tool_registry
 from workspace_manager import WorkspaceManager
 

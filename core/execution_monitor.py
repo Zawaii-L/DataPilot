@@ -18,7 +18,6 @@ class ExecutionMonitor:
     """
 
     def __init__(self):
-        # 任务开始时间
         self.started_at = datetime.now()
 
         # Stage记录
@@ -37,11 +36,9 @@ class ExecutionMonitor:
         self._stage_start = {}
         self._tool_start = {}
 
-
     def reset(self):
         """
         重置监控状态
-        用于同一个Agent对象执行多个任务
         """
 
         self.started_at = datetime.now()
@@ -55,14 +52,12 @@ class ExecutionMonitor:
         self._stage_start = {}
         self._tool_start = {}
 
-
     # =========================
     # Stage Timing
     # =========================
 
     def start_stage(self, stage: str):
         self._stage_start[stage] = time.time()
-
 
     def end_stage(
         self,
@@ -75,7 +70,6 @@ class ExecutionMonitor:
         if start is None:
             return
 
-
         self.stage_records.append(
             {
                 "stage": stage,
@@ -87,9 +81,7 @@ class ExecutionMonitor:
             }
         )
 
-
         del self._stage_start[stage]
-
 
     # =========================
     # Tool Timing
@@ -98,8 +90,6 @@ class ExecutionMonitor:
     def start_tool(self, tool_name: str):
 
         self._tool_start[tool_name] = time.time()
-
-
 
     def end_tool(
         self,
@@ -112,7 +102,6 @@ class ExecutionMonitor:
         if start is None:
             return
 
-
         self.tool_records.append(
             {
                 "tool": tool_name,
@@ -124,9 +113,7 @@ class ExecutionMonitor:
             }
         )
 
-
         del self._tool_start[tool_name]
-
 
     # =========================
     # LLM Timing
@@ -135,19 +122,30 @@ class ExecutionMonitor:
     def record_llm(
         self,
         iteration: int,
-        duration: float
+        elapsed: float = None,
+        duration: float = None,
     ):
+        """
+        兼容旧版本 duration
+        以及 v5.8 agent_loop 使用的 elapsed
+
+        """
+
+        if elapsed is None:
+            elapsed = duration
+
+        if elapsed is None:
+            elapsed = 0.0
 
         self.llm_records.append(
             {
                 "iteration": iteration,
                 "duration_seconds": round(
-                    duration,
+                    elapsed,
                     3
                 ),
             }
         )
-
 
     # =========================
     # Loop Counter
@@ -156,8 +154,6 @@ class ExecutionMonitor:
     def add_loop(self):
 
         self.loop_count += 1
-
-
 
     # =========================
     # Summary
@@ -173,7 +169,6 @@ class ExecutionMonitor:
             ).total_seconds(),
             3
         )
-
 
         return {
 
@@ -192,7 +187,6 @@ class ExecutionMonitor:
                 self.loop_count,
         }
 
-
     # =========================
     # Console Report
     # =========================
@@ -201,7 +195,6 @@ class ExecutionMonitor:
 
         result = self.summary()
 
-
         print("\n")
         print("=" * 60)
         print(
@@ -209,18 +202,15 @@ class ExecutionMonitor:
         )
         print("=" * 60)
 
-
         print(
             f"Total Time: "
             f"{result['total_duration_seconds']}s"
         )
 
-
         print(
             f"Agent Loop Count: "
             f"{result['loop_count']}"
         )
-
 
         print("\nStage Timing:")
 
@@ -231,7 +221,6 @@ class ExecutionMonitor:
                 f"{item['duration_seconds']}s"
             )
 
-
         print("\nTool Timing:")
 
         for item in result["tool_timing"]:
@@ -240,7 +229,6 @@ class ExecutionMonitor:
                 f"- {item['tool']}: "
                 f"{item['duration_seconds']}s"
             )
-
 
         print("\nLLM Timing:")
 
@@ -251,6 +239,5 @@ class ExecutionMonitor:
                 f"{item['iteration']}: "
                 f"{item['duration_seconds']}s"
             )
-
 
         print("=" * 60)

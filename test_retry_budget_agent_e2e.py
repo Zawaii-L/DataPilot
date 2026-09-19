@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from tool_executor import ToolExecutor
 
 

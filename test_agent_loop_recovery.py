@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from tool_executor import ToolExecutionResult
 
 

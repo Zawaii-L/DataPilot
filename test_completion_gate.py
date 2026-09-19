@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from verification_engine import VerificationCheck, VerificationReport
 
 

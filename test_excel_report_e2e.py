@@ -10,9 +10,9 @@ from unittest.mock import patch
 import pandas as pd
 from openpyxl import load_workbook
 
-import agent as agent_module
-from agent import DataPilotAgent
-from task_planner import TaskPlan
+import core.agent as agent_module
+from core.agent import DataPilotAgent
+from core.task_planner import TaskPlan
 
 
 class FakeTaskPlanner:

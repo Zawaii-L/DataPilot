@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 from docx import Document
 from openpyxl import Workbook, load_workbook
 
-from agent import DataPilotAgent
+from core.agent import DataPilotAgent
 from document_tools import read_document
 
 

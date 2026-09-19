@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from agent import DataPilotAgent
+from core.agent import DataPilotAgent
 
 
 TEST_ROOT = (

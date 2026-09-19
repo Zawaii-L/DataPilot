@@ -1,4 +1,4 @@
-from agent import DataPilotAgent
+from core.agent import DataPilotAgent
 
 
 def progress(message):

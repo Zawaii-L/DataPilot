@@ -2,7 +2,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from agent import DataPilotAgent
+from core.agent import DataPilotAgent
 
 
 def create_test_excel(file_path: Path):

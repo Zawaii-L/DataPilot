@@ -6,7 +6,7 @@ from pathlib import Path
 from docx import Document
 from openpyxl import Workbook, load_workbook
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 
 
 TEST_ROOT = (

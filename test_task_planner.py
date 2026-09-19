@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from task_planner import TaskPlan, TaskPlanner
+from core.task_planner import TaskPlan, TaskPlanner
 
 
 class ScriptedCompletions:

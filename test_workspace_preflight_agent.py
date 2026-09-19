@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 import pandas as pd
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 
 
 def file_sha256(path: Path) -> str:

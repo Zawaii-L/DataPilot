@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from skill_registry import SkillRegistry
 from tool_registry import ToolRegistry
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 
 
 class DummyClient:

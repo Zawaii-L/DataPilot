@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from tool_executor import ToolExecutionResult
 
 
@@ -169,7 +169,7 @@ def main():
     print("PASS")
 
     print("\n测试 9：AgentLoopResult 协议包含 retry_policy_report")
-    from agent_loop import AgentLoopResult
+    from core.agent_loop import AgentLoopResult
 
     result = AgentLoopResult(
         success=False,

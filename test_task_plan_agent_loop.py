@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from agent_loop import AgentLoop
-from task_planner import TaskPlan
+from core.agent_loop import AgentLoop
+from core.task_planner import TaskPlan
 from tool_registry import create_default_tool_registry
 from verification_engine import VerificationReport
 

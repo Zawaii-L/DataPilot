@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent_loop import AgentLoop
+from core.agent_loop import AgentLoop
 from skill_registry import create_default_skill_registry
 from skill_selector import SkillSelector
 
