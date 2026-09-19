@@ -29,8 +29,8 @@ from document_report_tools import (
     append_web_sources_to_word,
 )
 
-from agent_loop import AgentLoop
-from task_planner import TaskPlanner
+from .agent_loop import AgentLoop
+from .task_planner import TaskPlanner
 from workspace_manager import WorkspaceManager
 
 from office_data_tools import (

@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 
-from agent import DataPilotAgent
+from core.agent import DataPilotAgent
 from clarification_gate import ClarificationGate
 
 # 文件夹扫描时默认忽略程序环境、版本控制、缓存和历史输出目录。

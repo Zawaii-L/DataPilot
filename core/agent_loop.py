@@ -5,17 +5,18 @@ from pathlib import Path
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from execution_context import ExecutionContext, ReferenceResolver
+from .execution_context import ExecutionContext, ReferenceResolver
 from tool_executor import ToolExecutionResult, ToolExecutor
 from tool_failure_recovery import build_recovery_hint
 from tool_registry import ToolRegistry, create_default_tool_registry
-from task_planner import TaskPlan
+from .task_planner import TaskPlan
 from skill_registry import SkillRegistry, create_default_skill_registry
 from skill_selector import SkillSelection, SkillSelector
 from verification_engine import VerificationEngine, VerificationReport
@@ -28,6 +29,7 @@ from stage_orchestrator import (
 
 from acquisition_adapter import build_acquisition_instruction
 from readback_registry import ReadbackRegistry
+from .execution_monitor import ExecutionMonitor
 
 
 load_dotenv()
@@ -46,6 +48,7 @@ class AgentLoopResult:
     decisions: List[Dict[str, Any]] = field(default_factory=list)
     verification_report: Optional[Dict[str, Any]] = None
     retry_policy_report: Optional[Dict[str, Any]] = None
+    execution_timing: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -61,6 +64,7 @@ class AgentLoopResult:
             "decisions": self.decisions,
             "verification_report": self.verification_report,
             "retry_policy_report": self.retry_policy_report,
+            "execution_timing": self.execution_timing,
         }
 
 
@@ -362,29 +366,50 @@ class AgentLoop:
         missing = self._missing_reread_paths(report)
         if not missing:
             return None
-        path = missing[0]
-        suffix = Path(path).suffix.lower()
-        preferred = {
-            ".xlsx": "inspect_professional_excel_report",
-            ".xls": "read_office_data",
-            ".docx": "inspect_professional_word_report",
-            ".doc": "read_office_data",
-            ".csv": "read_office_data",
-            ".txt": "read_office_data",
-            ".pdf": "read_office_data",
-        }.get(suffix, "read_office_data")
-        canonical = self.registry.resolve_name(preferred)
-        if canonical is None:
-            canonical = self.registry.resolve_name("read_office_data")
-        if canonical is None:
+        recovery_tools = []
+
+        for path in missing:
+            suffix = Path(path).suffix.lower()
+
+            preferred = {
+                ".xlsx": "inspect_professional_excel_report",
+                ".xls": "read_office_data",
+                ".docx": "inspect_professional_word_report",
+                ".doc": "read_office_data",
+                ".csv": "read_office_data",
+                ".txt": "read_office_data",
+                ".pdf": "read_office_data",
+            }.get(suffix, "read_office_data")
+
+            canonical = self.registry.resolve_name(preferred)
+
+            if canonical is None:
+                canonical = self.registry.resolve_name(
+                    "read_office_data"
+                )
+
+            if canonical is None:
+                continue
+
+            recovery_tools.append(
+                {
+                    "action_type": "tool",
+                    "tool": canonical,
+                    "arguments": {"file_path": path},
+                    "purpose": (
+                        "Completion Recovery："
+                        "确定性补齐最终交付物生成后的回读证据。"
+                    ),
+                    "recovery_reason": (
+                        "final_deliverables_reread"
+                    ),
+                }
+            )
+
+        if not recovery_tools:
             return None
-        return {
-            "action_type": "tool",
-            "tool": canonical,
-            "arguments": {"file_path": path},
-            "purpose": "Completion Recovery：确定性补齐最终交付物生成后的回读证据。",
-            "recovery_reason": "final_deliverables_reread",
-        }
+
+        return recovery_tools[0]
 
 
     # ============================================================
@@ -1304,6 +1329,8 @@ class AgentLoop:
         self.context = ExecutionContext()
         self.verifier = verifier or VerificationEngine()
         self.readback_registry = ReadbackRegistry()
+        # v5.8 Execution Observability
+        self.execution_monitor = ExecutionMonitor()
 
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv(
@@ -1530,6 +1557,9 @@ class AgentLoop:
         iteration = 1
 
         while iteration <= max_total_iterations:
+            if hasattr(self.execution_monitor, "add_loop"):
+                self.execution_monitor.add_loop()
+
             if self._is_cancel_requested():
                 return self._cancelled_result(
                     goal=goal,
@@ -1596,10 +1626,18 @@ class AgentLoop:
                         "本轮由 Python 确定性补读，不再消耗 LLM 猜测。"
                     )
             if decision is None:
+                llm_start_time = time.time()
+
                 decision = self._decide_next_action(
                     goal=goal,
                     state=state,
                 )
+
+                if hasattr(self.execution_monitor, "record_llm"):
+                    self.execution_monitor.record_llm(
+                        iteration=iteration,
+                        elapsed=time.time() - llm_start_time,
+                    )
 
             if self._is_cancel_requested():
                 return self._cancelled_result(
@@ -1644,6 +1682,12 @@ class AgentLoop:
                     self.readback_registry.to_dict()
                 )
 
+                self._perform_final_readback_precheck(
+                    data_state=data_state,
+                    tool_results=tool_results,
+                    runtime_context=runtime_context,
+                )
+
                 verification_report = self._run_completion_gate(
                     goal=goal,
                     final_answer=final_answer,
@@ -1674,6 +1718,7 @@ class AgentLoop:
                         verification_report=(
                             verification_report.to_dict()
                         ),
+                        execution_timing=self.execution_monitor.summary(),
                     )
 
                 latest_verification_report = (
@@ -2136,6 +2181,7 @@ class AgentLoop:
                         verification_report=(
                             verification_report.to_dict()
                         ),
+                        execution_timing=self.execution_monitor.summary(),
                     )
 
                 latest_verification_report = (
@@ -2155,10 +2201,17 @@ class AgentLoop:
                 iteration += 1
                 continue
 
+            self.execution_monitor.start_tool(canonical_name)
+
             result = self.executor.execute(
                 canonical_name,
                 resolved_arguments,
                 runtime_context=runtime_context,
+            )
+
+            self.execution_monitor.end_tool(
+                canonical_name,
+                success=bool(getattr(result, "success", False)),
             )
 
             self.context.store(
@@ -2401,6 +2454,80 @@ class AgentLoop:
                 else None
             ),
         )
+
+
+    def _perform_final_readback_precheck(
+        self,
+        *,
+        data_state: DataState,
+        tool_results: List[ToolExecutionResult],
+        runtime_context: Dict[str, Any],
+    ) -> None:
+        """
+        v5.8 Final Readback Hook
+
+        Completion Gate 之前主动补齐最终交付物读取证据。
+        VerificationEngine 只负责验收，不负责产生证据。
+        """
+
+        readback_map = {
+            ".xlsx": "inspect_professional_excel_report",
+            ".xls": "read_office_data",
+            ".docx": "inspect_professional_word_report",
+            ".doc": "read_office_data",
+            ".csv": "read_office_data",
+            ".txt": "read_office_data",
+            ".pdf": "read_office_data",
+        }
+
+        existing = {
+            str(item.tool_name or "").strip().lower()
+            for item in tool_results
+            if getattr(item, "success", False)
+        }
+
+        for path in self._deduplicate_deliverable_paths(
+            data_state.deliverable_paths
+        ):
+            suffix = Path(path).suffix.lower()
+            preferred = readback_map.get(suffix)
+
+            if not preferred:
+                continue
+
+            canonical = self.registry.resolve_name(preferred)
+
+            if canonical is None:
+                continue
+
+            # 避免重复读取
+            if canonical.lower() in existing:
+                continue
+
+            self.report_progress(
+                "[Final Readback Hook] "
+                f"正在读取最终交付物：{Path(path).name}"
+            )
+
+            self.execution_monitor.start_tool(canonical)
+
+            result = self.executor.execute(
+                canonical,
+                {"file_path": path},
+                runtime_context=runtime_context,
+            )
+
+            self.execution_monitor.end_tool(
+                canonical,
+                success=bool(getattr(result, "success", False)),
+            )
+
+            tool_results.append(result)
+
+            self.context.store(
+                f"final_readback_{len(tool_results)}",
+                result,
+            )
 
     def _run_completion_gate(
         self,

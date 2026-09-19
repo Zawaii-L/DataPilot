@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from reporting_content_audit import ReportingContentAuditor
-from task_planner import TaskPlan
+from core.task_planner import TaskPlan
 from tool_executor import ToolExecutionResult
 
 

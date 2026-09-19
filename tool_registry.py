@@ -394,6 +394,7 @@ def create_default_tool_registry() -> ToolRegistry:
     from web_data_tools import download_data_file
     from web_search_tools import search_web, read_webpage
     from office_report_tools import generate_office_deliverables
+    from time_series_tool import analyze_time_series
     from file_discovery_tools import (
         discover_data_files,
         inspect_data_files,
@@ -849,6 +850,31 @@ def create_default_tool_registry() -> ToolRegistry:
             "编辑结果字典，包含 success、source_path、output_path、sheet_names、"
             "operation_count、operations。"
         ),
+    )
+
+    # ------------------------------------------------------------
+    # v5.7 Generic Time Series Engine
+    # ------------------------------------------------------------
+
+    registry.register(
+        "analyze_time_series",
+        analyze_time_series,
+        (
+            "调用 DataPilot v5.7 Generic Time Series Engine "
+            "对 CSV / Excel 时间序列数据进行结构识别、趋势分析、"
+            "异常检测、周期检测，并生成自然语言摘要。"
+        ),
+        category="time_series_analysis",
+        parameters={
+            "file_path": "CSV / Excel 时间序列数据文件路径",
+        },
+        returns=(
+            "统一分析结果 Schema，包含 analysis_result 和 summary"
+        ),
+        aliases=[
+            "time_series_analysis",
+            "analyze_timeseries",
+        ],
     )
 
     # ------------------------------------------------------------
