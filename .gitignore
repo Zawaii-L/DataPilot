@@ -1,18 +1,29 @@
-# Python
+# ==========================================
+# DataPilot Git Ignore
+# ==========================================
+
+# Python cache
 __pycache__/
 *.py[cod]
 *.pyo
+*.pyd
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
 env/
 
-# Environment variables
+# Environment variables / secrets
 .env
+.env.*
+!.env.example
 
-# Generated outputs
+# ==========================================
+# Runtime generated outputs
+# ==========================================
+
 outputs/
+output/
 
 # Generated data / Office files
 *.csv
@@ -25,16 +36,63 @@ outputs/
 *.jpg
 *.jpeg
 
-# Portfolio assets are intentionally versioned
+# ==========================================
+# Portfolio assets
+# These are intentionally versioned
+# ==========================================
+
 !assets/
 !assets/**/*.png
 !assets/**/*.jpg
 !assets/**/*.jpeg
 
+# ==========================================
+# Reproducible demo files
+# ==========================================
+
+!examples/
+!examples/**/*.xlsx
+!examples/**/*.csv
+
+# ==========================================
+# PyInstaller
+# ==========================================
+
+build/
+dist/
+
+# Keep PyInstaller specification
+!DataPilot.spec
+
+# ==========================================
+# Testing / temporary files
+# ==========================================
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+*.tmp
+*.temp
+*.log
+~$*
+
+# Temporary repository inspection files
+git_files.txt
+git_status.txt
+assets_list.txt
+
+# ==========================================
 # IDE
+# ==========================================
+
 .vscode/
 .idea/
 
+# ==========================================
 # Operating system
+# ==========================================
+
 .DS_Store
 Thumbs.db
+desktop.ini

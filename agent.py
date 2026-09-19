@@ -4744,13 +4744,222 @@ JSON 格式：
             **workspace_context,
         }
 
+    @staticmethod
+    def _resolve_dynamic_iteration_budget(
+        task: str,
+        task_plan: Dict[str, Any],
+        *,
+        explicit_max_iterations: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        DataPilot v5.1 Dynamic Loop Budget。
+
+        规则：
+        - 用户/测试显式传 max_iterations 时，严格尊重显式值；
+        - 否则根据任务合同确定正常执行预算；
+        - Completion Recovery 仍由 AgentLoop 单独保留，不挤占正常预算。
+        """
+        if explicit_max_iterations is not None:
+            value = max(1, int(explicit_max_iterations))
+            return {
+                "normal_iterations": value,
+                "mode": "explicit",
+                "reason": "调用方显式指定 max_iterations",
+            }
+
+        goal = str(task or "").lower()
+        plan = task_plan if isinstance(task_plan, dict) else {}
+
+        evidence = plan.get("evidence_requirements") or []
+        sources = plan.get("source_requirements") or []
+        deliverables = plan.get("deliverable_requirements") or []
+        execution = plan.get("execution_requirements") or []
+        verification = plan.get("verification_requirements") or []
+
+        combined = " ".join(
+            [goal]
+            + [str(x).lower() for x in evidence]
+            + [str(x).lower() for x in sources]
+            + [str(x).lower() for x in deliverables]
+            + [str(x).lower() for x in execution]
+            + [str(x).lower() for x in verification]
+        )
+
+        web_intent = any(
+            token in combined
+            for token in (
+                "联网", "网络", "网页", "公开", "权威数据源",
+                "download", "下载", "search_web", "read_webpage",
+                "url", "来源",
+            )
+        )
+        analysis_intent = any(
+            token in combined
+            for token in (
+                "分析", "统计", "清洗", "质量", "透视",
+                "可视化", "图表", "趋势", "异常",
+            )
+        )
+        multi_artifact = (
+            len(deliverables) >= 2
+            or (
+                any(token in combined for token in ("excel", "xlsx"))
+                and any(token in combined for token in ("word", "docx", "报告"))
+            )
+        )
+        verification_intent = any(
+            token in combined
+            for token in (
+                "核验", "验证", "一致", "重新读取",
+                "verification", "复核",
+            )
+        )
+        raw_retention = any(
+            token in combined
+            for token in (
+                "原始数据", "保存原始", "保留原始", "raw data",
+            )
+        )
+
+        # 三档正常预算。Completion Gate 会提前停止，所以这是 ceiling，
+        # 不是要求 Agent 必须用完。
+        if web_intent and analysis_intent and multi_artifact:
+            budget = 28
+            tier = "complex_web_workflow"
+        elif web_intent or multi_artifact or verification_intent:
+            budget = 20
+            tier = "standard_multi_step"
+        else:
+            budget = 12
+            tier = "simple_or_local"
+
+        # 原始数据保留 + 最终核验会增加确定性步骤，复杂任务给少量余量。
+        if budget >= 20 and raw_retention:
+            budget += 2
+        if budget >= 20 and verification_intent:
+            budget += 2
+
+        # 防止失控；这是正常执行 ceiling，不含 completion recovery。
+        budget = min(budget, 32)
+
+        return {
+            "normal_iterations": budget,
+            "mode": "dynamic",
+            "tier": tier,
+            "signals": {
+                "web_intent": web_intent,
+                "analysis_intent": analysis_intent,
+                "multi_artifact": multi_artifact,
+                "verification_intent": verification_intent,
+                "raw_retention": raw_retention,
+            },
+            "reason": "根据 TaskPlan 与用户目标确定正常执行预算上限",
+        }
+
+    @staticmethod
+    def _task_requires_raw_download_retention(
+        task: str,
+        task_plan: Dict[str, Any],
+    ) -> bool:
+        """
+        确定性判断 Task Contract 是否明确要求保留网络下载的原始数据。
+        只在用户/TaskPlan 明确要求时晋升，避免所有下载文件污染 deliverables。
+        """
+        plan = task_plan if isinstance(task_plan, dict) else {}
+        parts = [str(task or "")]
+
+        for key in (
+            "deliverable_requirements",
+            "execution_requirements",
+            "source_requirements",
+            "verification_requirements",
+        ):
+            value = plan.get(key) or []
+            if isinstance(value, (list, tuple, set)):
+                parts.extend(str(item) for item in value)
+            else:
+                parts.append(str(value))
+
+        combined = " ".join(parts).lower()
+
+        raw_tokens = (
+            "原始数据",
+            "原始文件",
+            "原始下载",
+            "raw data",
+            "raw file",
+        )
+        retain_tokens = (
+            "保存",
+            "保留",
+            "下载并保存",
+            "留存",
+            "交付",
+            "deliver",
+            "retain",
+            "preserve",
+            "save",
+        )
+
+        return (
+            any(token in combined for token in raw_tokens)
+            and any(token in combined for token in retain_tokens)
+        )
+
+    @staticmethod
+    def _extract_successful_download_paths(
+        tool_results,
+    ) -> list[str]:
+        """
+        只从真实成功的 download_data_file 工具结果提取本地文件路径。
+        不相信 LLM 文本声明，不把 search_web/read_webpage 当成原始数据文件。
+        """
+        paths: list[str] = []
+
+        def add_candidate(value):
+            if not isinstance(value, (str, Path)):
+                return
+            candidate = Path(str(value))
+            try:
+                if candidate.exists() and candidate.is_file():
+                    resolved = str(candidate.resolve())
+                    if resolved not in paths:
+                        paths.append(resolved)
+            except Exception:
+                return
+
+        for result in tool_results or []:
+            if not getattr(result, "success", False):
+                continue
+            if str(getattr(result, "tool_name", "")) != "download_data_file":
+                continue
+
+            output = getattr(result, "output", None)
+
+            if isinstance(output, (str, Path)):
+                add_candidate(output)
+            elif isinstance(output, dict):
+                # 兼容不同 download_data_file 返回合同。
+                for key, value in output.items():
+                    key_lower = str(key).lower()
+                    if any(
+                        token in key_lower
+                        for token in (
+                            "path", "file", "download",
+                            "saved", "output",
+                        )
+                    ):
+                        add_candidate(value)
+
+        return paths
+
     def execute_v31_agent_task(
         self,
         user_task: str,
         input_paths=None,
         file_path=None,
         output_dir="outputs",
-        max_iterations: int = 12,
+        max_iterations: Optional[int] = None,
         cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
@@ -4820,8 +5029,23 @@ JSON 格式：
 
         runtime_context["task_plan"] = task_plan.to_dict()
 
+        budget_policy = self._resolve_dynamic_iteration_budget(
+            task,
+            runtime_context["task_plan"],
+            explicit_max_iterations=max_iterations,
+        )
+        resolved_max_iterations = int(
+            budget_policy["normal_iterations"]
+        )
+        runtime_context["iteration_budget_policy"] = budget_policy
+
         self.report_progress(
             "TaskPlan 已建立并注入 AgentLoop 运行上下文。"
+        )
+        self.report_progress(
+            "Dynamic Loop Budget："
+            f"正常执行上限 {resolved_max_iterations} 轮；"
+            "Completion Recovery 预算独立保留。"
         )
 
         self.report_progress(
@@ -4847,7 +5071,7 @@ JSON 格式：
             progress_callback=self.progress_callback,
             client=self.client,
             model=self.model,
-            max_iterations=max_iterations,
+            max_iterations=resolved_max_iterations,
             cancel_event=cancel_event,
         )
 
@@ -4856,7 +5080,76 @@ JSON 格式：
             context=runtime_context,
         )
 
-        output_files = []
+        raw_download_deliverables = []
+
+        if self._task_requires_raw_download_retention(
+            task,
+            runtime_context.get("task_plan") or {},
+        ):
+            downloaded_paths = self._extract_successful_download_paths(
+                loop_result.tool_results
+            )
+
+            deliverables_root = Path(
+                workspace_manager.deliverables_dir
+            ).resolve()
+
+            def is_inside_deliverables(path_value):
+                try:
+                    candidate = Path(str(path_value)).resolve()
+                    candidate.relative_to(deliverables_root)
+                    return candidate.is_file()
+                except Exception:
+                    return False
+
+            # 如果执行阶段已经把原始下载文件直接放进 deliverables，
+            # Raw Retention 已满足，绝不能再从 temporary promote 出 asos_2.csv。
+            existing_raw_deliverables = [
+                str(Path(path_value).resolve())
+                for path_value in downloaded_paths
+                if is_inside_deliverables(path_value)
+            ]
+
+            if existing_raw_deliverables:
+                raw_download_deliverables.extend(
+                    existing_raw_deliverables
+                )
+                self.report_progress(
+                    "Raw Data Retention：正式交付目录中已存在原始下载文件；"
+                    "跳过重复晋升。"
+                )
+            elif loop_result.stop_reason != "user_cancelled":
+                # 只有尚无正式 raw deliverable 时，才从 temporary 中晋升一个
+                # 成功下载的原始文件。避免多个探索性下载都变成最终交付物。
+                for downloaded_path in reversed(downloaded_paths):
+                    try:
+                        promoted = (
+                            workspace_manager
+                            .promote_temporary_file_to_deliverable(
+                                downloaded_path
+                            )
+                        )
+                        raw_download_deliverables.append(promoted)
+                        self.report_progress(
+                            "Raw Data Retention：已将最终采用的原始下载文件"
+                            "晋升为正式交付物："
+                            f"{Path(promoted).name}"
+                        )
+                        break
+                    except ValueError:
+                        continue
+                    except Exception as error:
+                        self.report_progress(
+                            "Raw Data Retention：原始下载文件晋升失败："
+                            f"{type(error).__name__}: {error}"
+                        )
+            else:
+                self.report_progress(
+                    "Raw Data Retention：任务已由用户终止，"
+                    "不再新增原始文件副本。"
+                )
+
+        output_files = list(raw_download_deliverables)
 
         for tool_result in loop_result.tool_results:
             if not tool_result.success:
@@ -5508,6 +5801,7 @@ JSON 格式：
                 "requested_output_dir"
             ),
             "output_files": output_files,
+            "raw_download_deliverables": raw_download_deliverables,
             "workspace": workspace_summary,
             "workspace_manifest": str(
                 workspace_manager.manifest_path
@@ -5516,57 +5810,9 @@ JSON 格式：
             "final_answer": loop_result.final_answer,
             "answer": loop_result.final_answer,
             "stop_reason": loop_result.stop_reason,
+            "iteration_budget_policy": budget_policy,
             "iterations": loop_result.iterations,
-            # v5.0+ Execution Metrics
-            #
-            # tool_results 中同时包含：
-            # 1. 真正进入 ToolExecutor 的调用；
-            # 2. 被 Execution Budget / Read-Only Boundary
-            #    拦截、没有真实执行的 Policy Block。
-            #
-            # 因此不能再把 len(tool_results) 直接显示成
-            # “实际工具调用数量”。
-            "tool_count": sum(
-                1
-                for item in loop_result.tool_results
-                if not (
-                    isinstance(item.output, dict)
-                    and item.output.get("policy_blocked")
-                )
-            ),
-            "tool_request_count": len(
-                loop_result.tool_results
-            ),
-            "policy_blocked_count": sum(
-                1
-                for item in loop_result.tool_results
-                if (
-                    isinstance(item.output, dict)
-                    and item.output.get("policy_blocked")
-                )
-            ),
-            "failed_tool_count": sum(
-                1
-                for item in loop_result.tool_results
-                if (
-                    not item.success
-                    and not (
-                        isinstance(item.output, dict)
-                        and item.output.get("policy_blocked")
-                    )
-                )
-            ),
-            "successful_tool_count": sum(
-                1
-                for item in loop_result.tool_results
-                if (
-                    item.success
-                    and not (
-                        isinstance(item.output, dict)
-                        and item.output.get("policy_blocked")
-                    )
-                )
-            ),
+            "tool_count": len(loop_result.tool_results),
             "tool_results": [
                 item.to_dict()
                 for item in loop_result.tool_results

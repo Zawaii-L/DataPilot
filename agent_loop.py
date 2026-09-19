@@ -19,6 +19,15 @@ from task_planner import TaskPlan
 from skill_registry import SkillRegistry, create_default_skill_registry
 from skill_selector import SkillSelection, SkillSelector
 from verification_engine import VerificationEngine, VerificationReport
+from stage_orchestrator import (
+    AgentStage,
+    DataState,
+    StageOrchestrator,
+    StageRoute,
+)
+
+from acquisition_adapter import build_acquisition_instruction
+from readback_registry import ReadbackRegistry
 
 
 load_dotenv()
@@ -334,6 +343,932 @@ class AgentLoop:
 
         return None
 
+    @staticmethod
+    def _missing_reread_paths(report: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(report, dict):
+            return []
+        for check in report.get("checks") or []:
+            if not isinstance(check, dict) or check.get("check_id") != "final_deliverables_reread":
+                continue
+            missing = []
+            for item in check.get("evidence") or []:
+                text = str(item or "").strip()
+                if text.endswith(": MISSING"):
+                    missing.append(text[:-len(": MISSING")].strip())
+            return missing
+        return []
+
+    def _build_deterministic_reread_decision(self, report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        missing = self._missing_reread_paths(report)
+        if not missing:
+            return None
+        path = missing[0]
+        suffix = Path(path).suffix.lower()
+        preferred = {
+            ".xlsx": "inspect_professional_excel_report",
+            ".xls": "read_office_data",
+            ".docx": "inspect_professional_word_report",
+            ".doc": "read_office_data",
+            ".csv": "read_office_data",
+            ".txt": "read_office_data",
+            ".pdf": "read_office_data",
+        }.get(suffix, "read_office_data")
+        canonical = self.registry.resolve_name(preferred)
+        if canonical is None:
+            canonical = self.registry.resolve_name("read_office_data")
+        if canonical is None:
+            return None
+        return {
+            "action_type": "tool",
+            "tool": canonical,
+            "arguments": {"file_path": path},
+            "purpose": "Completion Recovery：确定性补齐最终交付物生成后的回读证据。",
+            "recovery_reason": "final_deliverables_reread",
+        }
+
+
+    # ============================================================
+    # v5.2 Multi-Stage Router
+    # ============================================================
+
+    _ACQUISITION_TOOL_HINTS = (
+        "search_web",
+        "read_webpage",
+        "download_data_file",
+        "list_files",
+        "scan",
+        "discover",
+    )
+
+    _DELIVERY_TOOL_HINTS = (
+        "generate",
+        "export",
+        "create_professional",
+        "apply_word_edits",
+        "apply_excel_edits",
+        "save",
+        "write",
+    )
+
+    _VERIFICATION_TOOL_HINTS = (
+        "inspect_professional_excel_report",
+        "inspect_professional_word_report",
+        "verify",
+        "validate",
+        "inspect_pdf",
+    )
+
+    _PROCESSING_TOOL_HINTS = (
+        "read_office_data",
+        "normalize_semantic_dataframe",
+        "analyze_semantic",
+        "semantic",
+        "clean",
+        "missing",
+        "duplicate",
+        "quality",
+        "statistics",
+        "statistic",
+        "group",
+        "pivot",
+        "sort",
+        "filter",
+        "calculate",
+        "chart",
+        "visual",
+        "plot",
+    )
+
+    @classmethod
+    def _classify_tool_stage(
+        cls,
+        tool_name: str,
+    ) -> AgentStage:
+        """
+        将真实 Tool 映射到执行 Stage。
+
+        顺序很重要：
+        - 最终 Excel/Word inspect 属于 Verification；
+        - read_office_data 属于 Processing；
+        - download/search/read_webpage 属于 Acquisition；
+        - 生成/编辑最终文件属于 Delivery。
+        """
+        name = str(tool_name or "").strip().lower()
+
+        if any(
+            hint in name
+            for hint in cls._VERIFICATION_TOOL_HINTS
+        ):
+            return AgentStage.VERIFICATION
+
+        if any(
+            hint in name
+            for hint in cls._ACQUISITION_TOOL_HINTS
+        ):
+            return AgentStage.ACQUISITION
+
+        if any(
+            hint in name
+            for hint in cls._DELIVERY_TOOL_HINTS
+        ):
+            return AgentStage.DELIVERY
+
+        if any(
+            hint in name
+            for hint in cls._PROCESSING_TOOL_HINTS
+        ):
+            return AgentStage.PROCESSING
+
+        # 未识别工具保守归 Processing：
+        # 它是“理解/处理真实工作对象”的默认阶段，
+        # 后续 v5.2-3 会结合 Registry metadata 进一步精确分类。
+        return AgentStage.PROCESSING
+
+    @staticmethod
+    def _stage_index(stage: AgentStage) -> int:
+        return StageOrchestrator.ORDER.index(stage)
+
+    def _sync_stage_for_tool(
+        self,
+        *,
+        route: StageRoute,
+        current_stage: AgentStage,
+        tool_name: str,
+        runtime_context: Dict[str, Any],
+    ) -> AgentStage:
+        """
+        v5.2-2 Stage Router。
+
+        当 LLM 从“找数据”自然转向“处理数据”，或从处理转向输出时，
+        Python 根据真实 Tool 类型推进 Stage，并把 Stage State 写入
+        runtime_context。当前版本只做路由与边界可见化，不在这里
+        强制消耗独立预算；独立预算在 v5.2-3 接入。
+        """
+        requested_stage = self._classify_tool_stage(tool_name)
+
+        current_index = self._stage_index(current_stage)
+        requested_index = self._stage_index(requested_stage)
+
+        # 如果目标 Stage 在当前 Stage 之后，依次关闭中间已启用 Stage。
+        if requested_index > current_index:
+            for stage in StageOrchestrator.ORDER[
+                current_index:requested_index
+            ]:
+                state = route.states[stage]
+                if state.enabled and not state.gate_passed:
+                    state.mark_passed(
+                        "Stage Router 检测到工作流已进入后续阶段。"
+                    )
+
+            target_state = route.states[requested_stage]
+            if target_state.enabled:
+                target_state.activate()
+                current_stage = requested_stage
+
+        # 如果 LLM 想回到更早 Stage，不允许静默乱跳。
+        # 真正回退必须由后续 Recovery Router 根据 Gate FAIL 决定。
+        elif requested_index < current_index:
+            self.report_progress(
+                "[Stage Router] 检测到跨阶段向后工具调用："
+                f"{current_stage.value} → {requested_stage.value}。"
+                "当前版本保留调用但不改变 Stage；"
+                "v5.2 Recovery Router 将负责确定性回退。"
+            )
+
+        else:
+            route.states[current_stage].activate()
+
+        runtime_context["stage_route"] = route.to_dict()
+        runtime_context["current_stage"] = current_stage.value
+
+        return current_stage
+
+    @staticmethod
+    def _build_stage_runtime_context(
+        *,
+        route: StageRoute,
+        current_stage: AgentStage,
+        data_state: DataState,
+    ) -> Dict[str, Any]:
+        return {
+            "current_stage": current_stage.value,
+            "stage_route": route.to_dict(),
+            "data_state": data_state.to_dict(),
+        }
+
+
+    @staticmethod
+    def _enabled_stage_normal_budget(
+        route: StageRoute,
+    ) -> int:
+        """所有启用 Stage 的正常预算总和，仅作为全局失控保险。"""
+        return sum(
+            int(route.states[stage].budget.normal_iterations)
+            for stage in route.enabled_stages
+        )
+
+    @staticmethod
+    def _stage_budget_summary(
+        route: StageRoute,
+    ) -> str:
+        parts = []
+        for stage in route.enabled_stages:
+            state = route.states[stage]
+            parts.append(
+                f"{stage.value}="
+                f"{state.budget.normal_iterations}"
+                f"(+{state.budget.recovery_iterations})"
+            )
+        return ", ".join(parts)
+
+    @staticmethod
+    def _stage_budget_block_reason(
+        *,
+        route: StageRoute,
+        stage: AgentStage,
+    ) -> Optional[str]:
+        state = route.states[stage]
+        if not state.enabled:
+            return (
+                f"{stage.value} Stage 未被本任务启用。"
+            )
+        if state.remaining_normal_iterations <= 0:
+            return (
+                f"{stage.value} Stage Normal Budget 已耗尽；"
+                "不能继续在该阶段执行新的普通 Tool。"
+            )
+        return None
+
+
+    @staticmethod
+    def _extract_output_mapping(
+        output: Any,
+    ) -> Dict[str, Any]:
+        if isinstance(output, dict):
+            return output
+        if hasattr(output, "to_dict"):
+            try:
+                value = output.to_dict()
+                if isinstance(value, dict):
+                    return value
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
+    def _update_data_state_from_tool_result(
+        cls,
+        *,
+        data_state: DataState,
+        tool_result: ToolExecutionResult,
+    ) -> None:
+        """仅依据成功的真实 Tool Observation 更新跨 Stage Data State。"""
+        if not getattr(tool_result, "success", False):
+            return
+
+        name = str(
+            getattr(tool_result, "tool_name", "") or ""
+        ).strip().lower()
+        output = cls._extract_output_mapping(
+            getattr(tool_result, "output", None)
+        )
+        arguments = getattr(tool_result, "arguments", {}) or {}
+
+        def first_text(mapping, keys):
+            for key in keys:
+                value = mapping.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+
+        def first_list(mapping, keys):
+            for key in keys:
+                value = mapping.get(key)
+                if isinstance(value, (list, tuple)):
+                    return [
+                        str(item)
+                        for item in value
+                        if str(item).strip()
+                    ]
+            return []
+
+        schema = first_list(
+            output,
+            (
+                "columns",
+                "schema",
+                "current_schema",
+                "column_names",
+            ),
+        )
+        result_ref = first_text(
+            output,
+            (
+                "result_ref",
+                "data_ref",
+                "dataframe_ref",
+                "output_ref",
+                "analysis_df_ref",
+                "clean_df_ref",
+                "statistics_ref",
+            ),
+        )
+
+        if "normalize_semantic_dataframe" in name:
+            if result_ref:
+                data_state.analysis_data_ref = result_ref
+                data_state.set_current_data(
+                    result_ref,
+                    schema=schema or None,
+                )
+            elif schema:
+                data_state.current_schema = schema
+
+            conversion_log = (
+                output.get("conversion_log")
+                or output.get("unit_conversions")
+            )
+            if isinstance(conversion_log, list):
+                data_state.conversion_log = list(conversion_log)
+
+            dictionary = (
+                output.get("field_dictionary")
+                or output.get("field_mapping")
+            )
+            if isinstance(dictionary, list):
+                data_state.field_dictionary = list(dictionary)
+
+        elif any(
+            token in name
+            for token in ("clean", "run_data_pipeline")
+        ):
+            if result_ref:
+                data_state.clean_data_ref = result_ref
+                data_state.set_current_data(
+                    result_ref,
+                    schema=schema or None,
+                )
+            elif schema:
+                data_state.current_schema = schema
+
+            quality = (
+                output.get("quality_summary")
+                or output.get("data_quality")
+            )
+            if isinstance(quality, dict):
+                data_state.quality_summary = dict(quality)
+
+        elif any(
+            token in name
+            for token in (
+                "read_office_data",
+                "load_data",
+                "read_csv",
+                "read_excel",
+                "get_data_info",
+            )
+        ):
+            # SOURCE_READY 修复：
+            # 成功读取文件不一定返回内部 dataframe ref。
+            # 但读取动作本身已经形成真实数据状态。
+
+            source_ref = first_text(
+                arguments,
+                (
+                    "file_path",
+                    "path",
+                    "input_path",
+                    "source_path",
+                ),
+            )
+
+            effective_ref = result_ref or source_ref
+
+            if effective_ref:
+                if data_state.raw_data_ref is None:
+                    data_state.raw_data_ref = effective_ref
+
+                data_state.set_current_data(
+                    effective_ref,
+                    schema=schema or None,
+                )
+
+            elif schema:
+                data_state.current_schema = schema
+
+        elif any(
+            token in name
+            for token in ("statistics", "statistic", "group_multi")
+        ):
+            if result_ref:
+                data_state.statistics_ref = result_ref
+
+        if "download" in name:
+            url = first_text(arguments, ("url", "source_url"))
+            if url and url not in data_state.source_urls:
+                data_state.source_urls.append(url)
+
+            downloaded_path = first_text(
+                output,
+                (
+                    "output_path",
+                    "file_path",
+                    "path",
+                    "saved_path",
+                ),
+            ) or first_text(
+                arguments,
+                (
+                    "output_path",
+                    "file_path",
+                    "path",
+                ),
+            )
+            if (
+                downloaded_path
+                and downloaded_path not in data_state.source_paths
+            ):
+                data_state.source_paths.append(downloaded_path)
+
+        path_candidates: List[str] = []
+        for mapping in (output, arguments):
+            for key in (
+                "output_path",
+                "file_path",
+                "path",
+                "saved_path",
+                "excel_path",
+                "word_path",
+                "pdf_path",
+                "image_path",
+                "chart_path",
+                "chart_paths",
+                "image_paths",
+                "output_files",
+                "deliverable_paths",
+            ):
+                value = mapping.get(key)
+
+                if isinstance(value, str) and value.strip():
+                    path_candidates.append(value.strip())
+
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, str) and item.strip():
+                            path_candidates.append(item.strip())
+
+        if cls._classify_tool_stage(name) == AgentStage.DELIVERY:
+            for item in path_candidates:
+                if item.lower().endswith(
+                    (
+                        ".xlsx", ".xls", ".docx", ".pdf",
+                        ".png", ".jpg", ".jpeg", ".csv",
+                    )
+                ):
+                    if item not in data_state.deliverable_paths:
+                        data_state.deliverable_paths.append(item)
+
+
+
+    @staticmethod
+    def _required_deliverable_extensions(
+        task_plan: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        """从 TaskPlan 提取最终成果类型，返回规范化扩展名。"""
+        if not isinstance(task_plan, dict):
+            return []
+
+        values: List[str] = []
+        for key in (
+            "deliverable_requirements",
+            "required_deliverables",
+            "deliverables",
+            "output_requirements",
+        ):
+            value = task_plan.get(key)
+            if isinstance(value, str):
+                values.append(value)
+            elif isinstance(value, (list, tuple)):
+                values.extend(str(item) for item in value)
+
+        combined = " ".join(values).lower()
+        mapping = (
+            ((".xlsx", "excel", "xlsx", "电子表格"), ".xlsx"),
+            ((".docx", "word", "docx", "综合分析报告", "word报告"), ".docx"),
+            ((".pdf", "pdf"), ".pdf"),
+            ((".png", "png", "图表", "可视化"), ".png"),
+            ((".csv", "csv", "原始数据"), ".csv"),
+        )
+
+        result: List[str] = []
+        for tokens, extension in mapping:
+            if any(token in combined for token in tokens):
+                if extension not in result:
+                    result.append(extension)
+        return result
+
+    @classmethod
+    def _delivery_gate_status(
+        cls,
+        *,
+        data_state: DataState,
+        task_plan: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Delivery → Verification Gate。
+
+        只有 TaskPlan 要求的最终成果类型都已经由成功 Tool Observation
+        登记到 DataState.deliverable_paths，才允许进入 Verification。
+        文件真实性/最终回读仍由 Completion Gate 负责。
+        """
+        required = cls._required_deliverable_extensions(task_plan)
+        paths = cls._deduplicate_deliverable_paths(
+            data_state.deliverable_paths
+        )
+
+        present_extensions = {
+            Path(item).suffix.lower()
+            for item in paths
+            if Path(item).suffix
+        }
+
+        missing = [
+            ext
+            for ext in required
+            if ext not in present_extensions
+        ]
+
+        # 没有显式 TaskPlan 类型时，至少要求存在一个登记的最终成果。
+        passed = (
+            not missing and bool(paths)
+            if not required
+            else not missing
+        )
+
+        if passed:
+            reason = (
+                "TaskPlan 要求的最终成果均已由成功 Tool Observation "
+                "登记，可进入 Verification。"
+            )
+        elif missing:
+            reason = (
+                "Delivery 尚缺少 TaskPlan 要求的最终成果："
+                + ", ".join(missing)
+                + "。"
+            )
+        else:
+            reason = (
+                "Delivery 尚未登记任何成功生成的最终成果，"
+                "不能进入 Verification。"
+            )
+
+        return {
+            "passed": passed,
+            "stage": AgentStage.DELIVERY.value,
+            "signal": (
+                "DELIVERABLES_READY"
+                if passed
+                else "DELIVERABLES_NOT_READY"
+            ),
+            "reason": reason,
+            "required_extensions": required,
+            "present_extensions": sorted(present_extensions),
+            "missing_extensions": missing,
+            "deliverable_paths": paths,
+        }
+
+    @staticmethod
+    def _acquisition_gate_status(
+        data_state: DataState,
+    ) -> Dict[str, Any]:
+        """
+        Acquisition → Processing 的 SOURCE_READY Gate。
+
+        下载成功本身不算 SOURCE_READY。
+        必须至少存在“成功读取后形成的数据引用或 schema”。
+        """
+        has_source = bool(
+            data_state.source_urls
+            or data_state.source_paths
+        )
+        has_readable_data = bool(
+            data_state.raw_data_ref
+            or data_state.current_data_ref
+            or data_state.current_schema
+        )
+
+        passed = has_readable_data
+
+        if passed:
+            reason = (
+                "来源数据已经成功读取并形成可追踪的数据状态，"
+                "SOURCE_READY。"
+            )
+        elif has_source:
+            reason = (
+                "来源已获取/下载，但尚无成功读取形成的数据引用或 schema；"
+                "Acquisition 不能提前 PASS。"
+            )
+        else:
+            reason = (
+                "尚未形成可读取的数据来源与数据状态；"
+                "Acquisition 不能进入 Processing。"
+            )
+
+        return {
+            "passed": passed,
+            "stage": AgentStage.ACQUISITION.value,
+            "signal": "SOURCE_READY" if passed else "SOURCE_NOT_READY",
+            "reason": reason,
+            "raw_data_ref": data_state.raw_data_ref,
+            "current_data_ref": data_state.current_data_ref,
+            "current_schema": list(data_state.current_schema),
+            "source_urls": list(data_state.source_urls),
+            "source_paths": list(data_state.source_paths),
+        }
+
+    @staticmethod
+    def _processing_gate_status(
+        data_state: DataState,
+    ) -> Dict[str, Any]:
+        """
+        Processing → Delivery 的最小结构化 Gate。
+        Completion Gate 仍负责最终真实性验收。
+        """
+        has_data = bool(
+            data_state.current_data_ref
+            or data_state.raw_data_ref
+            or data_state.analysis_data_ref
+            or data_state.clean_data_ref
+            or data_state.current_schema
+        )
+        return {
+            "passed": has_data,
+            "stage": AgentStage.PROCESSING.value,
+            "reason": (
+                "已存在结构化数据状态，可进入 Delivery。"
+                if has_data
+                else (
+                    "Processing 尚未形成可追踪的数据引用或 schema；"
+                    "不能安全进入 Delivery。"
+                )
+            ),
+            "current_data_ref": data_state.current_data_ref,
+            "current_schema": list(data_state.current_schema),
+        }
+
+
+    @staticmethod
+    def _normalized_search_signature(
+        tool_name: str,
+        arguments: Dict[str, Any],
+    ) -> str:
+        """为 Acquisition 重复搜索检测生成稳定签名。"""
+        name = str(tool_name or "").strip().lower()
+        query = str(
+            arguments.get("query")
+            or arguments.get("search_query")
+            or arguments.get("url")
+            or ""
+        ).strip().lower()
+        query = " ".join(query.split())
+        return f"{name}|{query}"
+
+    @classmethod
+    def _acquisition_saturation_status(
+        cls,
+        *,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        tool_results: List[ToolExecutionResult],
+    ) -> Dict[str, Any]:
+        """
+        防止 Acquisition 在同类搜索/网页读取上长期空转。
+
+        规则保守：
+        - 只检查 search_web / read_webpage；
+        - 完全相同签名成功执行 2 次后，第三次相同调用阻止；
+        - 最近 8 个 Acquisition 结果里若已有 >=6 次搜索/网页读取，
+          且仍准备继续搜索，则提示进入来源决策/下载，而不是无限搜。
+        """
+        name = str(tool_name or "").strip().lower()
+        if name not in {"search_web", "read_webpage"}:
+            return {"saturated": False, "reason": ""}
+
+        signature = cls._normalized_search_signature(
+            name,
+            arguments,
+        )
+
+        same_count = 0
+        acquisition_recent = []
+
+        for item in tool_results:
+            item_name = str(
+                getattr(item, "tool_name", "") or ""
+            ).strip().lower()
+            if item_name not in {"search_web", "read_webpage"}:
+                continue
+
+            item_args = getattr(item, "arguments", {}) or {}
+            item_sig = cls._normalized_search_signature(
+                item_name,
+                item_args,
+            )
+            if (
+                getattr(item, "success", False)
+                and item_sig == signature
+            ):
+                same_count += 1
+
+            acquisition_recent.append(item_name)
+
+        if same_count >= 2:
+            return {
+                "saturated": True,
+                "reason": (
+                    "相同 Acquisition 调用已成功执行至少 2 次，"
+                    "禁止第三次重复；应使用已有来源证据、改变检索策略，"
+                    "或进入下载/数据读取。"
+                ),
+                "signature": signature,
+            }
+
+        recent = acquisition_recent[-8:]
+        if (
+            name == "search_web"
+            and len(recent) >= 6
+            and sum(
+                x in {"search_web", "read_webpage"}
+                for x in recent
+            ) >= 6
+        ):
+            return {
+                "saturated": True,
+                "reason": (
+                    "最近 Acquisition 行为已连续大量用于搜索/读网页；"
+                    "当前搜索链达到饱和。应基于已有证据选择可用来源、"
+                    "下载数据，或明确切换来源策略。"
+                ),
+                "signature": signature,
+            }
+
+        return {
+            "saturated": False,
+            "reason": "",
+            "signature": signature,
+        }
+
+    @staticmethod
+    def _deduplicate_deliverable_paths(
+        paths: List[str],
+    ) -> List[str]:
+        """按规范化路径去重，保持首次出现顺序。"""
+        seen = set()
+        result = []
+        for item in paths:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            key = value.replace("\\", "/").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(value)
+        return result
+
+    @classmethod
+    def _raw_retention_already_satisfied(
+        cls,
+        *,
+        data_state: DataState,
+        workspace_deliverables: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        判断 Raw Download Retention 是否已经有一个真实原始数据交付物。
+
+        只用于“是否还需要再次 promote”的生命周期判断，
+        不替代 Completion Gate 对最终文件真实性的检查。
+        """
+        candidates = list(data_state.deliverable_paths)
+        candidates.extend(workspace_deliverables or [])
+
+        for item in cls._deduplicate_deliverable_paths(
+            candidates
+        ):
+            if str(item).lower().endswith(
+                (".csv", ".tsv", ".json", ".parquet")
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _stage_recovery_target_from_report(
+        cls,
+        verification_report: Optional[Dict[str, Any]],
+    ) -> AgentStage:
+        """把 Completion/Stage Gate 失败项映射到确定性回退 Stage。"""
+        if not verification_report:
+            return AgentStage.VERIFICATION
+
+        failed_texts: List[str] = []
+        checks = verification_report.get("checks") or []
+
+        if isinstance(checks, dict):
+            iterable = checks.values()
+        elif isinstance(checks, list):
+            iterable = checks
+        else:
+            iterable = []
+
+        for item in iterable:
+            if not isinstance(item, dict):
+                continue
+            passed = item.get("passed")
+            if passed is True:
+                continue
+            failed_texts.append(
+                " ".join(
+                    str(item.get(key) or "")
+                    for key in (
+                        "name",
+                        "check_name",
+                        "reason",
+                        "message",
+                        "details",
+                    )
+                )
+            )
+
+        failed_texts.append(
+            str(
+                verification_report.get("summary")
+                or verification_report.get("reason")
+                or ""
+            )
+        )
+
+        combined = " ".join(failed_texts)
+        return StageOrchestrator.recovery_target(
+            failure_category="verification_failure",
+            failure_text=combined,
+        )
+
+
+    @staticmethod
+    def _acquisition_adapter_observation(
+        *,
+        goal: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v5.2 Acquisition Source Adapter。
+
+        在真正进入 Acquisition Tool 前，
+        使用已登记来源策略减少无意义搜索。
+
+        当前只提供决策 Observation，
+        不直接替代 Tool 执行。
+        """
+
+        text = str(goal or "").strip()
+
+        weather_keywords = (
+            "天气",
+            "气象",
+            "温度",
+            "湿度",
+            "降水",
+            "风速",
+        )
+
+        if not any(
+            item in text
+            for item in weather_keywords
+        ):
+            return None
+
+        location = None
+        for item in (
+            "澳门",
+            "珠海",
+            "广州",
+            "深圳",
+        ):
+            if item in text:
+                location = item
+                break
+
+        if not location:
+            return None
+
+        instruction = build_acquisition_instruction(
+            domain="weather",
+            location=location,
+            data_type="observation",
+        )
+
+        return instruction.to_dict()
+
     def __init__(
         self,
         registry: Optional[ToolRegistry] = None,
@@ -368,6 +1303,7 @@ class AgentLoop:
 
         self.context = ExecutionContext()
         self.verifier = verifier or VerificationEngine()
+        self.readback_registry = ReadbackRegistry()
 
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv(
@@ -491,6 +1427,40 @@ class AgentLoop:
             runtime_context
         )
 
+        # v5.2-2：建立本次任务的 Stage Route。
+        stage_route = StageOrchestrator.build_route(
+            user_task=goal,
+            task_plan=runtime_context.get("task_plan"),
+        )
+        current_stage = StageOrchestrator.first_stage(
+            stage_route
+        )
+        data_state = DataState()
+
+        if current_stage is None:
+            current_stage = AgentStage.PROCESSING
+
+        stage_route.states[current_stage].activate()
+        runtime_context.update(
+            self._build_stage_runtime_context(
+                route=stage_route,
+                current_stage=current_stage,
+                data_state=data_state,
+            )
+        )
+
+        self.report_progress(
+            "v5.2 Stage Router："
+            + " → ".join(
+                stage.value
+                for stage in stage_route.enabled_stages
+            )
+        )
+        self.report_progress(
+            f"[{current_stage.value.title()} Loop] "
+            "Stage 已启动。"
+        )
+
         self._active_skill_selection = (
             self.skill_selector.select(
                 goal=goal,
@@ -532,18 +1502,29 @@ class AgentLoop:
             "DataPilot Workspace Agent Loop 启动。"
         )
 
-        # v5.0 Completion Recovery Budget：
-        # max_iterations 仍是正常执行预算；只有 Python Completion Gate
-        # 已经真实拒绝过一次完成申请后，才开放一个很小的额外恢复窗口。
+        # v5.2 Independent Stage Budget：
+        # 不再让 Acquisition / Processing / Delivery / Verification
+        # 争抢同一个 32 轮池。每个 Stage 自己计数、自己封顶。
         #
-        # 这个窗口不是普通“加轮数”：
-        # - 正常任务仍受 max_iterations 约束；
-        # - 没有 Gate FAIL 时绝不会进入恢复预算；
-        # - Gate FAIL 后允许修正最终交付物、重新回读最新版本并再次申请完成；
-        # - Retry Budget / ToolPreflight / Workspace Policy 继续照常生效。
+        # global_normal_safety_cap 只是“全局失控保险”，等于本任务所有
+        # 已启用 Stage 正常预算之和；真正的限制来自各 StageState。
+        # Completion Recovery 仍保留原来的独立小窗口。
+        global_normal_safety_cap = (
+            self._enabled_stage_normal_budget(stage_route)
+        )
         max_total_iterations = (
-            self.max_iterations
+            global_normal_safety_cap
             + self.max_completion_recovery_iterations
+        )
+
+        self.report_progress(
+            "v5.2 Independent Stage Budget："
+            + self._stage_budget_summary(stage_route)
+        )
+        self.report_progress(
+            "全局正常执行 Safety Cap："
+            f"{global_normal_safety_cap}；"
+            "该值不是共享预算池。"
         )
 
         iteration = 1
@@ -559,7 +1540,7 @@ class AgentLoop:
                 )
 
             in_completion_recovery = (
-                iteration > self.max_iterations
+                iteration > global_normal_safety_cap
             )
 
             if (
@@ -570,7 +1551,7 @@ class AgentLoop:
 
             if in_completion_recovery:
                 recovery_index = (
-                    iteration - self.max_iterations
+                    iteration - global_normal_safety_cap
                 )
                 self.report_progress(
                     "[Completion Recovery "
@@ -579,10 +1560,23 @@ class AgentLoop:
                     "正在根据最新验收失败项继续修正/回读……"
                 )
             else:
+                current_stage_state = stage_route.states[
+                    current_stage
+                ]
                 self.report_progress(
-                    f"[Agent Loop {iteration}/{self.max_iterations}] "
-                    "正在根据当前执行状态决定下一步……"
+                    f"[{current_stage.value.title()} Loop "
+                    f"{current_stage_state.iterations_used + 1}/"
+                    f"{current_stage_state.budget.normal_iterations}] "
+                    "正在根据当前 Stage 与真实执行状态决定下一步……"
                 )
+
+            runtime_context.update(
+                self._build_stage_runtime_context(
+                    route=stage_route,
+                    current_stage=current_stage,
+                    data_state=data_state,
+                )
+            )
 
             state = self._build_state(
                 goal=goal,
@@ -591,10 +1585,21 @@ class AgentLoop:
                 tool_results=tool_results,
             )
 
-            decision = self._decide_next_action(
-                goal=goal,
-                state=state,
-            )
+            decision = None
+            if in_completion_recovery:
+                decision = self._build_deterministic_reread_decision(
+                    latest_verification_report
+                )
+                if decision is not None:
+                    self.report_progress(
+                        "Completion Recovery：检测到最终交付物缺少写后回读证据，"
+                        "本轮由 Python 确定性补读，不再消耗 LLM 猜测。"
+                    )
+            if decision is None:
+                decision = self._decide_next_action(
+                    goal=goal,
+                    state=state,
+                )
 
             if self._is_cancel_requested():
                 return self._cancelled_result(
@@ -629,6 +1634,15 @@ class AgentLoop:
                         decisions=decisions,
                         latest_verification_report=latest_verification_report,
                     )
+
+                # v5.3 Readback Registry:
+                # Completion Gate 前确保最终交付物进入可追踪回读状态。
+                self.readback_registry.register_many(
+                    data_state.deliverable_paths
+                )
+                runtime_context["readback_registry"] = (
+                    self.readback_registry.to_dict()
+                )
 
                 verification_report = self._run_completion_gate(
                     goal=goal,
@@ -668,6 +1682,41 @@ class AgentLoop:
                 runtime_context["verification_observation"] = dict(
                     latest_verification_report
                 )
+
+                recovery_stage = (
+                    self._stage_recovery_target_from_report(
+                        latest_verification_report
+                    )
+                )
+                runtime_context["recovery_stage"] = (
+                    recovery_stage.value
+                )
+
+                if (
+                    recovery_stage != current_stage
+                    and stage_route.states[
+                        recovery_stage
+                    ].enabled
+                ):
+                    stage_route.states[
+                        recovery_stage
+                    ].reset_for_reentry(
+                        "Completion Gate FAIL 触发确定性回退。"
+                    )
+                    current_stage = recovery_stage
+                    stage_route.states[
+                        current_stage
+                    ].activate()
+                    runtime_context["current_stage"] = (
+                        current_stage.value
+                    )
+                    runtime_context["stage_route"] = (
+                        stage_route.to_dict()
+                    )
+                    self.report_progress(
+                        "[Stage Recovery] Completion Gate → "
+                        f"{current_stage.value}"
+                    )
 
                 self.report_progress(
                     "Completion Gate：未通过。"
@@ -712,6 +1761,219 @@ class AgentLoop:
                 raise TypeError(
                     "Agent 工具 arguments 必须是 JSON 对象。"
                 )
+
+            previous_stage = current_stage
+            requested_tool_stage = self._classify_tool_stage(
+                canonical_name
+            )
+
+            if requested_tool_stage == AgentStage.ACQUISITION:
+                acquisition_saturation = (
+                    self._acquisition_saturation_status(
+                        tool_name=canonical_name,
+                        arguments=arguments,
+                        tool_results=tool_results,
+                    )
+                )
+                if acquisition_saturation["saturated"]:
+                    self.report_progress(
+                        "[Acquisition Saturation Guard] "
+                        + acquisition_saturation["reason"]
+                    )
+                    runtime_context[
+                        "acquisition_saturation_observation"
+                    ] = acquisition_saturation
+                    iteration += 1
+                    continue
+
+            if (
+                current_stage == AgentStage.ACQUISITION
+                and requested_tool_stage == AgentStage.PROCESSING
+            ):
+                # read_office_data 是 Acquisition 的最后一个验证动作：
+                # 它本身必须允许执行，成功后 DataState 才会 SOURCE_READY。
+                acquisition_read_tools = {
+                    "read_office_data",
+                    "load_data",
+                    "read_csv",
+                    "read_excel",
+                    "get_data_info",
+                }
+                if canonical_name not in acquisition_read_tools:
+                    acquisition_gate = (
+                        self._acquisition_gate_status(data_state)
+                    )
+                    runtime_context[
+                        "acquisition_gate_observation"
+                    ] = acquisition_gate
+
+                    if not acquisition_gate["passed"]:
+                        self.report_progress(
+                            "[Acquisition Gate] FAIL："
+                            + acquisition_gate["reason"]
+                        )
+                        runtime_context[
+                            "stage_gate_observation"
+                        ] = acquisition_gate
+                        iteration += 1
+                        continue
+
+                    stage_route.states[
+                        AgentStage.ACQUISITION
+                    ].mark_passed(acquisition_gate["reason"])
+                    self.report_progress(
+                        "[Acquisition Gate] PASS："
+                        + acquisition_gate["reason"]
+                    )
+
+            if (
+                current_stage == AgentStage.PROCESSING
+                and requested_tool_stage == AgentStage.DELIVERY
+            ):
+                processing_gate = self._processing_gate_status(
+                    data_state
+                )
+                runtime_context[
+                    "processing_gate_observation"
+                ] = processing_gate
+
+                if not processing_gate["passed"]:
+                    self.report_progress(
+                        "[Processing Gate] FAIL："
+                        + processing_gate["reason"]
+                    )
+                    runtime_context[
+                        "stage_gate_observation"
+                    ] = processing_gate
+                    iteration += 1
+                    continue
+
+                stage_route.states[
+                    AgentStage.PROCESSING
+                ].mark_passed(processing_gate["reason"])
+                self.report_progress(
+                    "[Processing Gate] PASS："
+                    + processing_gate["reason"]
+                )
+
+            if (
+                current_stage == AgentStage.DELIVERY
+                and requested_tool_stage == AgentStage.VERIFICATION
+            ):
+                delivery_gate = self._delivery_gate_status(
+                    data_state=data_state,
+                    task_plan=runtime_context.get("task_plan"),
+                )
+                runtime_context[
+                    "delivery_gate_observation"
+                ] = delivery_gate
+
+                if not delivery_gate["passed"]:
+                    self.report_progress(
+                        "[Delivery Gate] FAIL："
+                        + delivery_gate["reason"]
+                    )
+                    runtime_context[
+                        "stage_gate_observation"
+                    ] = delivery_gate
+                    iteration += 1
+                    continue
+
+                stage_route.states[
+                    AgentStage.DELIVERY
+                ].mark_passed(delivery_gate["reason"])
+                self.report_progress(
+                    "[Delivery Gate] PASS："
+                    + delivery_gate["reason"]
+                )
+
+            routing_tool_name = canonical_name
+            if (
+                current_stage == AgentStage.ACQUISITION
+                and canonical_name
+                in {
+                    "read_office_data",
+                    "load_data",
+                    "read_csv",
+                    "read_excel",
+                    "get_data_info",
+                }
+                and not self._acquisition_gate_status(
+                    data_state
+                )["passed"]
+            ):
+                # 首次来源读取仍属于 Acquisition SOURCE_READY 验证，
+                # 不在执行前提前切到 Processing。
+                routing_tool_name = "download_data_file"
+
+            current_stage = self._sync_stage_for_tool(
+                route=stage_route,
+                current_stage=current_stage,
+                tool_name=routing_tool_name,
+                runtime_context=runtime_context,
+            )
+
+            if current_stage != previous_stage:
+                self.report_progress(
+                    "[Stage Router] "
+                    f"{previous_stage.value} → {current_stage.value}；"
+                    f"触发工具：{canonical_name}"
+                )
+                self.report_progress(
+                    f"[{current_stage.value.title()} Loop] "
+                    "Stage 已启动。"
+                )
+
+            # v5.2 Independent Stage Budget：
+            # 预算按“实际即将执行的 Tool 所属 Stage”计费，
+            # 而不是按全局 decision round 计费。
+            tool_stage = self._classify_tool_stage(
+                routing_tool_name
+            )
+            stage_budget_block_reason = (
+                self._stage_budget_block_reason(
+                    route=stage_route,
+                    stage=tool_stage,
+                )
+            )
+
+            if stage_budget_block_reason:
+                self.report_progress(
+                    "[Stage Budget Boundary] "
+                    + stage_budget_block_reason
+                )
+                runtime_context["stage_budget_observation"] = {
+                    "stage": tool_stage.value,
+                    "blocked_tool": canonical_name,
+                    "reason": stage_budget_block_reason,
+                    "instruction": (
+                        "当前 Stage 已耗尽正常预算。"
+                        "不要继续重复该阶段工具；"
+                        "请基于已有 Observation 推进到后续必要 Stage，"
+                        "或在确实无法满足任务时申请 finish，"
+                        "由 Completion Gate 给出真实验收结果。"
+                    ),
+                }
+                iteration += 1
+                continue
+
+            stage_route.states[
+                tool_stage
+            ].record_iteration()
+
+            runtime_context["stage_route"] = (
+                stage_route.to_dict()
+            )
+            runtime_context["current_stage"] = (
+                current_stage.value
+            )
+
+            self.report_progress(
+                "[Stage Budget] "
+                f"{tool_stage.value}: "
+                f"{stage_route.states[tool_stage].iterations_used}/"
+                f"{stage_route.states[tool_stage].budget.normal_iterations}"
+            )
 
             retry_policy = self._evaluate_retry_policy(
                 tool_name=canonical_name,
@@ -907,6 +2169,52 @@ class AgentLoop:
             tool_results.append(
                 result
             )
+
+            self._update_data_state_from_tool_result(
+                data_state=data_state,
+                tool_result=result,
+            )
+            data_state.deliverable_paths = (
+                self._deduplicate_deliverable_paths(
+                    data_state.deliverable_paths
+                )
+            )
+
+            # v5.3 Delivery -> Verification Bridge:
+            # 成功生成的最终文件进入回读队列。
+            if self._classify_tool_stage(result.tool_name) == AgentStage.DELIVERY:
+                self.readback_registry.register_many(
+                    data_state.deliverable_paths
+                )
+
+            if (
+                current_stage == AgentStage.ACQUISITION
+                and canonical_name
+                in {
+                    "read_office_data",
+                    "load_data",
+                    "read_csv",
+                    "read_excel",
+                    "get_data_info",
+                }
+                and getattr(result, "success", False)
+            ):
+                acquisition_gate = (
+                    self._acquisition_gate_status(data_state)
+                )
+                runtime_context[
+                    "acquisition_gate_observation"
+                ] = acquisition_gate
+                if acquisition_gate["passed"]:
+                    stage_route.states[
+                        AgentStage.ACQUISITION
+                    ].mark_passed(acquisition_gate["reason"])
+                    self.report_progress(
+                        "[Acquisition Gate] PASS："
+                        + acquisition_gate["reason"]
+                    )
+
+            runtime_context["data_state"] = data_state.to_dict()
 
             if self._is_cancel_requested():
                 return self._cancelled_result(
@@ -1431,6 +2739,47 @@ class AgentLoop:
 2. 或者确认任务已经完成。
 
 ============================================================
+v5.2 Multi-Stage 工作流
+============================================================
+
+runtime_context.current_stage 是当前执行阶段。
+标准顺序：
+Acquisition → Processing → Delivery → Verification。
+
+- Acquisition：搜索、读取网页、下载、确认来源。
+- Processing：读取数据、语义理解、单位转换、清洗、计算、统计、分析。
+- Delivery：生成或编辑 PNG / Excel / Word / PDF 等最终成果。
+- Verification：回读最终成果、核验数字/时间/来源/跨交付物一致性。
+
+优先完成当前 Stage 的必要工作后再进入后续 Stage。
+不要为了“确认一下”无理由返回已经完成的早期 Stage。
+如果 Completion Gate 指出需要回退，按真实失败证据修复，不得伪造 Stage PASS。
+
+每个 Stage 有独立执行预算。不要因为某阶段还有剩余预算就故意用满；
+Stage 目标一旦满足，应立即进入下一阶段。Acquisition 的搜索/网页读取
+不得消耗 Processing、Delivery、Verification 的预算。
+
+runtime_context.data_state 是跨 Stage 的权威结构化状态。
+当 current_schema 已存在时，后续工具参数必须使用 current_schema 中的
+真实字段名，不得继续沿用标准化/重命名前的旧字段名。
+统计、聚合、图表和 Delivery 应优先消费 current_data_ref 指向的最新数据状态。
+
+Acquisition 不得反复执行相同搜索。已有足够来源证据后，应进入下载/读取，
+而不是继续用近义关键词无限搜索。
+
+Raw Download Lifecycle 只允许一个最终原始数据保留路径：
+优先下载到 temporary → 读取/验证 → 最终 promote 一次。
+如果原始文件已经存在于 deliverables，不得再次 promote 生成 *_2 等重复副本。
+
+Acquisition 的 SOURCE_READY 不能由“下载成功”单独触发。
+下载后的来源必须至少成功读取一次，并形成可追踪的数据引用或 schema；
+首次 read_office_data/load_data 属于 Acquisition 的来源可读性验证动作。
+
+Delivery 的 DELIVERABLES_READY 不能由“调用过生成工具”触发。
+TaskPlan 要求的 Excel/Word/PDF/PNG/CSV 等最终成果必须由成功 Tool Observation
+真实登记到 data_state.deliverable_paths；缺任一要求类型都不能进入 Verification。
+
+============================================================
 工作原则
 ============================================================
 
@@ -1533,6 +2882,16 @@ class AgentLoop:
 81. 如果 Completion Gate 返回跨交付物一致性 pending，不要重新生成已经正确的文件；优先补齐缺失的最终文件 inspect/read 或独立数据统计 Observation。
 82. 多交付物任务应把每个最终文件直接写入 deliverables_dir；仅供生成过程使用的中间表、临时工作簿或草稿必须留在 temporary_dir。
 
+【v5.1 Semantic-Aware Data Understanding 规则】
+83. 对从互联网下载、外部公开数据源取得、或字段含义明显不透明的数据，在正式统计、图表和报告之前，应先调用 analyze_dataframe_semantics 理解关键字段角色、可读名称和已知单位。
+84. analyze_dataframe_semantics 是只读理解工具，不会修改源 DataFrame。不要把“识别字段含义”误当成“已经完成单位换算或数据清洗”。
+85. 对 tmpf、sknt 等专业缩写或其他不透明字段，只有语义工具或可靠来源给出足够证据时才能赋予具体含义；证据不足时必须保留原字段并说明不确定性，不得自行猜测。
+86. 在选择可视化方案前，优先使用 recommend_visualizations 或等价的语义证据。不得仅因为多个字段都是 numeric，就把不同物理量、不同单位或未知单位的指标放到同一 Y 轴比较。
+87. 最终 Excel、Word 和图表面向用户展示时，应优先使用已经有证据支持的可读字段名称和单位；原始下载数据本身仍应保持可追溯，不要为了展示而覆盖原始文件。
+88. “字段改成中文显示”与“单位转换”是两个不同动作。没有执行确定性单位换算工具及其真实 Observation 时，不得把 °F 数据标成 ℃、把 kt 标成 m/s、把 in 标成 mm。
+89. 如果用户明确要求保存/保留原始下载数据，该文件属于用户要求的交付内容，不得只停留在 temporary_dir；应使用当前已注册且安全的文件/导出能力形成 deliverable，若当前工具确实无法做到则不得假装已交付。
+90. Semantic Tool 是为了减少错误解释，而不是强制增加无意义轮次。对于字段已经清晰、单位无需判断且任务简单的本地办公数据，不要为了形式重复调用语义工具。
+
 【v5.0 Evidence-grounded Reporting 规则】
 83. 正式报告内容必须区分三类：事实、计算/比较结论、建议。三类内容的证据要求不同，不得混写成同等确定的事实。
 84. “事实”包括源数据值、KPI、排名、日期、主体、数量、状态等；只有真实 Observation 已读取、计算或验证的内容才能作为事实写入报告。
@@ -1574,6 +2933,8 @@ class AgentLoop:
 114. Gate FAIL 后如果修正或重新生成了最终 Word/Excel，之前对该文件的回读证据立即失效，下一步应优先 inspect/read 最新版本。
 115. Completion Recovery 的目标是形成“Gate FAIL → 修正 → 回读最新版本 → 再次 finish”的闭环；不要在恢复窗口中增加非必要分析、美化或重复计算。
 116. Completion Recovery 仍受 Retry Budget、ToolPreflight、Workspace Policy 和 Verification Engine 约束，不得借恢复窗口绕过任何安全或验收规则。
+117. 如果 TaskPlan 已给出确定性的时间范围（例如“最近30天：YYYY-MM-DD 至 YYYY-MM-DD”），所有联网查询、下载 URL、数据筛选、统计和报告必须服从该边界；不得把“近期”擅自扩大到年初、全年或更早。
+118. 已成功生成某个最终交付物后，不得仅为重复确认而再次用相同内容覆盖生成；优先使用 inspect/read 工具进行写后验证。只有真实内容需要修正时才允许重写。
 
 Skill Selection 状态：
 {skill_selection_note}

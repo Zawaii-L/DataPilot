@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date, timedelta
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -487,6 +488,15 @@ JSON 必须包含以下字段：
 14. 只有用户明确要求生成、导出、保存、制作、另存或交付文件时，
     才能把文件写入 deliverable_requirements，并加入文件存在/回读验收。
 15. assumptions 只记录真正无法确定的事项；没有时返回 []。
+16. 如果任务要求联网获取、下载或使用外部公开数据并继续分析，
+    execution_requirements 必须包含“读取后先理解关键字段语义、角色和已知单位，再进行统计/可视化/报告”。
+17. 对外部数据中的专业缩写、代码或未知单位，不得在 TaskPlan 中自行猜测含义；
+    应要求执行阶段基于真实数据结构、可靠字段定义或工具语义画像确认。
+18. 如果用户明确要求“下载并保存/保留原始数据”，原始下载文件属于最终交付要求，
+    不能只作为 temporary_dir 中的临时文件。
+19. 面向人的最终图表/报告应使用可解释字段；不同或未知单位的指标不得仅因同为数值列而强行放在同一纵轴。
+20. 用户只说“近期/最近/近来”且没有给出具体数字、月份或起止日期时，DataPilot 的默认合同是最近3个自然日（含当天）；不得擅自扩大为今年以来、年初至今或全年。
+21. 用户明确给出最近N天/周/月、今年以来或具体日期时，必须服从用户的显式时间范围，不得用默认3天覆盖。
 """.strip()
 
     def _build_user_prompt(
@@ -666,6 +676,117 @@ JSON 必须包含以下字段：
                     ),
                 )
 
+        # v5.1 Semantic-Aware External Data Contract
+        # 对“联网获取/下载外部数据后再分析”的任务，在 Python 层补充最小且
+        # 可验证的语义理解要求。这样不依赖 LLM 是否恰好在 TaskPlan 中写出该步骤，
+        # 同时不会影响普通本地 Excel 基本信息任务。
+        if self._requires_external_data_semantics(user_task):
+            self._append_unique(
+                normalized["execution_requirements"],
+                (
+                    "外部数据成功读取后，在统计、可视化和正式报告之前，"
+                    "先识别关键字段的业务含义、字段角色与已知单位；"
+                    "对无法可靠确定的含义或单位必须保留不确定性，不得猜测。"
+                ),
+            )
+            self._append_unique(
+                normalized["verification_requirements"],
+                (
+                    "面向人的最终图表和报告不得直接依赖无法解释的专业缩写；"
+                    "不同或未知单位的指标不得仅因同为数值列而强行放在同一纵轴比较。"
+                ),
+            )
+
+        # 常规天气任务的最小数据合同：
+        # 不做科研/高频研究时，默认只要求常用天气要素，并以逐小时作为
+        # 面向分析和交付的目标时间分辨率。原始数据可保留更高频率，
+        # 但 Processing 应按要素语义聚合，而不是把无关字段全部带入报告。
+        weather_text = re.sub(
+            r"\s+",
+            " ",
+            str(user_task or "").strip().lower(),
+        )
+        is_weather_task = any(
+            token in weather_text
+            for token in (
+                "天气", "气象", "气温", "温度", "湿度",
+                "降水", "降雨", "风速",
+            )
+        )
+        explicit_frequency = bool(
+            re.search(
+                r"(?:每|逐)\s*\d*\s*(?:分钟|分|小时|时)"
+                r"|\d+\s*(?:min|minute|minutes|hour|hours)"
+                r"|分钟级|小时级|逐时|逐分钟|高频",
+                weather_text,
+            )
+        )
+
+        if is_weather_task:
+            self._append_unique(
+                normalized["execution_requirements"],
+                (
+                    "常规天气数据遵循最小数据合同：优先围绕气温、相对湿度、"
+                    "降水和风速，以及时间/站点/来源等必要追溯字段获取和处理；"
+                    "除非用户明确要求、派生指标计算需要或质量核验需要，"
+                    "不要把气压、能见度、阵风等无关字段带入最终分析。"
+                ),
+            )
+            if not explicit_frequency:
+                self._append_unique(
+                    normalized["execution_requirements"],
+                    (
+                        "常规天气分析默认目标时间分辨率为1小时；"
+                        "若原始权威数据频率更高，应保留原始文件不变，"
+                        "在分析数据中按小时进行语义正确的聚合："
+                        "气温/湿度/风速可按小时统计，降水按小时累计。"
+                    ),
+                )
+                self._append_unique(
+                    normalized["assumptions"],
+                    "用户未指定天气时间精度，采用常规逐小时分析精度。",
+                )
+
+        # 通用 Minimal Data Contract：
+        # 不论气象、金融、经营还是其他办公数据任务，都优先获取完成用户目标
+        # 所必需的字段和追溯字段；不能因为数据源“还能提供更多列”就默认全部
+        # 带入后续分析。详细程度由用户明确要求、Clarification Gate 的澄清结果
+        # 或领域合理默认共同决定。
+        self._append_unique(
+            normalized["execution_requirements"],
+            (
+                "遵循最小必要数据原则：只获取和处理完成当前任务所必需的核心字段、"
+                "必要派生指标输入以及来源/时间/标识等追溯字段；"
+                "无关字段不得仅因数据源可提供而自动进入最终分析和交付物。"
+            ),
+        )
+
+        temporal_window = self._resolve_temporal_intent(user_task)
+        if temporal_window is not None:
+            start_date, end_date, label = temporal_window
+            contract = (
+                f"用户时间意图“{label}”按确定性默认窗口解释为最近3天；"
+                f"本次数据时间范围必须限制在 {start_date} 至 {end_date}。"
+            )
+            self._append_unique(normalized["source_requirements"], contract)
+            self._append_unique(
+                normalized["execution_requirements"],
+                f"构造联网查询、下载 URL 或筛选条件时，必须使用 {start_date} 至 {end_date} 的时间边界，不得擅自扩大到年初、全年或更早。",
+            )
+            self._append_unique(
+                normalized["verification_requirements"],
+                f"时间范围验收：最终用于分析的数据不得早于 {start_date}，不得晚于 {end_date}；如数据源返回越界记录，必须先按该窗口筛选后再统计和报告。",
+            )
+
+        if self._user_requests_original_download_delivery(user_task):
+            self._append_unique(
+                normalized["deliverable_requirements"],
+                (
+                    "保留并交付用户明确要求保存的原始下载数据文件，"
+                    "不得仅把它作为 temporary_dir 中可被清理的临时文件。"
+                ),
+            )
+
         return TaskPlan(
             task_goal=task_goal,
             evidence_requirements=normalized[
@@ -688,6 +809,89 @@ JSON 必须包含以下字段：
             ],
             assumptions=normalized["assumptions"],
         )
+
+    @staticmethod
+    def _resolve_temporal_intent(user_task: str):
+        """把未量化的“近期/最近”稳定解释为最近3个自然日（含当天）。
+
+        显式时间表达（如最近7天、近3个月、今年以来、明确日期）继续交给
+        用户原始约束，不在这里覆盖。
+        """
+        text = re.sub(r"\s+", " ", str(user_task or "").strip().lower())
+        if not text:
+            return None
+
+        explicit_patterns = (
+            r"(?:最近|近)\s*\d+\s*(?:天|日|周|星期|个月|月|年)",
+            r"\d{4}[-/.年]\d{1,2}",
+            r"今年以来|本年以来|年初至今|本月|这个月|本周|这周|过去\s*\d+",
+        )
+        if any(re.search(pattern, text) for pattern in explicit_patterns):
+            return None
+
+        label = next((token for token in ("近期", "最近", "近来") if token in text), None)
+        if label is None:
+            return None
+
+        end = date.today()
+        start = end - timedelta(days=2)
+        return start.isoformat(), end.isoformat(), label
+
+    @staticmethod
+    def _requires_external_data_semantics(
+        user_task: str,
+    ) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(user_task or "").strip().lower(),
+        )
+
+        external_source = any(
+            phrase in text
+            for phrase in (
+                "网上", "联网", "网络", "互联网", "公开数据",
+                "公开资料", "下载数据", "下载资料", "获取数据",
+                "获取资料", "数据源", "官方网站", "官方数据",
+                "web", "online", "download",
+            )
+        )
+
+        data_work = any(
+            phrase in text
+            for phrase in (
+                "数据", "csv", "excel", "xlsx", "统计", "分析",
+                "图表", "可视化", "报告",
+            )
+        )
+
+        return bool(external_source and data_work)
+
+    @staticmethod
+    def _user_requests_original_download_delivery(
+        user_task: str,
+    ) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(user_task or "").strip().lower(),
+        )
+
+        original_data = any(
+            phrase in text
+            for phrase in (
+                "原始数据", "源数据", "原始文件", "下载文件",
+                "原始资料", "原始下载",
+            )
+        )
+        preserve = any(
+            phrase in text
+            for phrase in (
+                "保存", "保留", "交付", "输出", "下载",
+            )
+        )
+
+        return bool(original_data and preserve)
 
     @classmethod
     def _user_explicitly_requests_artifact(
