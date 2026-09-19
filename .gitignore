@@ -96,3 +96,12 @@ assets_list.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Architecture analysis files
+*.svg
+*.zip
+structure.txt
+
+# Temporary scripts
+cmp_docx.py
+reformat_docx.py
