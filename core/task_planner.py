@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, timedelta
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -68,35 +67,60 @@ class TaskPlanner:
         "assumptions",
     )
 
-    # v5.0+ Output Mode Boundary
-    # 只有用户明确要求“生成/导出/保存/制作/另存/交付某种文件”时，
-    # 才允许 TaskPlan 存在最终文件交付要求。
+    # v6.4 Output-Mode Boundary
+    # 只有用户“正向、明确”要求生成/导出/保存文件时，
+    # TaskPlan 才能保留文件型 deliverable。
     _ARTIFACT_ACTION_KEYWORDS = (
         "生成", "导出", "保存", "另存", "制作", "创建",
-        "输出文件", "交付物", "交付文件", "写入文件",
-        "生成文件", "导出文件", "保存文件",
+        "写入", "输出", "交付",
     )
 
     _ARTIFACT_TYPE_KEYWORDS = (
         "word", "docx", "excel", "xlsx", "csv",
-        "ppt", "pptx", "pdf", "报告文件", "报表文件",
-        "文档", "工作簿", "演示文稿",
+        "ppt", "pptx", "pdf", "报告", "报表",
+        "文件", "文档", "工作簿", "演示文稿",
     )
 
-    _EXPLICIT_ARTIFACT_PHRASES = (
-        "生成报告", "制作报告", "导出报告", "保存报告",
-        "生成报表", "制作报表", "导出报表", "保存报表",
-        "生成word", "生成 word", "导出word", "导出 word",
-        "生成excel", "生成 excel", "导出excel", "导出 excel",
-        "生成ppt", "生成 ppt", "生成pdf", "生成 pdf",
-        "最终交付物", "最终文件",
+    _DIRECT_RESPONSE_ONLY_PHRASES = (
+        "只需要完成数据分析并告诉我结果",
+        "只需要分析并告诉我结果",
+        "只需要告诉我结果",
+        "只需告诉我结果",
+        "直接告诉我结果",
+        "只需要给我结果",
+        "只需给我结果",
+        "不要生成文件",
+        "不需要生成文件",
+        "无需生成文件",
+    )
+
+    _RESPONSE_DELIVERY_KEYWORDS = (
+        "告诉我结果",
+        "告诉我结论",
+        "给我结果",
+        "给我结论",
+        "给出结果",
+        "给出结论",
+        "说明结果",
+        "说明结论",
+        "直接回答",
+        "直接告诉我",
     )
 
     _FILE_VERIFICATION_KEYWORDS = (
-        "最终文件", "最终交付物", "交付物", "deliverables_dir",
-        "文件存在", "存在性", "回读", "重新读取最终",
-        "再次读取最终", "写后读取", "写后回读",
-        "生成后的", "导出后的", "保存后的",
+        "最终文件", "最终交付物", "deliverables_dir",
+        "文件存在", "交付物存在", "回读",
+        "重新读取最终", "再次读取最终",
+        "写后读取", "写后回读",
+        "生成后的文件", "导出后的文件", "保存后的文件",
+    )
+
+    _FILE_DELIVERY_SAFETY_KEYWORDS = (
+        "deliverables_dir",
+        "最终交付物必须写入",
+        "最终文件必须写入",
+        "最终交付物必须位于",
+        "最终文件必须位于",
     )
 
     def __init__(
@@ -135,6 +159,18 @@ class TaskPlanner:
                 base_url=self.base_url,
             )
 
+    def _is_ollama_backend(self) -> bool:
+        """
+        判断当前 OpenAI-compatible 后端是否为本机 Ollama。
+
+        仅根据 base_url 判断，避免影响 DeepSeek 或其他云端兼容接口。
+        """
+        base_url = str(getattr(self, "base_url", "") or "").strip().lower()
+        return (
+            "11434" in base_url
+            or "ollama" in base_url
+        )
+
     def report_progress(self, message: str):
         if self.progress_callback:
             try:
@@ -161,29 +197,6 @@ class TaskPlanner:
         self.report_progress(
             "DataPilot v4.0 Task Planner 正在建立任务合同……"
         )
-
-        # v5.0+ Deterministic Basic-Info Plan
-        #
-        # 高频且语义明确的“读取一个 Excel + 告诉我基本情况”任务，
-        # 直接由 Python 建立最小任务合同，不消耗 LLM Planner，
-        # 也不会因偶发 JSON 格式问题触发 Planner 重试。
-        #
-        # 复杂分析、统计、比较、文件交付、源数据修改等任务
-        # 仍完整走原有 LLM Task Planner。
-        if self._is_deterministic_excel_basic_info_task(task):
-            plan = self._build_deterministic_excel_basic_info_plan(
-                task
-            )
-
-            self.report_progress(
-                "DataPilot v5.0 Task Planner："
-                "已使用确定性 Basic-Info 任务合同，"
-                "无需 LLM JSON 规划。"
-            )
-            self.report_progress(
-                "DataPilot v4.0 Task Planner 已建立任务合同。"
-            )
-            return plan
 
         plan: Optional[TaskPlan] = None
         last_error: Optional[Exception] = None
@@ -219,18 +232,27 @@ class TaskPlanner:
                 )
 
             try:
+                request_kwargs: Dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "response_format": {
+                        "type": "json_object"
+                    },
+                }
+
+                # Ollama + Qwen 在 thinking 模式下可能把主要输出放在
+                # reasoning 字段，导致 message.content 为空或 JSON 不稳定。
+                # TaskPlan 需要短而确定的结构化输出，因此本地 Ollama
+                # 自动关闭 thinking；云端模型保持原行为。
+                if self._is_ollama_backend():
+                    request_kwargs["reasoning_effort"] = "none"
+
                 response = (
                     self.client
                     .chat
                     .completions
-                    .create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=0.0,
-                        response_format={
-                            "type": "json_object"
-                        },
-                    )
+                    .create(**request_kwargs)
                 )
 
                 content = (
@@ -247,6 +269,9 @@ class TaskPlanner:
 
                 raw_plan = self._extract_json_object(
                     content
+                )
+                raw_plan = self._normalize_plan_contract(
+                    raw_plan
                 )
 
                 plan = self._validate_plan(
@@ -289,113 +314,6 @@ class TaskPlanner:
         )
 
         return plan
-
-    @staticmethod
-    def _is_deterministic_excel_basic_info_task(
-        user_task: str,
-    ) -> bool:
-        """
-        只识别非常窄的 Excel 基本信息 response-only 任务。
-        """
-        text = str(user_task or "").strip().lower()
-
-        if not text:
-            return False
-
-        has_excel = any(
-            token in text
-            for token in (
-                "excel",
-                "xlsx",
-                "xls",
-            )
-        )
-
-        has_read_intent = any(
-            phrase in text
-            for phrase in (
-                "读取",
-                "查看",
-                "看看",
-                "打开",
-                "告诉我",
-                "说明",
-            )
-        )
-
-        has_basic_info = any(
-            phrase in text
-            for phrase in (
-                "基本情况",
-                "基本信息",
-                "数据概况",
-                "数据基本情况",
-                "简单看一下",
-                "简单看看",
-            )
-        )
-
-        has_complex_intent = any(
-            phrase in text
-            for phrase in (
-                "分析销售",
-                "深入分析",
-                "统计",
-                "汇总",
-                "分组",
-                "透视",
-                "比较",
-                "对比",
-                "合并",
-                "生成",
-                "导出",
-                "保存",
-                "报告",
-                "word",
-                "ppt",
-                "pdf",
-                "修改",
-                "清洗",
-                "删除缺失",
-                "填充缺失",
-            )
-        )
-
-        return (
-            has_excel
-            and has_read_intent
-            and has_basic_info
-            and not has_complex_intent
-        )
-
-    @staticmethod
-    def _build_deterministic_excel_basic_info_plan(
-        user_task: str,
-    ) -> TaskPlan:
-        """
-        为 Excel 基本情况任务建立最小、可验证的确定性合同。
-        """
-        return TaskPlan(
-            task_goal=str(user_task or "").strip(),
-            evidence_requirements=[
-                "真实读取一个可用 Excel 工作表。",
-                "取得数据行列规模、字段、字段类型、缺失值与重复行等基础信息。",
-            ],
-            source_requirements=[
-                "识别一个可读取的 Excel 文件及目标工作表。",
-            ],
-            deliverable_requirements=[],
-            execution_requirements=[
-                "发现或定位候选 Excel 数据源。",
-                "读取一个与任务匹配的 Excel 工作表。",
-                "获取该数据的基础结构与质量信息。",
-            ],
-            verification_requirements=[],
-            safety_requirements=[
-                "只读处理，不覆盖、不修改源 Excel 文件。",
-            ],
-            assumptions=[],
-        )
 
     @staticmethod
     def _build_retry_prompt(
@@ -480,23 +398,19 @@ JSON 必须包含以下字段：
    中间产物必须进入 temporary_dir。
 10. 不要声称任务已经完成。你只是在制定任务合同。
 11. 每个数组只写具体、可检查的要求，避免空泛口号。
-12. 如果用户任务本身没有明确要求生成、导出、保存、制作或另存某类文件，
-    deliverable_requirements 必须返回 []，不得把“直接回答用户”“告诉用户结果”
-    “说明情况”“给出结论”写成文件交付物。
-13. “读取/查看/告诉我/说明/分析一下/基本情况/有什么内容”默认是直接回答任务，
-    不是 Word/Excel/PPT/PDF 报告生成任务。
-14. 只有用户明确要求生成、导出、保存、制作、另存或交付文件时，
-    才能把文件写入 deliverable_requirements，并加入文件存在/回读验收。
-15. assumptions 只记录真正无法确定的事项；没有时返回 []。
-16. 如果任务要求联网获取、下载或使用外部公开数据并继续分析，
-    execution_requirements 必须包含“读取后先理解关键字段语义、角色和已知单位，再进行统计/可视化/报告”。
-17. 对外部数据中的专业缩写、代码或未知单位，不得在 TaskPlan 中自行猜测含义；
-    应要求执行阶段基于真实数据结构、可靠字段定义或工具语义画像确认。
-18. 如果用户明确要求“下载并保存/保留原始数据”，原始下载文件属于最终交付要求，
-    不能只作为 temporary_dir 中的临时文件。
-19. 面向人的最终图表/报告应使用可解释字段；不同或未知单位的指标不得仅因同为数值列而强行放在同一纵轴。
-20. 用户只说“近期/最近/近来”且没有给出具体数字、月份或起止日期时，DataPilot 的默认合同是最近3个自然日（含当天）；不得擅自扩大为今年以来、年初至今或全年。
-21. 用户明确给出最近N天/周/月、今年以来或具体日期时，必须服从用户的显式时间范围，不得用默认3天覆盖。
+12. 如果用户任务本身没有要求某类交付物，不要擅自增加 Word、Excel、PPT 等文件。
+13. assumptions 只记录真正无法确定的事项；没有时返回 []。
+14. 如果用户只是询问“如何处理 / 准备怎么做 / 给出方案 / 解释流程”，并明确说明
+    不需要联网、不需要读取或实际处理文件、不需要生成文件，则这是咨询/规划型任务：
+    不得擅自要求真实源数据。此时 evidence_requirements、source_requirements、
+    deliverable_requirements 通常应为 []；execution_requirements 只描述需要回答的方案要点，
+    verification_requirements 也不得虚构文件回读或数据核验要求。
+15. 否定式文件要求优先于关键词命中：例如“不要生成 Word”“不需要 Excel 报告”
+    “无需导出文件”表示禁止/不要求对应文件，绝不能因为其中出现“生成”“Word”“Excel”
+    就把它解释成文件交付要求。
+16. “只需要……告诉我结果 / 只需给我结论 / 直接告诉我结果”默认是直接回答模式。
+    除非用户在同一任务中另有独立、正向、明确的文件生成要求，否则不得添加文件交付、
+    文件存在性验收或最终文件回读要求。
 """.strip()
 
     def _build_user_prompt(
@@ -556,6 +470,42 @@ JSON 必须包含以下字段：
 
         return safe
 
+    @staticmethod
+    def _normalize_plan_contract(
+        raw_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        对本地小模型常见的 TaskPlan 字段别名做确定性归一化。
+
+        只映射结构字段，不生成任何业务要求。后续仍由 _validate_plan()
+        执行完整校验和 Workspace 安全约束补充。
+        """
+        if not isinstance(raw_plan, dict):
+            return raw_plan
+
+        normalized = dict(raw_plan)
+
+        aliases = {
+            "task_goal": ("goal", "objective", "task"),
+            "evidence_requirements": ("evidence", "evidence_required"),
+            "source_requirements": ("sources", "source_requirements_list"),
+            "deliverable_requirements": ("deliverables", "outputs"),
+            "execution_requirements": ("steps", "execution_steps"),
+            "verification_requirements": ("verification", "checks"),
+            "safety_requirements": ("safety", "safety_rules"),
+            "assumptions": ("assumption",),
+        }
+
+        for canonical, candidates in aliases.items():
+            if canonical in normalized:
+                continue
+            for candidate in candidates:
+                if candidate in normalized:
+                    normalized[canonical] = normalized[candidate]
+                    break
+
+        return normalized
+
     def _validate_plan(
         self,
         *,
@@ -583,61 +533,49 @@ JSON 必须包含以下字段：
                 field_name=field_name,
             )
 
-        # v5.0+ Output Mode Boundary
-        # Python 层根据用户原始任务确定是否真的需要最终文件。
+        # v6.4 Deterministic Output-Mode Boundary
+        #
+        # 本地小模型可能把“不要生成 Word 报告”里的“生成 + Word”
+        # 误判成正向文件交付要求。这里始终以用户原始任务为准：
+        # 没有独立、正向、明确的文件输出意图，就清除模型擅自添加的
+        # 文件 deliverable、文件写出步骤以及文件回读验收。
         artifact_required = self._user_explicitly_requests_artifact(
             user_task
         )
 
         if not artifact_required:
-            normalized["deliverable_requirements"] = []
+            normalized["deliverable_requirements"] = [
+                item
+                for item in normalized["deliverable_requirements"]
+                if not self._looks_like_file_deliverable_requirement(item)
+            ]
+
+            if (
+                self._user_requests_direct_response(user_task)
+                and not normalized["deliverable_requirements"]
+            ):
+                self._append_unique(
+                    normalized["deliverable_requirements"],
+                    "向用户直接给出分析结果和结论。",
+                )
+
+            normalized["execution_requirements"] = [
+                item
+                for item in normalized["execution_requirements"]
+                if not self._looks_like_file_execution_requirement(item)
+            ]
 
             normalized["verification_requirements"] = [
                 item
                 for item in normalized["verification_requirements"]
-                if not self._looks_like_file_verification_requirement(
-                    item
-                )
+                if not self._looks_like_file_verification_requirement(item)
             ]
 
-            # v5.0+ Response-Only Basic-Info Contract
-            #
-            # “读取一个 Excel 并告诉我基本情况”不需要：
-            # - 最终文件回读
-            # - 再次读取源文件
-            # - 深入分组统计
-            # - 为了验收而制造额外 Tool Call
-            #
-            # 真实 read + get_data_info 已经是这一类任务的事实证据。
-            # Completion Gate 继续保留执行成功/工具失败等硬检查，
-            # 但 Planner 不再生成无法终止的语义验收循环。
-            user_task_lower = str(user_task or "").lower()
-            response_only_basic_info = (
-                any(
-                    phrase in user_task_lower
-                    for phrase in (
-                        "基本情况",
-                        "基本信息",
-                        "数据概况",
-                        "数据基本情况",
-                        "简单看一下",
-                        "简单看看",
-                    )
-                )
-                and any(
-                    phrase in user_task_lower
-                    for phrase in (
-                        "读取",
-                        "查看",
-                        "看看",
-                        "告诉我",
-                        "说明",
-                    )
-                )
-            )
-
-            if response_only_basic_info:
-                normalized["verification_requirements"] = []
+            normalized["safety_requirements"] = [
+                item
+                for item in normalized["safety_requirements"]
+                if not self._looks_like_file_delivery_safety_requirement(item)
+            ]
 
         workspace = context.get("workspace")
 
@@ -676,117 +614,6 @@ JSON 必须包含以下字段：
                     ),
                 )
 
-        # v5.1 Semantic-Aware External Data Contract
-        # 对“联网获取/下载外部数据后再分析”的任务，在 Python 层补充最小且
-        # 可验证的语义理解要求。这样不依赖 LLM 是否恰好在 TaskPlan 中写出该步骤，
-        # 同时不会影响普通本地 Excel 基本信息任务。
-        if self._requires_external_data_semantics(user_task):
-            self._append_unique(
-                normalized["execution_requirements"],
-                (
-                    "外部数据成功读取后，在统计、可视化和正式报告之前，"
-                    "先识别关键字段的业务含义、字段角色与已知单位；"
-                    "对无法可靠确定的含义或单位必须保留不确定性，不得猜测。"
-                ),
-            )
-            self._append_unique(
-                normalized["verification_requirements"],
-                (
-                    "面向人的最终图表和报告不得直接依赖无法解释的专业缩写；"
-                    "不同或未知单位的指标不得仅因同为数值列而强行放在同一纵轴比较。"
-                ),
-            )
-
-        # 常规天气任务的最小数据合同：
-        # 不做科研/高频研究时，默认只要求常用天气要素，并以逐小时作为
-        # 面向分析和交付的目标时间分辨率。原始数据可保留更高频率，
-        # 但 Processing 应按要素语义聚合，而不是把无关字段全部带入报告。
-        weather_text = re.sub(
-            r"\s+",
-            " ",
-            str(user_task or "").strip().lower(),
-        )
-        is_weather_task = any(
-            token in weather_text
-            for token in (
-                "天气", "气象", "气温", "温度", "湿度",
-                "降水", "降雨", "风速",
-            )
-        )
-        explicit_frequency = bool(
-            re.search(
-                r"(?:每|逐)\s*\d*\s*(?:分钟|分|小时|时)"
-                r"|\d+\s*(?:min|minute|minutes|hour|hours)"
-                r"|分钟级|小时级|逐时|逐分钟|高频",
-                weather_text,
-            )
-        )
-
-        if is_weather_task:
-            self._append_unique(
-                normalized["execution_requirements"],
-                (
-                    "常规天气数据遵循最小数据合同：优先围绕气温、相对湿度、"
-                    "降水和风速，以及时间/站点/来源等必要追溯字段获取和处理；"
-                    "除非用户明确要求、派生指标计算需要或质量核验需要，"
-                    "不要把气压、能见度、阵风等无关字段带入最终分析。"
-                ),
-            )
-            if not explicit_frequency:
-                self._append_unique(
-                    normalized["execution_requirements"],
-                    (
-                        "常规天气分析默认目标时间分辨率为1小时；"
-                        "若原始权威数据频率更高，应保留原始文件不变，"
-                        "在分析数据中按小时进行语义正确的聚合："
-                        "气温/湿度/风速可按小时统计，降水按小时累计。"
-                    ),
-                )
-                self._append_unique(
-                    normalized["assumptions"],
-                    "用户未指定天气时间精度，采用常规逐小时分析精度。",
-                )
-
-        # 通用 Minimal Data Contract：
-        # 不论气象、金融、经营还是其他办公数据任务，都优先获取完成用户目标
-        # 所必需的字段和追溯字段；不能因为数据源“还能提供更多列”就默认全部
-        # 带入后续分析。详细程度由用户明确要求、Clarification Gate 的澄清结果
-        # 或领域合理默认共同决定。
-        self._append_unique(
-            normalized["execution_requirements"],
-            (
-                "遵循最小必要数据原则：只获取和处理完成当前任务所必需的核心字段、"
-                "必要派生指标输入以及来源/时间/标识等追溯字段；"
-                "无关字段不得仅因数据源可提供而自动进入最终分析和交付物。"
-            ),
-        )
-
-        temporal_window = self._resolve_temporal_intent(user_task)
-        if temporal_window is not None:
-            start_date, end_date, label = temporal_window
-            contract = (
-                f"用户时间意图“{label}”按确定性默认窗口解释为最近3天；"
-                f"本次数据时间范围必须限制在 {start_date} 至 {end_date}。"
-            )
-            self._append_unique(normalized["source_requirements"], contract)
-            self._append_unique(
-                normalized["execution_requirements"],
-                f"构造联网查询、下载 URL 或筛选条件时，必须使用 {start_date} 至 {end_date} 的时间边界，不得擅自扩大到年初、全年或更早。",
-            )
-            self._append_unique(
-                normalized["verification_requirements"],
-                f"时间范围验收：最终用于分析的数据不得早于 {start_date}，不得晚于 {end_date}；如数据源返回越界记录，必须先按该窗口筛选后再统计和报告。",
-            )
-
-        if self._user_requests_original_download_delivery(user_task):
-            self._append_unique(
-                normalized["deliverable_requirements"],
-                (
-                    "保留并交付用户明确要求保存的原始下载数据文件，"
-                    "不得仅把它作为 temporary_dir 中可被清理的临时文件。"
-                ),
-            )
-
         return TaskPlan(
             task_goal=task_goal,
             evidence_requirements=normalized[
@@ -810,88 +637,54 @@ JSON 必须包含以下字段：
             assumptions=normalized["assumptions"],
         )
 
-    @staticmethod
-    def _resolve_temporal_intent(user_task: str):
-        """把未量化的“近期/最近”稳定解释为最近3个自然日（含当天）。
-
-        显式时间表达（如最近7天、近3个月、今年以来、明确日期）继续交给
-        用户原始约束，不在这里覆盖。
+    @classmethod
+    def _strip_negated_artifact_phrases(
+        cls,
+        text: str,
+    ) -> str:
         """
-        text = re.sub(r"\s+", " ", str(user_task or "").strip().lower())
-        if not text:
-            return None
+        删除用户原始任务中的“否定文件输出”短语，再做正向意图判断。
 
-        explicit_patterns = (
-            r"(?:最近|近)\s*\d+\s*(?:天|日|周|星期|个月|月|年)",
-            r"\d{4}[-/.年]\d{1,2}",
-            r"今年以来|本年以来|年初至今|本月|这个月|本周|这周|过去\s*\d+",
-        )
-        if any(re.search(pattern, text) for pattern in explicit_patterns):
-            return None
+        例如：
+        - 不需要生成 Word 报告
+        - 不要导出 Excel
+        - PDF 文件不用生成
 
-        label = next((token for token in ("近期", "最近", "近来") if token in text), None)
-        if label is None:
-            return None
-
-        end = date.today()
-        start = end - timedelta(days=2)
-        return start.isoformat(), end.isoformat(), label
-
-    @staticmethod
-    def _requires_external_data_semantics(
-        user_task: str,
-    ) -> bool:
-        text = re.sub(
+        这些短语中虽然同时出现动作词和文件类型词，也不能被当成
+        正向 artifact 请求。
+        """
+        value = re.sub(
             r"\s+",
             " ",
-            str(user_task or "").strip().lower(),
+            str(text or "").strip().lower(),
         )
 
-        external_source = any(
-            phrase in text
-            for phrase in (
-                "网上", "联网", "网络", "互联网", "公开数据",
-                "公开资料", "下载数据", "下载资料", "获取数据",
-                "获取资料", "数据源", "官方网站", "官方数据",
-                "web", "online", "download",
+        artifact_types = (
+            r"word|docx|excel|xlsx|csv|pptx?|pdf|"
+            r"报告|报表|文件|文档|工作簿|演示文稿|交付物"
+        )
+        actions = r"生成|导出|保存|另存|制作|创建|写入|输出|交付"
+        negatives = (
+            r"不需要|无需|不要|不必|不用|不要求|禁止|"
+            r"不生成|不导出|不保存|无需生成|不要生成"
+        )
+
+        patterns = (
+            rf"(?:{negatives})\s*(?:(?:{actions})\s*)?"
+            rf"[^。；，,\n]{{0,12}}?(?:{artifact_types})",
+            rf"(?:{artifact_types})[^。；，,\n]{{0,12}}?"
+            rf"(?:{negatives})\s*(?:(?:{actions})\s*)?",
+        )
+
+        for pattern in patterns:
+            value = re.sub(
+                pattern,
+                " ",
+                value,
+                flags=re.IGNORECASE,
             )
-        )
 
-        data_work = any(
-            phrase in text
-            for phrase in (
-                "数据", "csv", "excel", "xlsx", "统计", "分析",
-                "图表", "可视化", "报告",
-            )
-        )
-
-        return bool(external_source and data_work)
-
-    @staticmethod
-    def _user_requests_original_download_delivery(
-        user_task: str,
-    ) -> bool:
-        text = re.sub(
-            r"\s+",
-            " ",
-            str(user_task or "").strip().lower(),
-        )
-
-        original_data = any(
-            phrase in text
-            for phrase in (
-                "原始数据", "源数据", "原始文件", "下载文件",
-                "原始资料", "原始下载",
-            )
-        )
-        preserve = any(
-            phrase in text
-            for phrase in (
-                "保存", "保留", "交付", "输出", "下载",
-            )
-        )
-
-        return bool(original_data and preserve)
+        return re.sub(r"\s+", " ", value).strip()
 
     @classmethod
     def _user_explicitly_requests_artifact(
@@ -907,22 +700,65 @@ JSON 必须包含以下字段：
         if not text:
             return False
 
-        if any(
-            phrase in text
-            for phrase in cls._EXPLICIT_ARTIFACT_PHRASES
-        ):
-            return True
+        positive_text = cls._strip_negated_artifact_phrases(text)
 
+        # “只需要告诉我结果”本身不是文件输出请求；仍允许同一任务里
+        # 独立出现“并生成 Excel”这样的正向要求，因此最终仍检查
+        # positive_text 中是否存在真实 artifact 动作。
         has_action = any(
-            keyword in text
+            keyword in positive_text
             for keyword in cls._ARTIFACT_ACTION_KEYWORDS
         )
         has_type = any(
-            keyword in text
+            keyword in positive_text
             for keyword in cls._ARTIFACT_TYPE_KEYWORDS
         )
 
-        return bool(has_action and has_type)
+        if has_action and has_type:
+            return True
+
+        # “给我一份 Excel / 提供一份 Word 报告”虽没有“生成”二字，
+        # 语义上仍是明确的文件交付请求。
+        if re.search(
+            r"(?:给我|提供|交付)\s*(?:一份|一个|一版)?\s*"
+            r"(?:word|docx|excel|xlsx|csv|pptx?|pdf|报告|报表|文档|工作簿)",
+            positive_text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+
+        return False
+
+    @classmethod
+    def _user_requests_direct_response(
+        cls,
+        user_task: str,
+    ) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(user_task or "").strip().lower(),
+        )
+        return any(
+            keyword.lower() in text
+            for keyword in cls._RESPONSE_DELIVERY_KEYWORDS
+        )
+
+    @classmethod
+    def _looks_like_file_deliverable_requirement(
+        cls,
+        requirement: str,
+    ) -> bool:
+        return cls._user_explicitly_requests_artifact(requirement)
+
+    @classmethod
+    def _looks_like_file_execution_requirement(
+        cls,
+        requirement: str,
+    ) -> bool:
+        # “读取 Excel”不是输出文件动作，因此不会被删除；
+        # “导出 Excel / 生成报告”会被识别为文件写出要求。
+        return cls._user_explicitly_requests_artifact(requirement)
 
     @classmethod
     def _looks_like_file_verification_requirement(
@@ -934,10 +770,24 @@ JSON 必须包含以下字段：
             " ",
             str(requirement or "").strip().lower(),
         )
-
         return any(
             keyword.lower() in text
             for keyword in cls._FILE_VERIFICATION_KEYWORDS
+        )
+
+    @classmethod
+    def _looks_like_file_delivery_safety_requirement(
+        cls,
+        requirement: str,
+    ) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(requirement or "").strip().lower(),
+        )
+        return any(
+            keyword.lower() in text
+            for keyword in cls._FILE_DELIVERY_SAFETY_KEYWORDS
         )
 
     @staticmethod
@@ -949,9 +799,13 @@ JSON 必须包含以下字段：
         if value is None:
             return []
 
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+
         if not isinstance(value, list):
             raise ValueError(
-                f"Task Planner 字段 {field_name} 必须是数组。"
+                f"Task Planner 字段 {field_name} 必须是数组或字符串。"
             )
 
         result: List[str] = []
@@ -976,6 +830,12 @@ JSON 必须包含以下字段：
 
     @staticmethod
     def _extract_json_object(content: str) -> Dict[str, Any]:
+        """
+        从模型输出中提取第一个完整 JSON 对象。
+
+        兼容纯 JSON、Markdown 围栏、JSON 前后解释文字，以及
+        JSON 后附加额外文本。不会尝试修补损坏 JSON。
+        """
         text = str(content or "").strip()
 
         if not text:
@@ -985,46 +845,36 @@ JSON 必须包含以下字段：
 
         try:
             parsed = json.loads(text)
-
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
             pass
 
-        fenced_match = re.search(
-            r"```(?:json)?\s*(\{.*?\})\s*```",
+        fence = "`" * 3
+        text = re.sub(
+            rf"^\s*{re.escape(fence)}(?:json)?\s*",
+            "",
             text,
-            flags=re.IGNORECASE | re.DOTALL,
+            flags=re.IGNORECASE,
         )
+        text = re.sub(
+            rf"\s*{re.escape(fence)}\s*$",
+            "",
+            text,
+        ).strip()
 
-        if fenced_match:
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
             try:
-                parsed = json.loads(
-                    fenced_match.group(1)
-                )
-
-                if isinstance(parsed, dict):
-                    return parsed
+                parsed, _ = decoder.raw_decode(text[index:])
             except json.JSONDecodeError:
-                pass
-
-        start = text.find("{")
-        end = text.rfind("}")
-
-        if start >= 0 and end > start:
-            candidate = text[start:end + 1]
-
-            try:
-                parsed = json.loads(candidate)
-
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError as error:
-                raise ValueError(
-                    "Task Planner 返回的 JSON 无法解析："
-                    f"{error}"
-                ) from error
+                continue
+            if isinstance(parsed, dict):
+                return parsed
 
         raise ValueError(
             "Task Planner 没有返回有效 JSON 对象。"
         )
+

@@ -7,17 +7,17 @@ from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from batch_data_tools import run_batch_pipeline
-from data_tools import run_data_pipeline
+from tools.business.data.batch_data_tools import run_batch_pipeline
+from tools.business.data.data_tools import run_data_pipeline
 from report_generator import generate_word_report
-from web_data_tools import download_data_file
+from tools.business.web.web_data_tools import download_data_file
 from office_report_tools import generate_office_deliverables
-from file_discovery_tools import (
+from tools.business.file.file_discovery_tools import (
     discover_data_files,
     inspect_data_files,
     build_file_catalog_text,
 )
-from document_tools import (
+from tools.business.document.document_tools import (
     SUPPORTED_DOCUMENT_EXTENSIONS,
     inspect_documents,
     read_document,
@@ -33,7 +33,7 @@ from .agent_loop import AgentLoop
 from .task_planner import TaskPlanner
 from workspace_manager import WorkspaceManager
 
-from office_data_tools import (
+from tools.business.office.office_data_tools import (
     read_office_data,
     merge_data_files,
     apply_filters,

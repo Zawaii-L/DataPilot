@@ -4,6 +4,10 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent_core.acquisition_completion_checker import (
+    check_acquisition_completion,
+)
+
 
 class AgentStage(str, Enum):
     """DataPilot v5.2 的四个执行阶段。"""
@@ -451,6 +455,81 @@ class StageOrchestrator:
                 return stage
 
         return None
+
+
+    @classmethod
+    def check_acquisition_gate(
+        cls,
+        *,
+        observations: List[Any],
+        task: str = "",
+    ) -> Dict[str, Any]:
+        """
+        v6.3.1 Acquisition Completion Gate
+
+        判断 Acquisition 是否已经达到进入 Processing 的条件。
+
+        返回：
+        {
+            "sufficient": bool,
+            "reason": str,
+            "evidence": list
+        }
+
+        AgentLoop 可以根据 sufficient 决定：
+        Acquisition -> Processing
+        """
+
+        result = check_acquisition_completion(
+            observations,
+            task,
+        )
+
+        return {
+            "sufficient": bool(
+                result.get("sufficient", False)
+            ),
+            "reason": str(
+                result.get("reason", "")
+            ),
+            "evidence": result.get(
+                "evidence",
+                [],
+            ),
+            "detected_years": result.get(
+                "detected_years",
+                [],
+            ),
+            "detected_brands": result.get(
+                "detected_brands",
+                [],
+            ),
+        }
+
+
+    @classmethod
+    def should_leave_acquisition(
+        cls,
+        *,
+        observations: List[Any],
+        task: str = "",
+    ) -> bool:
+        """
+        判断是否应该结束 Acquisition。
+
+        True:
+            允许进入 Processing。
+        """
+
+        gate = cls.check_acquisition_gate(
+            observations=observations,
+            task=task,
+        )
+
+        return bool(
+            gate["sufficient"]
+        )
+
 
     @classmethod
     def recovery_target(

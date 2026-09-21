@@ -22,10 +22,15 @@ from PySide6.QtWidgets import (
     QWidget,
     QLineEdit,
     QInputDialog,
+    QComboBox,
 )
 
 from core.agent import DataPilotAgent
 from clarification_gate import ClarificationGate
+from core.model_router import (
+    apply_model_profile,
+    default_mode,
+)
 
 # 文件夹扫描时默认忽略程序环境、版本控制、缓存和历史输出目录。
 # 这些目录通常包含第三方许可证、缓存文件或 Agent 自己生成的结果，
@@ -62,12 +67,13 @@ class AgentWorker(QThread):
     cancelled_signal = Signal(dict)
     error_signal = Signal(str)
 
-    def __init__(self, task, input_paths, output_dir):
+    def __init__(self, task, input_paths, output_dir, model_mode):
         super().__init__()
 
         self.task = task
         self.input_paths = input_paths
         self.output_dir = output_dir
+        self.model_mode = model_mode
         self.cancel_event = threading.Event()
 
     def request_cancel(self):
@@ -82,6 +88,12 @@ class AgentWorker(QThread):
 
     def run(self):
         try:
+            profile = apply_model_profile(
+                self.model_mode
+            )
+            self.report_progress(
+                "模型路由：" + profile.public_summary()
+            )
             self.report_progress(
                 "正在创建 DataPilot Agent..."
             )
@@ -221,6 +233,64 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(
             subtitle_label
+        )
+
+        # ----------------------------------------------------
+        # v6.5 模型路由
+        # ----------------------------------------------------
+
+        model_layout = QHBoxLayout()
+
+        model_label = QLabel(
+            "模型"
+        )
+        model_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+        model_layout.addWidget(
+            model_label
+        )
+
+        self.model_combo = QComboBox()
+        self.model_combo.addItem(
+            "本地 Qwen3.5-9B（Ollama）",
+            "local",
+        )
+        self.model_combo.addItem(
+            "DeepSeek 云端",
+            "cloud",
+        )
+
+        initial_mode = default_mode()
+        initial_index = self.model_combo.findData(
+            initial_mode
+        )
+        if initial_index >= 0:
+            self.model_combo.setCurrentIndex(
+                initial_index
+            )
+
+        self.model_combo.setMinimumWidth(
+            260
+        )
+        model_layout.addWidget(
+            self.model_combo
+        )
+        model_layout.addStretch()
+
+        main_layout.addLayout(
+            model_layout
+        )
+
+        model_hint = QLabel(
+            "本地模式默认使用 Ollama + qwen3.5:9b；云端模式使用项目 .env 中的 DeepSeek 配置。"
+            "不会自动从本地切换到云端。"
+        )
+        model_hint.setStyleSheet(
+            "color: #777777; padding-bottom: 6px;"
+        )
+        main_layout.addWidget(
+            model_hint
         )
 
         # ----------------------------------------------------
@@ -1008,6 +1078,10 @@ class MainWindow(QMainWindow):
             enabled
         )
 
+        self.model_combo.setEnabled(
+            enabled
+        )
+
         self.cancel_button.setEnabled(
             not enabled
         )
@@ -1180,6 +1254,26 @@ class MainWindow(QMainWindow):
 
             return
 
+        model_mode = str(
+            self.model_combo.currentData()
+            or "local"
+        )
+
+        try:
+            selected_profile = apply_model_profile(
+                model_mode
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "模型配置错误",
+                str(error),
+            )
+            self.append_log(
+                "模型配置错误：" + str(error)
+            )
+            return
+
         clarified_task = self.resolve_task_clarifications(task)
         if clarified_task is None:
             return
@@ -1297,6 +1391,10 @@ class MainWindow(QMainWindow):
             )
 
         self.append_log(
+            f"模型：{selected_profile.public_summary()}"
+        )
+
+        self.append_log(
             f"输出目录：{output_dir}"
         )
 
@@ -1316,6 +1414,7 @@ class MainWindow(QMainWindow):
             task=task,
             input_paths=input_paths,
             output_dir=output_dir,
+            model_mode=model_mode,
         )
 
         self.worker.log_signal.connect(

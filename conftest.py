@@ -3,8 +3,8 @@ import pytest
 
 from tempfile import TemporaryDirectory
 
-from test_document_selector import create_document_infos
-from test_document_tools import (
+from tests.integration.test_document_selector import create_document_infos
+from tests.integration.test_document_tools import (
     create_test_txt,
     create_test_markdown,
     create_test_word,
@@ -77,7 +77,7 @@ def files(folder):
     """
     提供批量文档画像测试需要的文件列表。
     """
-    from document_tools import scan_document_files
+    from tools.business.document.document_tools import scan_document_files
 
     return scan_document_files(
         folder,
@@ -90,7 +90,7 @@ def infos(files):
     """
     提供文档目录生成测试需要的画像列表。
     """
-    from document_tools import inspect_documents
+    from tools.business.document.document_tools import inspect_documents
 
     return inspect_documents(
         files,

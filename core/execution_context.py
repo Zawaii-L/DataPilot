@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from tool_executor import ToolExecutionResult, ToolExecutor
+from tools.tool_executor import ToolExecutionResult, ToolExecutor
 
 
 _REF_PATTERN = re.compile(

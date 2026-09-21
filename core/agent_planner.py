@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from tool_registry import ToolRegistry, create_default_tool_registry
+from tools.tool_registry import ToolRegistry, create_default_tool_registry
 
 
 load_dotenv()

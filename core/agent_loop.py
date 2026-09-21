@@ -13,13 +13,16 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from .execution_context import ExecutionContext, ReferenceResolver
-from tool_executor import ToolExecutionResult, ToolExecutor
-from tool_failure_recovery import build_recovery_hint
-from tool_registry import ToolRegistry, create_default_tool_registry
+from tools.tool_executor import ToolExecutionResult, ToolExecutor
+from tools.tool_failure_recovery import build_recovery_hint
+from tools.tool_registry import ToolRegistry, create_default_tool_registry
 from .task_planner import TaskPlan
 from skill_registry import SkillRegistry, create_default_skill_registry
 from skill_selector import SkillSelection, SkillSelector
-from verification_engine import VerificationEngine, VerificationReport
+from verification.verification_engine import (
+    VerificationEngine,
+    VerificationReport,
+)
 from stage_orchestrator import (
     AgentStage,
     DataState,
@@ -29,7 +32,7 @@ from stage_orchestrator import (
 
 from acquisition_adapter import build_acquisition_instruction
 from readback_registry import ReadbackRegistry
-from .execution_monitor import ExecutionMonitor
+from agent_core.execution_monitor import ExecutionMonitor
 
 
 load_dotenv()
@@ -95,12 +98,234 @@ class AgentLoop:
     # 但禁止为了“核实情况”擅自清洗、删除、填充或改写数据。
     _DATA_MUTATION_TOOLS = {
         "handle_missing_values",
+        "drop_duplicate_rows",
         "remove_duplicates",
         "clean_data",
         "auto_clean_data",
         "fill_missing_values",
         "drop_missing_values",
     }
+
+    @staticmethod
+    def _goal_explicitly_requests_data_cleaning(goal: str) -> bool:
+        text = re.sub(r"\s+", " ", str(goal or "").strip().lower())
+        cleaning_phrases = (
+            "清洗",
+            "去重",
+            "删除重复",
+            "处理重复",
+            "重复记录",
+            "缺失值",
+            "处理缺失",
+            "填充缺失",
+            "删除缺失",
+            "异常值处理",
+            "数据整理",
+        )
+        return any(phrase in text for phrase in cleaning_phrases)
+
+    @staticmethod
+    def _goal_explicitly_requests_response_only(goal: str) -> bool:
+        """识别用户明确要求“只返回结果、不生成文件”的响应型任务。"""
+        text = re.sub(r"\s+", " ", str(goal or "").strip().lower())
+
+        explicit_no_file = any(
+            phrase in text
+            for phrase in (
+                "不需要生成文件",
+                "无需生成文件",
+                "不要生成文件",
+                "不需要输出文件",
+                "无需输出文件",
+                "不要输出文件",
+                "不需要保存文件",
+                "无需保存文件",
+                "不要保存文件",
+            )
+        )
+
+        answer_only_patterns = (
+            r"(?:只需要|只需|只要).{0,40}(?:告诉|回答|给出|返回).{0,12}(?:结果|结论)",
+            r"(?:只|仅).{0,12}(?:告诉|回答|给出|返回).{0,12}(?:结果|结论)",
+        )
+        answer_only = any(
+            re.search(pattern, text) is not None
+            for pattern in answer_only_patterns
+        )
+
+        return bool(explicit_no_file or answer_only)
+
+    @staticmethod
+    def _goal_explicitly_requests_advisory_only(goal: str) -> bool:
+        """
+        识别“只讲方法/思路，不读取、不联网、不生成文件”的纯咨询任务。
+
+        该判断故意保持严格：只有同时出现咨询意图，以及明确的
+        no-read / no-network / no-file 三类约束时才返回 True。
+        这样不会把真实文件分析任务误降级成纯文本回答。
+        """
+        text = re.sub(r"\s+", " ", str(goal or "").strip().lower())
+        if not text:
+            return False
+
+        advisory = any(
+            token in text
+            for token in (
+                "处理思路", "分析思路", "检查思路", "方法",
+                "方案", "流程", "怎么做", "如何", "准备如何",
+                "简单说明", "说明你准备", "解释",
+            )
+        )
+
+        no_read = re.search(
+            r"(?:不需要|无需|不要|不必).{0,12}(?:读取|打开|加载).{0,8}(?:文件|excel|csv|数据表)?",
+            text,
+        ) is not None
+        no_network = re.search(
+            r"(?:不需要|无需|不要|不必).{0,12}(?:联网|上网|搜索|检索|网页|网络)",
+            text,
+        ) is not None
+        no_file = re.search(
+            r"(?:不需要|无需|不要|不必).{0,16}(?:生成|导出|保存|制作|创建)?[^。；;]{0,8}(?:任何)?(?:文件|报告|excel|xlsx|csv|word|docx|pdf|ppt|pptx)",
+            text,
+        ) is not None
+
+        return bool(advisory and no_read and no_network and no_file)
+
+    @staticmethod
+    def _build_local_advisory_system_prompt() -> str:
+        """本地 Qwen 纯咨询任务的极简 finish-only 协议。"""
+        return (
+            "你是 DataPilot 的本地回答器。当前用户明确要求只说明方法/思路，"
+            "并明确不要读取文件、不要联网、不要生成文件。\n"
+            "不要搜索，不要调用任何工具，不要返回 query、plan、tool、arguments。\n"
+            "只返回一个 JSON 对象，格式必须逐字遵守：\n"
+            '{"action_type":"finish","final_answer":"直接给用户的简洁回答"}\n'
+            "final_answer 应直接回答用户的问题。不要输出 Markdown 代码围栏，"
+            "不要输出第二个 JSON，也不要解释协议。"
+        )
+
+    @staticmethod
+    def _looks_like_file_output_tool(tool_name: str) -> bool:
+        """只识别明显的写文件/导出动作，不把分析工具误判为交付。"""
+        name = str(tool_name or "").strip().lower()
+        if not name:
+            return False
+
+        exact_names = {
+            "write_file",
+            "save_file",
+            "create_file",
+            "export_file",
+            "write_csv",
+            "save_csv",
+            "export_csv",
+            "to_csv",
+            "write_excel",
+            "save_excel",
+            "export_excel",
+            "to_excel",
+            "export_office_result",
+            "export_multi_sheet_excel",
+            "generate_office_deliverables",
+            "create_professional_excel_report",
+            "create_professional_word_report",
+            "generate_document_summary_report",
+        }
+        if name in exact_names:
+            return True
+
+        return name.startswith(("write_", "save_", "export_"))
+
+    @classmethod
+    def _response_only_analysis_ready(
+        cls,
+        *,
+        goal: str,
+        state: Dict[str, Any],
+    ) -> bool:
+        """
+        判断响应型分析是否已有足够真实 Observation，可以直接 finish。
+
+        这里只检查已成功工具，不计算或伪造新的业务结果。
+        """
+        if not isinstance(state, dict):
+            return False
+
+        runtime = state.get("runtime_context")
+        if not isinstance(runtime, dict):
+            runtime = {}
+
+        if cls._task_plan_has_file_deliverables(runtime):
+            return False
+
+        if not cls._goal_explicitly_requests_response_only(goal):
+            return False
+
+        steps = state.get("completed_tool_steps")
+        if not isinstance(steps, list):
+            return False
+
+        successful = [
+            item
+            for item in steps
+            if isinstance(item, dict) and bool(item.get("success"))
+        ]
+        successful_names = {
+            str(item.get("tool") or "").strip().lower()
+            for item in successful
+        }
+
+        goal_text = str(goal or "").lower()
+        quality_requested = any(
+            token in goal_text
+            for token in ("缺失", "重复", "数据质量", "missing", "duplicate")
+        )
+        if quality_requested and "get_data_info" not in successful_names:
+            return False
+
+        quality_observation = None
+        for item in reversed(successful):
+            if str(item.get("tool") or "").strip().lower() == "get_data_info":
+                if isinstance(item.get("observation"), dict):
+                    quality_observation = item.get("observation")
+                break
+
+        if (
+            quality_requested
+            and isinstance(quality_observation, dict)
+            and cls._goal_explicitly_requests_data_cleaning(goal)
+        ):
+            missing_values = quality_observation.get("missing_values") or {}
+            duplicate_rows = quality_observation.get("duplicate_rows") or 0
+            try:
+                duplicate_count = int(duplicate_rows)
+            except (TypeError, ValueError):
+                duplicate_count = 0
+
+            if missing_values and "handle_missing_values" not in successful_names:
+                return False
+            if duplicate_count > 0 and "drop_duplicate_rows" not in successful_names:
+                return False
+
+        analysis_requested = any(
+            token in goal_text
+            for token in (
+                "统计", "汇总", "合计", "平均", "均值",
+                "最高", "最大", "最低", "最小", "分析",
+            )
+        )
+        analysis_tools = {
+            "group_statistics",
+            "group_multi_statistics",
+            "create_pivot_summary",
+            "calculate_stats",
+            "run_data_pipeline",
+        }
+        if analysis_requested and not (successful_names & analysis_tools):
+            return False
+
+        return bool(successful)
 
     @staticmethod
     def _task_plan_has_deliverables(
@@ -119,6 +344,40 @@ class AgentLoop:
         return bool(
             plan.get("deliverable_requirements") or []
         )
+
+    @staticmethod
+    def _task_plan_has_file_deliverables(
+        runtime_context: Dict[str, Any],
+    ) -> bool:
+        """只判断 TaskPlan 是否明确要求真实文件型交付物。"""
+        plan = (runtime_context or {}).get("task_plan")
+
+        if isinstance(plan, TaskPlan):
+            plan = plan.to_dict()
+        elif hasattr(plan, "to_dict"):
+            plan = plan.to_dict()
+
+        if not isinstance(plan, dict):
+            return False
+
+        requirements = plan.get("deliverable_requirements") or []
+        if not isinstance(requirements, (list, tuple)):
+            requirements = [requirements]
+
+        file_tokens = (
+            "文件", "附件", "下载",
+            "excel", "xlsx", "xls", "csv",
+            "word", "docx", "pdf", "png", "jpg", "jpeg",
+            "报告", "图表", "工作簿", "文档",
+        )
+        for item in requirements:
+            text = str(item or "").strip().lower()
+            if not text:
+                continue
+            if any(token in text for token in file_tokens):
+                return True
+
+        return False
 
     @staticmethod
     def _has_successful_tool(
@@ -259,6 +518,172 @@ class AgentLoop:
         return "\n".join(lines).strip()
 
     @classmethod
+    def _build_response_only_analysis_final_answer(
+        cls,
+        *,
+        goal: str,
+        state: Dict[str, Any],
+    ) -> str:
+        """
+        用已经成功的质量检查/统计 Observation 生成响应型最终答案。
+
+        不调用新工具，不从 DataFrame preview 补造统计；仅整理真实工具结果。
+        """
+        if not isinstance(state, dict):
+            return ""
+        steps = state.get("completed_tool_steps")
+        if not isinstance(steps, list):
+            return ""
+
+        successful = [
+            item
+            for item in steps
+            if isinstance(item, dict) and bool(item.get("success"))
+        ]
+        if not successful:
+            return ""
+
+        info = None
+        analysis_step = None
+        read_step = None
+        clean_steps: List[Dict[str, Any]] = []
+
+        for item in successful:
+            name = str(item.get("tool") or "").strip().lower()
+            if name == "read_office_data":
+                read_step = item
+            elif name == "get_data_info" and isinstance(item.get("observation"), dict):
+                info = item.get("observation")
+            elif name in {"handle_missing_values", "drop_duplicate_rows"}:
+                clean_steps.append(item)
+            elif name in {
+                "group_statistics",
+                "group_multi_statistics",
+                "create_pivot_summary",
+                "calculate_stats",
+                "run_data_pipeline",
+            }:
+                analysis_step = item
+
+        lines: List[str] = []
+
+        if isinstance(read_step, dict):
+            arguments = read_step.get("arguments") or {}
+            source_path = str(arguments.get("file_path") or "").strip()
+            if source_path:
+                lines.append(f"已读取并分析 {Path(source_path).name}。")
+
+        if isinstance(info, dict):
+            rows = info.get("rows")
+            columns = info.get("columns")
+            if rows is not None and columns is not None:
+                lines.append(f"数据规模：{rows} 行 × {columns} 列。")
+
+            missing_values = info.get("missing_values") or {}
+            duplicate_rows = info.get("duplicate_rows") or 0
+            if isinstance(missing_values, dict):
+                if missing_values:
+                    detail = "、".join(
+                        f"{column} {count} 个"
+                        for column, count in missing_values.items()
+                    )
+                    lines.append(f"缺失值检查：发现 {detail}。")
+                else:
+                    lines.append("缺失值检查：未发现缺失值。")
+
+            try:
+                duplicate_count = int(duplicate_rows)
+            except (TypeError, ValueError):
+                duplicate_count = 0
+            if duplicate_count > 0:
+                lines.append(f"重复记录检查：发现 {duplicate_count} 行重复记录。")
+            else:
+                lines.append("重复记录检查：未发现完全重复行。")
+
+            if not missing_values and duplicate_count == 0 and cls._goal_explicitly_requests_data_cleaning(goal):
+                lines.append("由于未发现缺失值或重复记录，因此未执行不必要的数据清洗。")
+
+        for item in clean_steps:
+            name = str(item.get("tool") or "").strip().lower()
+            arguments = item.get("arguments") or {}
+            if name == "handle_missing_values":
+                method = str(arguments.get("method") or "既定方法").strip()
+                lines.append(f"缺失值已完成处理，方法：{method}。")
+            elif name == "drop_duplicate_rows":
+                keep = str(arguments.get("keep") or "first").strip()
+                lines.append(f"重复记录已完成去重，保留策略：{keep}。")
+
+        if isinstance(analysis_step, dict):
+            name = str(analysis_step.get("tool") or "").strip().lower()
+            arguments = analysis_step.get("arguments") or {}
+            observation = analysis_step.get("observation")
+            preview = observation.get("preview") if isinstance(observation, dict) else None
+
+            if name == "group_statistics" and isinstance(preview, list) and preview:
+                group_by = str(arguments.get("group_by") or "分组").strip()
+                target_column = str(arguments.get("target_column") or "指标").strip()
+                operation = str(arguments.get("operation") or "").strip().lower()
+                operation_label = {
+                    "sum": "合计",
+                    "mean": "平均值",
+                    "count": "数量",
+                    "max": "最大值",
+                    "min": "最小值",
+                    "median": "中位数",
+                }.get(operation, operation or "统计值")
+
+                value_column = ""
+                if isinstance(observation, dict):
+                    columns = observation.get("columns") or []
+                    if isinstance(columns, (list, tuple)):
+                        candidates = [
+                            str(column)
+                            for column in columns
+                            if str(column) != group_by
+                        ]
+                        if len(candidates) == 1:
+                            value_column = candidates[0]
+
+                if not value_column:
+                    for key in preview[0].keys() if isinstance(preview[0], dict) else []:
+                        if str(key) != group_by:
+                            value_column = str(key)
+                            break
+
+                pairs = []
+                numeric_rows = []
+                for row in preview:
+                    if not isinstance(row, dict):
+                        continue
+                    group_value = row.get(group_by)
+                    metric_value = row.get(value_column) if value_column else None
+                    pairs.append(f"{group_value}：{metric_value}")
+                    if isinstance(metric_value, (int, float)):
+                        numeric_rows.append((group_value, metric_value))
+
+                if pairs:
+                    lines.append(
+                        f"按{group_by}统计{target_column}{operation_label}："
+                        + "；".join(pairs)
+                        + "。"
+                    )
+
+                goal_text = str(goal or "").lower()
+                if numeric_rows and any(token in goal_text for token in ("最高", "最大")):
+                    top_group, top_value = max(numeric_rows, key=lambda item: item[1])
+                    lines.append(
+                        f"{target_column}最高的{group_by}是{top_group}，"
+                        f"{operation_label}为 {top_value}。"
+                    )
+
+            elif isinstance(preview, list) and preview:
+                lines.append(
+                    "统计分析已完成；结果来自成功执行的确定性统计工具。"
+                )
+
+        return "\n".join(line for line in lines if line).strip()
+
+    @classmethod
     def _get_execution_budget_block_reason(
         cls,
         *,
@@ -278,10 +703,14 @@ class AgentLoop:
             runtime_context
         )
 
-        if response_only and normalized in cls._DATA_MUTATION_TOOLS:
+        if (
+            response_only
+            and normalized in cls._DATA_MUTATION_TOOLS
+            and not cls._goal_explicitly_requests_data_cleaning(goal)
+        ):
             return (
-                "当前 TaskPlan 没有最终文件交付要求，属于直接回答/只读分析任务；"
-                f"工具 {tool_name} 会改变数据内容，因此被 Read-Only Task Boundary 拦截。"
+                "当前 TaskPlan 没有最终文件交付要求，且用户没有明确要求清洗/去重/缺失值处理；"
+                f"工具 {tool_name} 会改变 DataFrame 内容，因此被 Read-Only Task Boundary 拦截。"
                 "请使用读取、检查或统计类工具取得证据。"
             )
 
@@ -420,6 +849,7 @@ class AgentLoop:
         "search_web",
         "read_webpage",
         "download_data_file",
+        "download_document_file",
         "list_files",
         "scan",
         "discover",
@@ -631,6 +1061,10 @@ class AgentLoop:
     ) -> Dict[str, Any]:
         if isinstance(output, dict):
             return output
+        # pandas.DataFrame.to_dict() 可能把大表完整复制成嵌套 dict。
+        # DataFrame 由 _structured_output_reference() 单独处理，这里不要展开。
+        if hasattr(output, "columns") and hasattr(output, "shape"):
+            return {}
         if hasattr(output, "to_dict"):
             try:
                 value = output.to_dict()
@@ -640,12 +1074,64 @@ class AgentLoop:
                 pass
         return {}
 
+    @staticmethod
+    def _structured_output_reference(
+        *,
+        step_id: str,
+        output: Any,
+    ) -> tuple[Optional[str], List[str]]:
+        """
+        为真实结构化 Tool 输出建立 ExecutionContext 引用。
+
+        DataPilot 的 ExecutionContext 原生支持 step_N.output(.field) 引用。
+        很多 DataFrame 工具直接返回 pandas.DataFrame，或把 DataFrame 放在
+        analysis_df/dataframe/clean_df 等字段里，并不会额外返回 data_ref 字符串。
+        因此 DataState 不能只等待 *_ref；否则 Processing Gate 会把已经存在的
+        真实 DataFrame 误判成“无可追踪数据状态”。
+        """
+        step = str(step_id or "").strip()
+        if not step or output is None:
+            return None, []
+
+        def schema_of(value: Any) -> List[str]:
+            columns = getattr(value, "columns", None)
+            if columns is None:
+                return []
+            try:
+                return [str(item) for item in list(columns)]
+            except Exception:
+                return []
+
+        direct_schema = schema_of(output)
+        if direct_schema:
+            return f"{step}.output", direct_schema
+
+        if isinstance(output, dict):
+            for key in (
+                "analysis_df",
+                "clean_df",
+                "dataframe",
+                "df",
+                "data",
+                "result",
+                "output",
+            ):
+                if key not in output:
+                    continue
+                child = output.get(key)
+                child_schema = schema_of(child)
+                if child_schema:
+                    return f"{step}.output.{key}", child_schema
+
+        return None, []
+
     @classmethod
     def _update_data_state_from_tool_result(
         cls,
         *,
         data_state: DataState,
         tool_result: ToolExecutionResult,
+        step_id: str = "",
     ) -> None:
         """仅依据成功的真实 Tool Observation 更新跨 Stage Data State。"""
         if not getattr(tool_result, "success", False):
@@ -654,10 +1140,14 @@ class AgentLoop:
         name = str(
             getattr(tool_result, "tool_name", "") or ""
         ).strip().lower()
-        output = cls._extract_output_mapping(
-            getattr(tool_result, "output", None)
-        )
+        raw_output = getattr(tool_result, "output", None)
+        output = cls._extract_output_mapping(raw_output)
         arguments = getattr(tool_result, "arguments", {}) or {}
+
+        structured_ref, structured_schema = cls._structured_output_reference(
+            step_id=step_id,
+            output=raw_output,
+        )
 
         def first_text(mapping, keys):
             for key in keys:
@@ -787,6 +1277,34 @@ class AgentLoop:
         ):
             if result_ref:
                 data_state.statistics_ref = result_ref
+
+        # v6.4 Integration Fix：DataFrame 工具通常直接返回真实 DataFrame，
+        # 不额外生成 result_ref。此时使用 ExecutionContext 的 step_N.output
+        # 引用登记最新数据状态，避免 Processing Gate 假 FAIL。
+        if structured_ref:
+            data_state.set_current_data(
+                structured_ref,
+                schema=structured_schema or schema or None,
+            )
+            if name == "normalize_semantic_dataframe":
+                data_state.analysis_data_ref = structured_ref
+            elif any(
+                token in name
+                for token in (
+                    "build_dataframe",
+                    "create_dataframe",
+                    "filter_data",
+                    "apply_filters",
+                    "select_columns",
+                    "create_pivot_summary",
+                    "merge_data_files",
+                    "drop_columns",
+                    "rename_columns",
+                    "drop_duplicate_rows",
+                    "handle_missing_values",
+                )
+            ):
+                data_state.analysis_data_ref = structured_ref
 
         if "download" in name:
             url = first_text(arguments, ("url", "source_url"))
@@ -963,54 +1481,514 @@ class AgentLoop:
         }
 
     @staticmethod
+    def _task_requires_regression(goal: str) -> bool:
+        text = str(goal or "").lower()
+        return any(
+            token in text
+            for token in (
+                "回归", "regression", "预测", "影响因素", "驱动因素",
+                "因素分析", "相关性", "模型", "原因分析",
+            )
+        )
+
+    @staticmethod
+    def _collect_acquisition_observations(
+        tool_results: List[ToolExecutionResult],
+    ) -> List[Any]:
+        observations: List[Any] = []
+        for item in tool_results or []:
+            if not getattr(item, "success", False):
+                continue
+            name = str(getattr(item, "tool_name", "") or "").strip().lower()
+            if name not in {
+                "search_web",
+                "read_webpage",
+                "download_data_file",
+                "download_document_file",
+                "read_document",
+            }:
+                continue
+            output = getattr(item, "output", None)
+            if output is not None:
+                observations.append(output)
+        return observations
+
+    @classmethod
+    def _acquisition_evidence_status(
+        cls,
+        *,
+        tool_results: List[ToolExecutionResult],
+        goal: str,
+    ) -> Dict[str, Any]:
+        observations = cls._collect_acquisition_observations(tool_results)
+        if not observations:
+            return {
+                "sufficient": False,
+                "reason": "尚无成功 Acquisition Observation。",
+                "evidence": [],
+            }
+        try:
+            return StageOrchestrator.check_acquisition_gate(
+                observations=observations,
+                task=goal,
+            )
+        except Exception as error:
+            # Completion Checker 只是智能停止辅助，不能因为它自身异常
+            # 阻断原有 SOURCE_READY 路径。
+            return {
+                "sufficient": False,
+                "reason": f"Acquisition Completion Checker 未能判定：{error}",
+                "evidence": [],
+            }
+
+    @classmethod
+    def _has_fine_grained_acquisition_evidence(
+        cls,
+        tool_results: List[ToolExecutionResult],
+    ) -> bool:
+        """
+        判断是否真正读取到可形成回归样本的月度/季度业务证据。
+
+        v6.4 不能只因为长网页/原始 Wiki 文本里出现很多月份、季度和数字
+        就判定为 fine-grained。引用日期、更新时间、脚注日期并不是销量时间序列。
+        因此要求至少 3 个不同月/季度时间点，并且每个时间点附近存在
+        可识别的业务数值。对于“万辆/辆/vehicles”等强车辆单位，单位本身
+        可作为销量序列信号；对于 million/units 等泛化单位，则仍要求附近
+        同时出现销量/交付等业务度量词。ISO 引用日期（如 2024-01-05）
+        不作为月度时间点。
+        """
+        period_patterns = (
+            ("quarter_en", re.compile(r"\bq([1-4])\b", re.IGNORECASE)),
+            ("quarter_cn", re.compile(r"第?([一二三四1234])季度")),
+            (
+                "month_cn",
+                re.compile(
+                    r"(?<!\d)(?:20\d{2}[年\-/])?(1[0-2]|0?[1-9])月|"
+                    r"20\d{2}[-/](1[0-2]|0?[1-9])(?!\d)(?![-/]\d{1,2}\b)"
+                ),
+            ),
+        )
+        metric_pattern = re.compile(
+            r"销量|销售量|交付量|交付|sales?|sold|deliver(?:y|ies|ed)?",
+            re.IGNORECASE,
+        )
+        value_with_unit_pattern = re.compile(
+            r"[-+]?\d[\d,]*(?:\.\d+)?\s*"
+            r"(?:万辆|万台|辆|台|million\b|vehicles?\b|units?\b)",
+            re.IGNORECASE,
+        )
+        strong_vehicle_value_pattern = re.compile(
+            r"[-+]?\d[\d,]*(?:\.\d+)?\s*"
+            r"(?:万辆|万台|辆|台|vehicles?\b|cars?\b)",
+            re.IGNORECASE,
+        )
+        chinese_quarter_map = {
+            "一": "1", "二": "2", "三": "3", "四": "4",
+            "1": "1", "2": "2", "3": "3", "4": "4",
+        }
+
+        for item in tool_results or []:
+            if not getattr(item, "success", False):
+                continue
+            name = str(getattr(item, "tool_name", "") or "").strip().lower()
+            if name not in {"read_webpage", "read_document"}:
+                continue
+
+            output = getattr(item, "output", None)
+            if isinstance(output, dict):
+                text = str(output.get("text") or "")
+            else:
+                text = str(output or "")
+            if not text:
+                continue
+
+            qualified_periods: set[str] = set()
+            for period_type, pattern in period_patterns:
+                for match in pattern.finditer(text):
+                    groups = [group for group in match.groups() if group]
+                    value = groups[0] if groups else match.group(0)
+                    if period_type.startswith("quarter"):
+                        normalized = chinese_quarter_map.get(str(value), str(value))
+                        period_key = f"Q{normalized}"
+                    else:
+                        try:
+                            period_key = f"M{int(value)}"
+                        except Exception:
+                            period_key = f"M{value}"
+
+                    window = text[
+                        max(0, match.start() - 60):
+                        min(len(text), match.end() + 140)
+                    ]
+                    has_value_with_unit = bool(
+                        value_with_unit_pattern.search(window)
+                    )
+                    has_metric = bool(metric_pattern.search(window))
+                    has_strong_vehicle_value = bool(
+                        strong_vehicle_value_pattern.search(window)
+                    )
+                    if (
+                        has_value_with_unit
+                        and (has_metric or has_strong_vehicle_value)
+                    ):
+                        qualified_periods.add(period_key)
+
+            if len(qualified_periods) >= 3:
+                return True
+
+        return False
+
+    @classmethod
     def _acquisition_gate_status(
+        cls,
         data_state: DataState,
+        *,
+        tool_results: Optional[List[ToolExecutionResult]] = None,
+        goal: str = "",
     ) -> Dict[str, Any]:
         """
-        Acquisition → Processing 的 SOURCE_READY Gate。
+        v6.4 Acquisition → Processing Gate。
 
-        下载成功本身不算 SOURCE_READY。
-        必须至少存在“成功读取后形成的数据引用或 schema”。
+        两条可接受路径：
+        1. SOURCE_READY：下载/本地来源已经成功读取，形成可追踪数据状态；
+        2. EVIDENCE_READY：联网研究已取得足够结构化网页证据，允许进入
+           Processing 使用 build_dataframe/create_dataframe 结构化，不再为了
+           “形式上必须下载一个文件”继续消耗搜索 Token。
         """
-        has_source = bool(
-            data_state.source_urls
-            or data_state.source_paths
-        )
+        has_source = bool(data_state.source_urls or data_state.source_paths)
         has_readable_data = bool(
             data_state.raw_data_ref
             or data_state.current_data_ref
             or data_state.current_schema
         )
 
-        passed = has_readable_data
+        evidence_gate = {
+            "sufficient": False,
+            "reason": "",
+            "evidence": [],
+        }
+        if tool_results:
+            evidence_gate = cls._acquisition_evidence_status(
+                tool_results=tool_results,
+                goal=goal,
+            )
 
-        if passed:
+        base_evidence_ready = bool(evidence_gate.get("sufficient", False))
+        regression_needed = cls._task_requires_regression(goal)
+        fine_grained = cls._has_fine_grained_acquisition_evidence(tool_results or [])
+        web_action_count = sum(
+            1
+            for item in (tool_results or [])
+            if str(getattr(item, "tool_name", "") or "").strip().lower()
+            in {"search_web", "read_webpage"}
+        )
+
+        # 回归/影响因素任务优先要求月度或季度证据。
+        # 但为了控制 Token，网页 Acquisition 达到 6 次后允许以年度证据降级推进，
+        # 后续 Processing Intelligence 会把模型标记为探索性小样本回归。
+        evidence_ready = bool(
+            base_evidence_ready
+            and (
+                not regression_needed
+                or fine_grained
+                or web_action_count >= 6
+            )
+        )
+        degraded_evidence_ready = bool(
+            evidence_ready
+            and regression_needed
+            and not fine_grained
+            and web_action_count >= 6
+        )
+        passed = bool(has_readable_data or evidence_ready)
+
+        if has_readable_data:
+            signal = "SOURCE_READY"
             reason = (
-                "来源数据已经成功读取并形成可追踪的数据状态，"
-                "SOURCE_READY。"
+                "来源数据已经成功读取并形成可追踪的数据状态，SOURCE_READY。"
+            )
+        elif degraded_evidence_ready:
+            signal = "EVIDENCE_READY_DEGRADED"
+            reason = (
+                "核心网页证据已足够，但回归任务在 6 次网页 Acquisition 动作内仍未获得"
+                "稳定月度/季度数据；为控制 Token，允许进入 Processing，且回归必须按"
+                "探索性小样本模型处理。"
+            )
+        elif evidence_ready:
+            signal = "EVIDENCE_READY"
+            reason = (
+                "已有联网 Acquisition Observation 满足核心对象/时间范围等证据要求；"
+                "回归任务所需细粒度证据条件也已满足，允许进入 Processing 结构化已有证据。"
             )
         elif has_source:
+            signal = "SOURCE_NOT_READY"
             reason = (
                 "来源已获取/下载，但尚无成功读取形成的数据引用或 schema；"
-                "Acquisition 不能提前 PASS。"
+                "且网页证据尚不足，Acquisition 不能提前 PASS。"
             )
         else:
+            signal = "SOURCE_NOT_READY"
             reason = (
-                "尚未形成可读取的数据来源与数据状态；"
+                "尚未形成可读取的数据来源，且现有网页证据仍不足；"
                 "Acquisition 不能进入 Processing。"
             )
 
         return {
             "passed": passed,
             "stage": AgentStage.ACQUISITION.value,
-            "signal": "SOURCE_READY" if passed else "SOURCE_NOT_READY",
+            "signal": signal,
             "reason": reason,
             "raw_data_ref": data_state.raw_data_ref,
             "current_data_ref": data_state.current_data_ref,
             "current_schema": list(data_state.current_schema),
             "source_urls": list(data_state.source_urls),
             "source_paths": list(data_state.source_paths),
+            "evidence_gate": evidence_gate,
+            "regression_requested": regression_needed,
+            "fine_grained_evidence": fine_grained,
+            "web_action_count": web_action_count,
+            "degraded_evidence_ready": degraded_evidence_ready,
         }
+
+    @staticmethod
+    def _normalize_numeric_token(value: Any) -> Optional[str]:
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                number = float(value)
+            except Exception:
+                return None
+            if not (number == number):
+                return None
+            if number.is_integer():
+                return str(int(number))
+            return (f"{number:.12f}").rstrip("0").rstrip(".")
+        return None
+
+    @classmethod
+    def _numeric_evidence_tokens(
+        cls,
+        tool_results: List[ToolExecutionResult],
+    ) -> set[str]:
+        tokens: set[str] = set()
+        pattern = re.compile(r"(?<![A-Za-z0-9_.])-?\d[\d,]*(?:\.\d+)?")
+
+        for item in tool_results or []:
+            if not getattr(item, "success", False):
+                continue
+            try:
+                text = repr(getattr(item, "output", None))
+            except Exception:
+                text = str(getattr(item, "output", None))
+            for raw in pattern.findall(text):
+                cleaned = raw.replace(",", "")
+                try:
+                    number = float(cleaned)
+                except Exception:
+                    continue
+                normalized = cls._normalize_numeric_token(number)
+                if normalized is not None:
+                    tokens.add(normalized)
+        return tokens
+
+    @classmethod
+    def _ungrounded_dataframe_literals(
+        cls,
+        *,
+        arguments: Dict[str, Any],
+        tool_results: List[ToolExecutionResult],
+        goal: str,
+    ) -> List[str]:
+        """
+        检查 create_dataframe/build_dataframe 中由 LLM 直接写入的数值是否
+        能在之前真实 Tool Observation 中找到证据。
+
+        v6.4 同时检查 Python 数值和“纯数字字符串”。例如 "1,863,494"
+        不能因为被包成字符串就绕过 Evidence Grounding。0/1 编码和用户任务
+        中明确写出的年份允许作为结构常量；其他事实数值必须已有真实证据。
+        """
+        evidence = cls._numeric_evidence_tokens(tool_results)
+        allowed = {"0", "1"}
+        allowed.update(re.findall(r"\b20\d{2}\b", str(goal or "")))
+        missing: set[str] = set()
+        numeric_string_pattern = re.compile(
+            r"^\s*([-+]?\d[\d,]*(?:\.\d+)?)\s*"
+            r"(?:%|辆|台|万辆|万台|元|万元|亿元)?\s*$",
+            re.IGNORECASE,
+        )
+
+        def literal_token(value: Any) -> Optional[str]:
+            token = cls._normalize_numeric_token(value)
+            if token is not None:
+                return token
+            if isinstance(value, str):
+                match = numeric_string_pattern.fullmatch(value)
+                if match:
+                    raw = match.group(1).replace(",", "")
+                    try:
+                        return cls._normalize_numeric_token(float(raw))
+                    except Exception:
+                        return None
+            return None
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    walk(child)
+                return
+            if isinstance(value, (list, tuple)):
+                for child in value:
+                    walk(child)
+                return
+            token = literal_token(value)
+            if token is None or token in allowed:
+                return
+            if token not in evidence:
+                missing.add(token)
+
+        walk(arguments.get("data"))
+        return sorted(missing)
+
+    @staticmethod
+    def _extract_row_count_from_output(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+
+        shape = getattr(value, "shape", None)
+        if isinstance(shape, tuple) and shape:
+            try:
+                return int(shape[0])
+            except Exception:
+                pass
+
+        if isinstance(value, dict):
+            for key in ("row_count", "rows", "record_count", "sample_size"):
+                candidate = value.get(key)
+                if isinstance(candidate, (int, float)) and int(candidate) >= 0:
+                    return int(candidate)
+
+            shape_value = value.get("shape")
+            if isinstance(shape_value, (list, tuple)) and shape_value:
+                try:
+                    return int(shape_value[0])
+                except Exception:
+                    pass
+
+            for key in (
+                "dataframe", "df", "analysis_df", "clean_df", "data",
+                "result", "output", "summary",
+            ):
+                if key in value:
+                    found = AgentLoop._extract_row_count_from_output(value.get(key))
+                    if found is not None:
+                        return found
+
+        return None
+
+    @classmethod
+    def _latest_structured_row_count(
+        cls,
+        tool_results: Optional[List[ToolExecutionResult]],
+    ) -> Optional[int]:
+        for item in reversed(tool_results or []):
+            if not getattr(item, "success", False):
+                continue
+            found = cls._extract_row_count_from_output(
+                getattr(item, "output", None)
+            )
+            if found is not None and found > 0:
+                return found
+        return None
+
+    @classmethod
+    def _detect_processing_strategy(
+        cls,
+        *,
+        goal: str,
+        data_state: DataState,
+        tool_results: Optional[List[ToolExecutionResult]] = None,
+    ) -> Dict[str, Any]:
+        """
+        v6.4 Processing Intelligence。
+
+        在 v6.3 的“统计/回归路线推荐”上增加小样本诊断。
+        诊断只影响可靠性与下一步建议，不硬性禁止合法的小样本回归。
+        """
+        schema = [str(item) for item in (data_state.current_schema or [])]
+        need_regression = cls._task_requires_regression(goal)
+        row_count = cls._latest_structured_row_count(tool_results)
+        recommended_min_samples = 12
+
+        if need_regression:
+            small_sample = (
+                row_count is not None
+                and row_count < recommended_min_samples
+            )
+
+            if small_sample:
+                return {
+                    "analysis_type": "regression_exploratory",
+                    "recommended_tools": [
+                        "regression_analysis",
+                        "generate_regression_visualizations",
+                    ],
+                    "reason": (
+                        f"当前最新结构化数据约 {row_count} 条观测，低于 "
+                        f"{recommended_min_samples} 条的通用稳健性提醒阈值。"
+                        "如 Acquisition 中存在可信月度/季度来源，应优先补充细粒度数据；"
+                        "若无法补充，可以做探索性回归，但不得把高 R² 直接解释为稳健因果或主要驱动因素。"
+                    ),
+                    "schema": schema,
+                    "sample_diagnostic": {
+                        "row_count": row_count,
+                        "recommended_min_samples": recommended_min_samples,
+                        "small_sample": True,
+                        "reliable_for_inference": False,
+                        "model_selection_rule": (
+                            "不得仅因 R² 更高就选择模型；必须同时考虑变量业务含义、"
+                            "样本量、共线性和可解释性。"
+                        ),
+                    },
+                }
+
+            return {
+                "analysis_type": "regression",
+                "recommended_tools": [
+                    "regression_analysis",
+                    "generate_regression_visualizations",
+                ],
+                "reason": (
+                    "检测到预测/因素分析需求；可建立回归分析流程，"
+                    "但仍需根据变量业务含义与样本质量解释结果。"
+                ),
+                "schema": schema,
+                "sample_diagnostic": {
+                    "row_count": row_count,
+                    "recommended_min_samples": recommended_min_samples,
+                    "small_sample": False if row_count is not None else None,
+                    "reliable_for_inference": None if row_count is None else True,
+                    "model_selection_rule": (
+                        "不得仅因 R² 更高就选择模型；同时检查变量合理性、共线性与残差。"
+                    ),
+                },
+            }
+
+        return {
+            "analysis_type": "statistics",
+            "recommended_tools": [
+                "group_statistics",
+                "recommend_visualizations",
+            ],
+            "reason": "当前任务更适合基础统计和可视化分析。",
+            "schema": schema,
+            "sample_diagnostic": {
+                "row_count": row_count,
+                "small_sample": None,
+                "reliable_for_inference": None,
+            },
+        }
+
 
     @staticmethod
     def _processing_gate_status(
@@ -1060,88 +2038,241 @@ class AgentLoop:
         return f"{name}|{query}"
 
     @classmethod
+    def _post_stage_acquisition_recovery_status(
+        cls,
+        *,
+        current_stage: AgentStage,
+        requested_tool_stage: AgentStage,
+        tool_name: str,
+        runtime_context: Dict[str, Any],
+        max_recovery_actions: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        v6.4 Stage-Isolated Acquisition Recovery。
+
+        Processing/Delivery 发现真实证据缺口时，可以临时回补少量网页来源；
+        但这不是重新开启完整 Acquisition Stage，必须有独立上限，避免网络
+        故障或模型执念把后续 Stage 再次拖入搜索死循环。
+        """
+        name = str(tool_name or "").strip().lower()
+        is_web_recovery = name in {
+            "search_web",
+            "read_webpage",
+            "download_data_file",
+            "download_document_file",
+        }
+        if (
+            current_stage == AgentStage.ACQUISITION
+            or requested_tool_stage != AgentStage.ACQUISITION
+            or not is_web_recovery
+        ):
+            return {
+                "active": False,
+                "blocked": False,
+                "used": int(
+                    runtime_context.get(
+                        "_post_stage_acquisition_recovery_count",
+                        0,
+                    )
+                    or 0
+                ),
+                "limit": int(max_recovery_actions),
+            }
+
+        used = int(
+            runtime_context.get(
+                "_post_stage_acquisition_recovery_count",
+                0,
+            )
+            or 0
+        )
+        limit = max(1, int(max_recovery_actions))
+        return {
+            "active": True,
+            "blocked": used >= limit,
+            "used": used,
+            "limit": limit,
+            "reason": (
+                "后续 Stage 的 Acquisition Recovery 已达到上限；"
+                "不能继续通过搜索/网页读取消耗决策轮数。"
+                if used >= limit
+                else (
+                    f"允许后续 Stage 回补来源：{used}/{limit} 已使用。"
+                )
+            ),
+        }
+
+
+    @classmethod
+    def _processing_recovery_degrade_status(
+        cls,
+        *,
+        current_stage: AgentStage,
+        data_state: DataState,
+        goal: str,
+        tool_results: List[ToolExecutionResult],
+    ) -> Dict[str, Any]:
+        """Recovery 用尽后，判断是否可基于现有结构化数据安全降级继续。"""
+        has_structured_data = bool(
+            data_state.current_data_ref
+            or data_state.analysis_data_ref
+            or data_state.clean_data_ref
+            or data_state.raw_data_ref
+            or data_state.current_schema
+            or cls._latest_structured_row_count(tool_results) is not None
+        )
+        allowed = bool(
+            current_stage == AgentStage.PROCESSING
+            and has_structured_data
+        )
+        strategy = cls._detect_processing_strategy(
+            goal=goal,
+            data_state=data_state,
+            tool_results=tool_results,
+        )
+        return {
+            "degrade_to_processing": allowed,
+            "has_structured_data": has_structured_data,
+            "processing_strategy": strategy,
+            "reason": (
+                "Acquisition Recovery 已达到上限，但已有结构化数据。"
+                "停止继续联网补证据，回到 Processing 使用现有数据完成可支持的分析；"
+                "若样本不足，则回归必须降级为探索性结果并明确局限。"
+                if allowed
+                else (
+                    "Acquisition Recovery 已达到上限，且当前没有足够结构化数据可安全降级。"
+                )
+            ),
+        }
+
+
+    @classmethod
     def _acquisition_saturation_status(
         cls,
         *,
         tool_name: str,
         arguments: Dict[str, Any],
         tool_results: List[ToolExecutionResult],
+        goal: str = "",
+        current_stage: Optional[AgentStage] = None,
     ) -> Dict[str, Any]:
         """
-        防止 Acquisition 在同类搜索/网页读取上长期空转。
+        v6.4 Acquisition Smart Stop。
 
-        规则保守：
-        - 只检查 search_web / read_webpage；
-        - 完全相同签名成功执行 2 次后，第三次相同调用阻止；
-        - 最近 8 个 Acquisition 结果里若已有 >=6 次搜索/网页读取，
-          且仍准备继续搜索，则提示进入来源决策/下载，而不是无限搜。
+        目标不是简单限制次数，而是：
+        - 有足够证据时立即停止继续搜索；
+        - 回归任务优先寻找月度/季度细粒度证据；
+        - 到达合理搜索上限后停止继续烧 Token，转结构化/下载/探索性分析。
         """
+        # Saturation Guard 是 Acquisition 阶段的局部策略，不能污染
+        # Processing/Delivery/Verification。后续阶段若因证据缺口临时调用
+        # acquisition tool，应允许该调用真实执行，由 Evidence Grounding /
+        # Completion Gate 决定是否仍需补来源，而不是继续套用已结束阶段的
+        # Smart Stop。
+        if (
+            current_stage is not None
+            and current_stage != AgentStage.ACQUISITION
+        ):
+            return {
+                "saturated": False,
+                "reason": "",
+                "stage_scoped": True,
+            }
+
         name = str(tool_name or "").strip().lower()
         if name not in {"search_web", "read_webpage"}:
             return {"saturated": False, "reason": ""}
 
-        signature = cls._normalized_search_signature(
-            name,
-            arguments,
-        )
-
+        signature = cls._normalized_search_signature(name, arguments)
         same_count = 0
-        acquisition_recent = []
+        web_actions: List[str] = []
 
-        for item in tool_results:
-            item_name = str(
-                getattr(item, "tool_name", "") or ""
-            ).strip().lower()
+        for item in tool_results or []:
+            item_name = str(getattr(item, "tool_name", "") or "").strip().lower()
             if item_name not in {"search_web", "read_webpage"}:
                 continue
-
             item_args = getattr(item, "arguments", {}) or {}
-            item_sig = cls._normalized_search_signature(
-                item_name,
-                item_args,
-            )
-            if (
-                getattr(item, "success", False)
-                and item_sig == signature
-            ):
+            item_sig = cls._normalized_search_signature(item_name, item_args)
+            if getattr(item, "success", False) and item_sig == signature:
                 same_count += 1
-
-            acquisition_recent.append(item_name)
+            web_actions.append(item_name)
 
         if same_count >= 2:
             return {
                 "saturated": True,
                 "reason": (
-                    "相同 Acquisition 调用已成功执行至少 2 次，"
-                    "禁止第三次重复；应使用已有来源证据、改变检索策略，"
-                    "或进入下载/数据读取。"
+                    "相同 Acquisition 调用已成功执行至少 2 次，禁止第三次重复；"
+                    "应使用已有来源证据、改用明确数据 URL，或进入 Processing。"
                 ),
                 "signature": signature,
+                "instruction": "不要再改写同义关键词重复搜索。",
             }
 
-        recent = acquisition_recent[-8:]
-        if (
-            name == "search_web"
-            and len(recent) >= 6
-            and sum(
-                x in {"search_web", "read_webpage"}
-                for x in recent
-            ) >= 6
+        evidence_gate = cls._acquisition_evidence_status(
+            tool_results=tool_results,
+            goal=goal,
+        )
+        regression_needed = cls._task_requires_regression(goal)
+        fine_grained = cls._has_fine_grained_acquisition_evidence(tool_results)
+        web_count = len(web_actions)
+
+        if evidence_gate.get("sufficient") and (
+            not regression_needed or fine_grained
         ):
             return {
                 "saturated": True,
                 "reason": (
-                    "最近 Acquisition 行为已连续大量用于搜索/读网页；"
-                    "当前搜索链达到饱和。应基于已有证据选择可用来源、"
-                    "下载数据，或明确切换来源策略。"
+                    "Acquisition Completion Checker 已判断核心对象/时间范围证据充足；"
+                    "继续搜索的边际价值低，应立即进入 Processing 结构化已有证据。"
                 ),
                 "signature": signature,
+                "evidence_gate": evidence_gate,
+                "instruction": (
+                    "优先调用 build_dataframe/create_dataframe 或读取已明确的数据文件，"
+                    "不要继续 search_web/read_webpage。"
+                ),
+            }
+
+        # 普通研究：4 次网页动作后禁止继续扩展“搜索”面，允许读取已发现候选。
+        if name == "search_web" and web_count >= 4:
+            return {
+                "saturated": True,
+                "reason": (
+                    "已进行了至少 4 次搜索/网页动作；停止继续扩展搜索关键词。"
+                    "应读取最高价值候选、使用明确数据 URL，或基于已有证据推进。"
+                ),
+                "signature": signature,
+                "instruction": "停止 broad search，转 source decision。",
+            }
+
+        # 6 次网页动作是硬上限：之后 search/read 都停止，防止研究链无限延长。
+        if web_count >= 6:
+            if regression_needed and not fine_grained:
+                reason = (
+                    "已使用 6 次网页 Acquisition 动作仍未形成稳定月度/季度证据；"
+                    "停止继续消耗搜索 Token。若已有明确数据文件 URL 可直接下载；"
+                    "否则使用现有年度数据继续，并把回归明确降级为探索性小样本分析。"
+                )
+            else:
+                reason = (
+                    "Acquisition 网页动作已达到 6 次智能停止上限；"
+                    "应使用已有证据进入结构化/下载，不再继续 search/read。"
+                )
+            return {
+                "saturated": True,
+                "reason": reason,
+                "signature": signature,
+                "evidence_gate": evidence_gate,
+                "instruction": "停止 search_web/read_webpage，推进现有证据。",
             }
 
         return {
             "saturated": False,
             "reason": "",
-            "signature": signature,
+            "web_action_count": web_count,
+            "regression_requested": regression_needed,
+            "fine_grained_evidence": fine_grained,
+            "evidence_gate": evidence_gate,
         }
 
     @staticmethod
@@ -1812,12 +2943,105 @@ class AgentLoop:
                 canonical_name
             )
 
+            if canonical_name in {"build_dataframe", "create_dataframe"}:
+                ungrounded_literals = self._ungrounded_dataframe_literals(
+                    arguments=arguments,
+                    tool_results=tool_results,
+                    goal=goal,
+                )
+                if ungrounded_literals:
+                    evidence_guard = {
+                        "blocked_tool": canonical_name,
+                        "ungrounded_numeric_literals": ungrounded_literals[:20],
+                        "reason": (
+                            "准备写入 DataFrame 的部分数值尚未出现在任何成功 Tool Observation 中。"
+                            "禁止由模型直接补数；请先读取/获取真实来源，或用确定性计算工具生成派生值。"
+                        ),
+                    }
+                    runtime_context["evidence_grounding_observation"] = evidence_guard
+                    self.report_progress(
+                        "[Evidence Grounding Guard] "
+                        + evidence_guard["reason"]
+                        + " 未证实数值："
+                        + ", ".join(ungrounded_literals[:10])
+                    )
+                    iteration += 1
+                    continue
+
+            post_stage_recovery = self._post_stage_acquisition_recovery_status(
+                current_stage=current_stage,
+                requested_tool_stage=requested_tool_stage,
+                tool_name=canonical_name,
+                runtime_context=runtime_context,
+            )
+            if post_stage_recovery.get("blocked"):
+                fallback = self._processing_recovery_degrade_status(
+                    current_stage=current_stage,
+                    data_state=data_state,
+                    goal=goal,
+                    tool_results=tool_results,
+                )
+                if fallback.get("degrade_to_processing"):
+                    observation = {
+                        **post_stage_recovery,
+                        **fallback,
+                        "instruction": (
+                            "Acquisition Recovery 已耗尽。禁止继续 search_web、read_webpage、"
+                            "download_data_file、download_document_file。"
+                            "必须使用现有结构化数据继续 Processing；"
+                            "无法由现有证据支持的影响因素结论必须明确标记为未验证/局限。"
+                        ),
+                    }
+                    runtime_context[
+                        "_post_stage_acquisition_recovery_exhausted"
+                    ] = True
+                    runtime_context[
+                        "acquisition_recovery_observation"
+                    ] = observation
+                    runtime_context[
+                        "processing_strategy_observation"
+                    ] = fallback.get("processing_strategy")
+                    self.report_progress(
+                        "[Acquisition Recovery Degrade] "
+                        + fallback["reason"]
+                    )
+                    iteration += 1
+                    continue
+
+                self.report_progress(
+                    "[Acquisition Recovery Terminal Guard] "
+                    + str(post_stage_recovery.get("reason") or "")
+                )
+                runtime_context[
+                    "acquisition_recovery_observation"
+                ] = {
+                    **post_stage_recovery,
+                    **fallback,
+                }
+                return AgentLoopResult(
+                    success=False,
+                    goal=goal,
+                    final_answer="",
+                    stop_reason="post_stage_acquisition_recovery_exhausted",
+                    iterations=iteration,
+                    tool_results=tool_results,
+                    decisions=decisions,
+                    verification_report=(
+                        dict(latest_verification_report)
+                        if isinstance(latest_verification_report, dict)
+                        else None
+                    ),
+                    retry_policy_report=retry_policy,
+                )
+
             if requested_tool_stage == AgentStage.ACQUISITION:
                 acquisition_saturation = (
                     self._acquisition_saturation_status(
                         tool_name=canonical_name,
                         arguments=arguments,
                         tool_results=tool_results,
+                        goal=goal,
+                        current_stage=current_stage,
                     )
                 )
                 if acquisition_saturation["saturated"]:
@@ -1843,10 +3067,15 @@ class AgentLoop:
                     "read_csv",
                     "read_excel",
                     "get_data_info",
+                    "read_document",
                 }
                 if canonical_name not in acquisition_read_tools:
                     acquisition_gate = (
-                        self._acquisition_gate_status(data_state)
+                        self._acquisition_gate_status(
+                            data_state,
+                            tool_results=tool_results,
+                            goal=goal,
+                        )
                     )
                     runtime_context[
                         "acquisition_gate_observation"
@@ -1890,6 +3119,31 @@ class AgentLoop:
                     runtime_context[
                         "stage_gate_observation"
                     ] = processing_gate
+
+                    processing_state = stage_route.states[
+                        AgentStage.PROCESSING
+                    ]
+                    if processing_state.remaining_normal_iterations <= 0:
+                        self.report_progress(
+                            "[Stage Budget Terminal Guard] Processing 正常预算已耗尽且 Gate 仍 FAIL；"
+                            "停止继续空转模型决策，直接返回可诊断失败。"
+                        )
+                        return AgentLoopResult(
+                            success=False,
+                            goal=goal,
+                            final_answer="",
+                            stop_reason="processing_gate_failed_after_budget",
+                            iterations=iteration,
+                            tool_results=tool_results,
+                            decisions=decisions,
+                            verification_report=(
+                                dict(latest_verification_report)
+                                if isinstance(latest_verification_report, dict)
+                                else None
+                            ),
+                            retry_policy_report=retry_policy,
+                        )
+
                     iteration += 1
                     continue
 
@@ -1942,9 +3196,12 @@ class AgentLoop:
                     "read_csv",
                     "read_excel",
                     "get_data_info",
+                    "read_document",
                 }
                 and not self._acquisition_gate_status(
-                    data_state
+                    data_state,
+                    tool_results=tool_results,
+                    goal=goal,
                 )["passed"]
             ):
                 # 首次来源读取仍属于 Acquisition SOURCE_READY 验证，
@@ -1959,6 +3216,15 @@ class AgentLoop:
             )
 
             if current_stage != previous_stage:
+                # Acquisition 的 saturation instruction 只能约束 Acquisition。
+                # 一旦正式进入后续 Stage，清理旧观察，避免系统提示词把
+                # “停止搜索”错误带入 Processing 并造成跨阶段死循环。
+                if previous_stage == AgentStage.ACQUISITION:
+                    runtime_context.pop(
+                        "acquisition_saturation_observation",
+                        None,
+                    )
+
                 self.report_progress(
                     "[Stage Router] "
                     f"{previous_stage.value} → {current_stage.value}；"
@@ -2223,10 +3489,48 @@ class AgentLoop:
                 result
             )
 
+            if post_stage_recovery.get("active"):
+                runtime_context[
+                    "_post_stage_acquisition_recovery_count"
+                ] = int(
+                    runtime_context.get(
+                        "_post_stage_acquisition_recovery_count",
+                        0,
+                    )
+                    or 0
+                ) + 1
+                runtime_context[
+                    "acquisition_recovery_observation"
+                ] = {
+                    **post_stage_recovery,
+                    "used_after_call": runtime_context[
+                        "_post_stage_acquisition_recovery_count"
+                    ],
+                    "last_tool": canonical_name,
+                    "last_success": bool(
+                        getattr(result, "success", False)
+                    ),
+                }
+
             self._update_data_state_from_tool_result(
                 data_state=data_state,
                 tool_result=result,
+                step_id=step_id,
             )
+
+
+            # v6.3 Processing Intelligence:
+            # 数据读取/处理成功后，生成分析路线 Observation，
+            # 让后续 LLM 决策优先考虑合适的分析工具。
+            if getattr(result, "success", False):
+                processing_strategy = self._detect_processing_strategy(
+                    goal=goal,
+                    data_state=data_state,
+                    tool_results=tool_results,
+                )
+                runtime_context[
+                    "processing_strategy_observation"
+                ] = processing_strategy
             data_state.deliverable_paths = (
                 self._deduplicate_deliverable_paths(
                     data_state.deliverable_paths
@@ -2249,11 +3553,16 @@ class AgentLoop:
                     "read_csv",
                     "read_excel",
                     "get_data_info",
+                    "read_document",
                 }
                 and getattr(result, "success", False)
             ):
                 acquisition_gate = (
-                    self._acquisition_gate_status(data_state)
+                    self._acquisition_gate_status(
+                        data_state,
+                        tool_results=tool_results,
+                        goal=goal,
+                    )
                 )
                 runtime_context[
                     "acquisition_gate_observation"
@@ -2563,6 +3872,856 @@ class AgentLoop:
             workspace_summary=None,
         )
 
+    def _is_ollama_backend(self) -> bool:
+        """
+        判断当前 OpenAI-compatible 后端是否为本机 Ollama。
+
+        仅根据 base_url 判断，避免把云端 Qwen 等其他兼容服务
+        错误当成 Ollama。
+        """
+        base_url = str(getattr(self, "base_url", "") or "").strip().lower()
+        return (
+            "11434" in base_url
+            or "ollama" in base_url
+        )
+
+    @staticmethod
+    def _normalize_decision_contract(
+        decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        对本地小模型常见的轻微 JSON 契约偏差做确定性归一化。
+
+        只修正字段别名/动作同义词，不猜业务内容、不猜工具参数。
+        所有归一化结果仍会继续经过 Tool Registry、arguments 类型、
+        Stage/Recovery 等原有严格校验。
+        """
+        if not isinstance(decision, dict):
+            return decision
+
+        normalized = dict(decision)
+
+        raw_action = (
+            normalized.get("action_type")
+            or normalized.get("action")
+            or normalized.get("type")
+            or ""
+        )
+        action = str(raw_action).strip().lower()
+
+        # 本地中小模型在“观察 -> 下一步”场景中，常把真正动作包进
+        # next_action / next_step / decision / tool_call/function_call。Qwen 还会
+        # 生成 decision -> tool_call 两层嵌套，因此这里最多做 3 层受控解包。
+        # 只解包 dict，不执行任何名字；最终仍必须经过 Registry 白名单。
+        for _ in range(3):
+            nested_candidate = None
+            nested_key_used = ""
+            for nested_key in (
+                "next_action",
+                "next_step",
+                "decision",
+                "tool_call",
+                "function_call",
+            ):
+                candidate = normalized.get(nested_key)
+                if isinstance(candidate, dict) and candidate:
+                    nested_candidate = dict(candidate)
+                    nested_key_used = nested_key
+                    break
+
+            if nested_candidate is None:
+                break
+
+            # tool_call/function_call 的常见 schema 是
+            # {"name": "read_excel", "arguments": {...}}。
+            if nested_key_used in {"tool_call", "function_call"}:
+                nested_candidate.setdefault("action_type", "tool")
+                if "tool" not in nested_candidate and nested_candidate.get("name"):
+                    nested_candidate["tool"] = nested_candidate.get("name")
+
+            # 外层 arguments/purpose/reasoning 仅在内层缺失时补入。
+            if "arguments" not in nested_candidate:
+                for alias in ("arguments", "args", "parameters", "params"):
+                    if alias in normalized:
+                        nested_candidate["arguments"] = normalized[alias]
+                        break
+            if "purpose" not in nested_candidate:
+                for alias in ("purpose", "reason", "rationale", "reasoning"):
+                    if alias in normalized:
+                        nested_candidate["purpose"] = normalized[alias]
+                        break
+
+            normalized = nested_candidate
+            raw_action = (
+                normalized.get("action_type")
+                or normalized.get("action")
+                or normalized.get("type")
+                or ""
+            )
+            action = str(raw_action).strip().lower()
+
+            # 已经解包到标准 tool/finish 或显式 tool/name 时即可停止；
+            # 否则允许再解一层（典型：decision -> tool_call）。
+            if action in {"tool", "finish"} or normalized.get("tool"):
+                break
+
+        tool_aliases = {
+            "tool",
+            "use_tool",
+            "call_tool",
+            "tool_call",
+            "function",
+            "function_call",
+        }
+        finish_aliases = {
+            "finish",
+            "done",
+            "complete",
+            "completed",
+            "final",
+            "final_answer",
+            "answer",
+        }
+
+        if action in tool_aliases:
+            normalized["action_type"] = "tool"
+        elif action in finish_aliases:
+            normalized["action_type"] = "finish"
+        else:
+            # 除标准 tool/tool_name 外，兼容 Qwen 常用的 next_tool /
+            # next_action / next_step 字符串表达；这些仍会在后续经过 Registry
+            # 白名单校验，不能执行任意名字。
+            explicit_tool_value = (
+                normalized.get("tool")
+                or normalized.get("tool_name")
+                or normalized.get("function_name")
+                or normalized.get("next_tool")
+            )
+            if not explicit_tool_value:
+                for key in ("next_action", "next_step"):
+                    value = normalized.get(key)
+                    if isinstance(value, str) and value.strip():
+                        explicit_tool_value = value
+                        break
+
+            has_tool_field = bool(str(explicit_tool_value or "").strip())
+            has_answer_field = any(
+                str(normalized.get(key) or "").strip()
+                for key in (
+                    "final_answer", "answer", "response", "message",
+                    "final", "final_response", "conclusion",
+                )
+            )
+
+            # 本地小模型有时会把动作写成 respond / plan / analysis 等
+            # 非标准枚举。只有当其余字段已经明确表达唯一意图时才修正：
+            # 有真实工具字段 -> tool；只有回答字段 -> finish。
+            # 不在两者都存在时猜测，避免错误改变业务动作。
+            if has_tool_field and not has_answer_field:
+                normalized["action_type"] = "tool"
+                normalized.setdefault("tool", explicit_tool_value)
+            elif has_answer_field and not has_tool_field:
+                normalized["action_type"] = "finish"
+            else:
+                # 本地小模型有时会把真实/拟调用的工具名直接写进
+                # action_type（例如 {"action_type":"read_file",...}）。
+                # 这里只在存在 arguments/args/parameters/params 时把该值
+                # 视为“候选工具名”；后续仍必须经过 Tool Registry/本地别名
+                # 的严格验证，因此不会把 plan/respond/analysis 等文本动作
+                # 直接当成可执行工具。
+                has_argument_payload = any(
+                    key in normalized
+                    for key in ("arguments", "args", "parameters", "params")
+                )
+                meta_actions = {
+                    "plan", "analysis", "respond", "response", "answer",
+                    "think", "reason", "reasoning", "skill",
+                }
+                if action and has_argument_payload and action not in meta_actions:
+                    normalized["action_type"] = "tool"
+                    normalized.setdefault("tool", raw_action)
+
+        if normalized.get("action_type") == "tool":
+            if not str(normalized.get("tool") or "").strip():
+                alias_tool = (
+                    normalized.get("tool_name")
+                    or normalized.get("function_name")
+                    or normalized.get("name")
+                )
+                if alias_tool is not None:
+                    normalized["tool"] = alias_tool
+
+            if "arguments" not in normalized:
+                for alias in ("args", "parameters", "params"):
+                    if alias in normalized:
+                        normalized["arguments"] = normalized[alias]
+                        break
+
+            if "purpose" not in normalized:
+                alias_purpose = (
+                    normalized.get("reason")
+                    or normalized.get("rationale")
+                )
+                if alias_purpose is not None:
+                    normalized["purpose"] = alias_purpose
+
+        elif normalized.get("action_type") == "finish":
+            if not str(normalized.get("final_answer") or "").strip():
+                alias_answer = (
+                    normalized.get("answer")
+                    or normalized.get("response")
+                    or normalized.get("message")
+                    or normalized.get("final")
+                    or normalized.get("final_response")
+                    or normalized.get("conclusion")
+                )
+                if alias_answer is not None:
+                    normalized["final_answer"] = alias_answer
+
+        return normalized
+
+    def _normalize_local_response_pseudo_action(
+        self,
+        decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        v6.6 本地 Qwen 文本回复伪工具兼容层。
+
+        本地模型在无需真实工具、只需直接回答用户时，偶尔会返回：
+        {"action":"generate_text","arguments":{"text":"..."}}
+        这实际上是“finish + final_answer”，不是 Tool 调用。
+
+        仅在以下条件同时满足时做确定性转换：
+        1. 当前是 Ollama 本地后端；
+        2. 决策已经被归一化为 tool；
+        3. tool 是明确的“回复伪动作”；
+        4. 该名称并未真实注册在 Tool Registry；
+        5. arguments 中存在非空文本。
+
+        不推断任何业务事实，也不执行未注册工具。转换后的 finish 仍会继续
+        经过 Completion Gate，因此不会绕过文件交付、证据或验收要求。
+        """
+        if not isinstance(decision, dict):
+            return decision
+
+        if not self._is_ollama_backend():
+            return decision
+
+        if decision.get("action_type") != "tool":
+            return decision
+
+        tool_name = str(decision.get("tool") or "").strip()
+        normalized_name = tool_name.lower().replace("-", "_").replace(" ", "_")
+
+        pseudo_response_tools = {
+            "generate_text",
+            "generate_response",
+            "respond",
+            "reply",
+            "reply_to_user",
+            "answer_user",
+            "final_response",
+            "write_response",
+        }
+
+        if normalized_name not in pseudo_response_tools:
+            return decision
+
+        # 如果未来真的注册了同名 Tool，必须尊重 Registry，不能把真实 Tool
+        # 偷偷改写成 finish。
+        try:
+            if self.registry.resolve_name(tool_name) is not None:
+                return decision
+        except Exception:
+            pass
+
+        arguments = decision.get("arguments")
+        if not isinstance(arguments, dict):
+            return decision
+
+        final_answer = ""
+        for key in (
+            "text",
+            "content",
+            "answer",
+            "response",
+            "message",
+            "final_answer",
+        ):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                final_answer = value.strip()
+                break
+
+        if not final_answer:
+            return decision
+
+        return {
+            "action_type": "finish",
+            "final_answer": final_answer,
+            "_local_response_alias": tool_name,
+        }
+
+    @staticmethod
+    def _local_single_input_path(state: Dict[str, Any]) -> str:
+        """从真实 runtime_context 中取得唯一已选输入文件，不猜测路径。"""
+        if not isinstance(state, dict):
+            return ""
+        runtime = state.get("runtime_context")
+        if not isinstance(runtime, dict):
+            return ""
+
+        candidates: List[str] = []
+
+        def add(value: Any):
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                if text not in candidates:
+                    candidates.append(text)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    add(item)
+
+        add(runtime.get("input_paths"))
+        workspace = runtime.get("workspace")
+        if isinstance(workspace, dict):
+            add(workspace.get("protected_input_paths"))
+            add(workspace.get("source_paths"))
+
+        return candidates[0] if len(candidates) == 1 else ""
+
+    @staticmethod
+    def _local_current_data_ref(state: Dict[str, Any]) -> str:
+        if not isinstance(state, dict):
+            return ""
+        runtime = state.get("runtime_context")
+        if not isinstance(runtime, dict):
+            return ""
+        data_state = runtime.get("data_state")
+        if not isinstance(data_state, dict):
+            return ""
+        for key in (
+            "current_data_ref",
+            "analysis_data_ref",
+            "clean_data_ref",
+            "raw_data_ref",
+        ):
+            value = str(data_state.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _local_current_schema(state: Dict[str, Any]) -> List[str]:
+        """取得 DataState 中最近的真实字段名列表。"""
+        if not isinstance(state, dict):
+            return []
+        runtime = state.get("runtime_context")
+        if not isinstance(runtime, dict):
+            return []
+        data_state = runtime.get("data_state")
+        if not isinstance(data_state, dict):
+            return []
+        raw_schema = data_state.get("current_schema") or []
+        if not isinstance(raw_schema, (list, tuple)):
+            return []
+        result: List[str] = []
+        for item in raw_schema:
+            value = str(item or "").strip()
+            if value and value not in result:
+                result.append(value)
+        return result
+
+    def _resolve_local_tool_request(
+        self,
+        *,
+        tool_name: str,
+        arguments: Any,
+        state: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any], str]:
+        """
+        Ollama 中小模型的确定性工具名/参数兼容层。
+
+        目标不是替模型猜业务结论，而是把常见的“泛化工具名、引用写法、
+        聚合参数 schema”收敛到 DataPilot 已注册工具的真实签名。所有结果
+        仍然继续经过 ToolRegistry、ReferenceResolver、ToolPreflight、
+        Stage/Recovery 与 Verification。
+        """
+        raw_name = str(tool_name or "").strip()
+        args = dict(arguments) if isinstance(arguments, dict) else {}
+
+        if not self._is_ollama_backend() or not raw_name:
+            return raw_name, args, ""
+
+        def as_step_ref(value: Any) -> Any:
+            # Qwen 常把 {"$ref": "step_1.output"} 简写成
+            # "step_1.output" 或 "$step_1.output"。只有严格匹配 DataPilot
+            # 引用语法时才包装，避免普通字符串被误当引用。
+            if isinstance(value, str):
+                text = value.strip()
+                if text.startswith("$") and re.fullmatch(
+                    r"\$step_\d+\.output(?:\..+)?", text
+                ):
+                    text = text[1:]
+                if re.fullmatch(r"step_\d+\.output(?:\..+)?", text):
+                    return {"$ref": text}
+            return value
+
+        def completed_successfully(name: str) -> bool:
+            steps = state.get("completed_tool_steps") if isinstance(state, dict) else None
+            if not isinstance(steps, list):
+                return False
+            target_name = str(name or "").strip().lower()
+            return any(
+                isinstance(item, dict)
+                and bool(item.get("success"))
+                and str(item.get("tool") or "").strip().lower() == target_name
+                for item in steps
+            )
+
+        def latest_successful_observation(name: str) -> Any:
+            steps = state.get("completed_tool_steps") if isinstance(state, dict) else None
+            if not isinstance(steps, list):
+                return None
+            target_name = str(name or "").strip().lower()
+            for item in reversed(steps):
+                if (
+                    isinstance(item, dict)
+                    and bool(item.get("success"))
+                    and str(item.get("tool") or "").strip().lower() == target_name
+                ):
+                    return item.get("observation")
+            return None
+
+        def normalize_dataframe_reference(value: Any, fallback_ref: str) -> Any:
+            # Qwen 有时会把 Observation 中的 DataFrame 摘要对象
+            # {python_type: DataFrame, shape: ..., columns: ...} 原样塞回 df。
+            # 该对象只是 JSON 摘要，不是真实 DataFrame；应回到 DataState 的
+            # 可追踪 Python 引用。
+            if (
+                isinstance(value, dict)
+                and str(value.get("python_type") or "").strip().lower() == "dataframe"
+                and fallback_ref
+            ):
+                return {"$ref": fallback_ref}
+
+            converted = as_step_ref(value)
+            ref_text = ""
+            if isinstance(converted, dict) and set(converted) == {"$ref"}:
+                ref_text = str(converted.get("$ref") or "").strip()
+
+            # get_data_info 的 output 是质量信息 dict，不是 DataFrame。
+            # Qwen 常把“最新一步”误写为 df；此时回退到 DataState 中最近的
+            # 真实 DataFrame 引用，而不是让 ToolPreflight 报类型错误。
+            match = re.fullmatch(r"step_(\d+)\.output", ref_text)
+            if match:
+                steps = state.get("completed_tool_steps") if isinstance(state, dict) else None
+                index = int(match.group(1)) - 1
+                if isinstance(steps, list) and 0 <= index < len(steps):
+                    item = steps[index]
+                    source_tool = (
+                        str(item.get("tool") or "").strip().lower()
+                        if isinstance(item, dict)
+                        else ""
+                    )
+                    non_dataframe_outputs = {
+                        "get_data_info",
+                        "inspect_data_files",
+                        "inspect_documents",
+                    }
+                    if source_tool in non_dataframe_outputs and fallback_ref:
+                        return {"$ref": fallback_ref}
+
+            return converted
+
+        name = raw_name.lower()
+
+        # 本地中小模型经常把 Python / pandas API 当作 Agent Tool 名，
+        # 例如 pandas.read_excel、pd.read_csv、df.drop_duplicates。
+        # DataPilot 不直接执行任意库 API；只把受控前缀下、末级名称明确命中
+        # 已知别名白名单的调用收敛到 Registry 中的确定性 Tool。
+        semantic_name = name
+        namespace_prefixes = (
+            "pandas.",
+            "pd.",
+            "dataframe.",
+            "pandas.dataframe.",
+            "df.",
+        )
+        if any(name.startswith(prefix) for prefix in namespace_prefixes):
+            semantic_name = name.rsplit(".", 1)[-1]
+
+        input_path = self._local_single_input_path(state)
+        suffix = Path(input_path).suffix.lower() if input_path else ""
+        current_ref = self._local_current_data_ref(state)
+        current_schema = self._local_current_schema(state)
+
+        spreadsheet_suffixes = {".csv", ".xlsx", ".xls", ".xlsm"}
+        document_suffixes = {".docx", ".doc", ".pdf", ".txt", ".md"}
+
+        read_aliases = {
+            "read_file", "load_file", "open_file",
+            "read_excel", "read_excel_file", "load_excel", "open_excel",
+            "read_csv", "load_csv", "load_data",
+        }
+        info_aliases = {
+            "check_data_quality", "inspect_data", "data_info",
+            "check_missing_values", "check_duplicates",
+            "inspect_dataframe", "describe_dataframe",
+        }
+        duplicate_aliases = {
+            "remove_duplicates", "drop_duplicates", "deduplicate",
+            "remove_duplicate_rows",
+        }
+        missing_aliases = {
+            "fill_missing_values", "clean_missing_values",
+            "handle_missing", "impute_missing_values",
+        }
+
+        canonical_existing = self.registry.resolve_name(raw_name)
+        target = str(canonical_existing or "").strip()
+        notes: List[str] = []
+
+        # 先处理未注册的常见泛化工具名。
+        if not target:
+            if semantic_name in read_aliases:
+                if suffix in spreadsheet_suffixes or any(
+                    token in semantic_name for token in ("excel", "csv", "data")
+                ):
+                    target = "read_office_data"
+                    if input_path and not str(args.get("file_path") or "").strip():
+                        args["file_path"] = input_path
+                    if "file_path" not in args and isinstance(args.get("path"), str):
+                        args["file_path"] = args.pop("path")
+                elif suffix in document_suffixes:
+                    target = "read_document"
+                    if input_path and not str(args.get("file_path") or "").strip():
+                        args["file_path"] = input_path
+                    if "file_path" not in args and isinstance(args.get("path"), str):
+                        args["file_path"] = args.pop("path")
+
+            elif semantic_name in info_aliases and current_ref:
+                target = "get_data_info"
+
+            elif semantic_name in duplicate_aliases and current_ref:
+                target = "drop_duplicate_rows"
+
+            elif semantic_name in missing_aliases and current_ref:
+                target = "handle_missing_values"
+
+            if target:
+                notes.append(f"{raw_name} -> {target}")
+
+        if not target:
+            return raw_name, args, ""
+
+        canonical = self.registry.resolve_name(target)
+        if canonical is None:
+            return raw_name, args, ""
+        target = canonical
+
+        # --------------------------------------------------------
+        # read_office_data 参数收敛
+        # --------------------------------------------------------
+        if target == "read_office_data":
+            # DataPilot 的真实签名只有 file_path / sheet_name。Qwen 从 pandas
+            # API 迁移过来时常附带 header/engine/usecols 等参数，这些不能直接
+            # 透传给确定性 Tool。路径仍必须来自真实输入或模型明确给出的路径。
+            allowed_read_args = {"file_path", "sheet_name"}
+            removed = [key for key in list(args) if key not in allowed_read_args]
+            for key in removed:
+                args.pop(key, None)
+            if removed:
+                notes.append(
+                    "drop unsupported read args: " + ",".join(sorted(removed))
+                )
+            if input_path and not str(args.get("file_path") or "").strip():
+                args["file_path"] = input_path
+
+        # --------------------------------------------------------
+        # 质量检查前置：用户明确要求检查缺失/重复时，在任何清洗或分析
+        # 之前先取得 get_data_info 的真实 Observation。
+        # --------------------------------------------------------
+        goal_text = str((state or {}).get("goal") or "").lower()
+        quality_requested = any(
+            token in goal_text
+            for token in ("缺失", "重复", "数据质量", "missing", "duplicate")
+        )
+        downstream_data_tools = {
+            "handle_missing_values",
+            "drop_duplicate_rows",
+            "group_statistics",
+            "group_multi_statistics",
+            "create_pivot_summary",
+        }
+        if (
+            current_ref
+            and quality_requested
+            and target in downstream_data_tools
+            and not completed_successfully("get_data_info")
+        ):
+            notes.append(f"{target} -> get_data_info (quality prerequisite)")
+            target = "get_data_info"
+            args = {"df": {"$ref": current_ref}}
+            return target, args, "; ".join(notes)
+
+        # 质量检查已经完成后，如果 Observation 明确发现问题且用户要求
+        # “存在则清洗”，则禁止直接跳到统计分析。让 LLM 先选择真实清洗工具。
+        quality_observation = latest_successful_observation("get_data_info")
+        if (
+            isinstance(quality_observation, dict)
+            and self._goal_explicitly_requests_data_cleaning(goal_text)
+            and target in {
+                "group_statistics",
+                "group_multi_statistics",
+                "create_pivot_summary",
+            }
+        ):
+            missing_values = quality_observation.get("missing_values") or {}
+            duplicate_rows = quality_observation.get("duplicate_rows") or 0
+            try:
+                duplicate_count = int(duplicate_rows)
+            except (TypeError, ValueError):
+                duplicate_count = 0
+
+            missing_pending = bool(missing_values) and not completed_successfully(
+                "handle_missing_values"
+            )
+            duplicate_pending = duplicate_count > 0 and not completed_successfully(
+                "drop_duplicate_rows"
+            )
+
+            if missing_pending or duplicate_pending:
+                pending = []
+                if missing_pending:
+                    pending.append("缺失值处理(handle_missing_values)")
+                if duplicate_pending:
+                    pending.append("重复记录处理(drop_duplicate_rows)")
+                raise ValueError(
+                    "用户要求发现数据质量问题时先清洗；get_data_info 已确认仍需："
+                    + "、".join(pending)
+                    + "。请先调用对应真实清洗 Tool，再进行统计分析。"
+                )
+
+        # --------------------------------------------------------
+        # DataFrame 引用兼容
+        # --------------------------------------------------------
+        dataframe_tools = {
+            "get_data_info",
+            "handle_missing_values",
+            "drop_duplicate_rows",
+            "group_statistics",
+            "group_multi_statistics",
+            "create_pivot_summary",
+            "apply_filters",
+            "filter_data",
+            "sort_data",
+            "select_columns",
+            "drop_columns",
+            "rename_columns",
+            "filter_date_range",
+        }
+
+        if target in dataframe_tools:
+            if "df" not in args and "data_ref" in args:
+                args["df"] = args.pop("data_ref")
+                notes.append("data_ref -> df")
+            if "df" in args:
+                converted = normalize_dataframe_reference(
+                    args["df"],
+                    current_ref,
+                )
+                if converted != args["df"]:
+                    notes.append("df reference normalized")
+                args["df"] = converted
+            elif current_ref:
+                args["df"] = {"$ref": current_ref}
+                notes.append("inject current_data_ref")
+
+        # --------------------------------------------------------
+        # group_statistics / group_multi_statistics schema 兼容
+        # --------------------------------------------------------
+        if target in {"group_statistics", "group_multi_statistics"}:
+            if "group_by" not in args and "group_by_columns" in args:
+                args["group_by"] = args.pop("group_by_columns")
+                notes.append("group_by_columns -> group_by")
+
+            raw_aggs = args.get("aggregations")
+            normalized_aggs: Dict[str, List[str]] = {}
+            if isinstance(raw_aggs, list):
+                for item in raw_aggs:
+                    if not isinstance(item, dict):
+                        continue
+                    column = str(
+                        item.get("column")
+                        or item.get("target_column")
+                        or ""
+                    ).strip()
+                    function = str(
+                        item.get("function")
+                        or item.get("operation")
+                        or item.get("agg")
+                        or ""
+                    ).strip().lower()
+                    if column and function:
+                        normalized_aggs.setdefault(column, [])
+                        if function not in normalized_aggs[column]:
+                            normalized_aggs[column].append(function)
+                if normalized_aggs:
+                    notes.append("aggregation list -> mapping")
+            elif isinstance(raw_aggs, dict):
+                for column, functions in raw_aggs.items():
+                    if isinstance(functions, str):
+                        normalized_aggs[str(column)] = [functions]
+                    elif isinstance(functions, (list, tuple)):
+                        normalized_aggs[str(column)] = [
+                            str(item) for item in functions if str(item).strip()
+                        ]
+
+            group_by = args.get("group_by")
+            group_columns = (
+                list(group_by)
+                if isinstance(group_by, (list, tuple))
+                else ([group_by] if isinstance(group_by, str) and group_by.strip() else [])
+            )
+
+            # ----------------------------------------------------
+            # 用户目标字段约束：本地 9B 容易在看到完整 schema 后擅自加入
+            # “月份/部门/订单金额”等未要求维度。只有当用户目标中明确出现
+            # 真实 schema 字段时才启用收敛；不凭空猜字段。
+            # ----------------------------------------------------
+            goal_columns = [
+                column
+                for column in current_schema
+                if column and column in goal_text
+            ]
+
+            requested_group_columns: List[str] = []
+            # 中文“按X统计/汇总/分析/计算”优先识别 X。
+            for match in re.finditer(
+                r"按([^，。；;]+?)(?:统计|汇总|分析|计算)",
+                goal_text,
+            ):
+                phrase = match.group(1)
+                for column in current_schema:
+                    if column and column in phrase and column not in requested_group_columns:
+                        requested_group_columns.append(column)
+
+            quality_info = latest_successful_observation("get_data_info")
+            numeric_columns = []
+            if isinstance(quality_info, dict):
+                values = quality_info.get("numeric_columns") or []
+                if isinstance(values, (list, tuple)):
+                    numeric_columns = [str(item) for item in values]
+
+            if numeric_columns:
+                # 有 get_data_info 类型证据时，只把真实数值列当作指标。
+                requested_metric_columns = [
+                    column for column in goal_columns
+                    if column in numeric_columns
+                ]
+            else:
+                # 没有类型证据时，至少排除已经明确识别为“按X”的分组字段。
+                requested_metric_columns = [
+                    column for column in goal_columns
+                    if column not in requested_group_columns
+                ]
+
+            requested_operations: List[str] = []
+            operation_tokens = (
+                ("sum", ("合计", "总和", "求和")),
+                ("mean", ("平均", "均值")),
+                ("count", ("数量", "计数", "个数")),
+                ("max", ("最大值",)),
+                ("min", ("最小值",)),
+                ("median", ("中位数",)),
+            )
+            for operation_name, tokens in operation_tokens:
+                if any(token in goal_text for token in tokens):
+                    requested_operations.append(operation_name)
+
+            if requested_group_columns:
+                if group_columns != requested_group_columns:
+                    notes.append("group_by constrained by user goal")
+                group_columns = requested_group_columns
+
+            if requested_metric_columns:
+                filtered_aggs: Dict[str, List[str]] = {}
+                for column in requested_metric_columns:
+                    if column in normalized_aggs:
+                        functions = normalized_aggs[column]
+                    else:
+                        functions = requested_operations or ["sum"]
+                    if requested_operations:
+                        overlap = [
+                            item for item in functions
+                            if item in requested_operations
+                        ]
+                        functions = overlap or list(requested_operations)
+                    filtered_aggs[column] = functions
+                if filtered_aggs != normalized_aggs:
+                    notes.append("aggregations constrained by user goal")
+                normalized_aggs = filtered_aggs
+
+            # Qwen 没给 group_by/aggregations，但用户目标已经明确到真实字段时，
+            # 直接用目标字段补足，而不是让空参数进入 ToolPreflight。
+            if not group_columns and requested_group_columns:
+                group_columns = list(requested_group_columns)
+            if not normalized_aggs and requested_metric_columns:
+                normalized_aggs = {
+                    column: (requested_operations or ["sum"])
+                    for column in requested_metric_columns
+                }
+
+            # Qwen 常把“多字段/多指标”参数交给 group_statistics。
+            # 这时不丢信息，确定性切换到真实的 group_multi_statistics。
+            goal_constrained = bool(
+                requested_group_columns or requested_metric_columns
+            )
+            should_use_multi = (
+                len(group_columns) > 1
+                or len(normalized_aggs) > 1
+                or any(len(funcs) > 1 for funcs in normalized_aggs.values())
+                or (target == "group_multi_statistics" and not goal_constrained)
+            )
+
+            if should_use_multi and normalized_aggs:
+                multi_name = self.registry.resolve_name("group_multi_statistics")
+                if multi_name is not None:
+                    if target != multi_name:
+                        notes.append(f"{target} schema -> {multi_name}")
+                    target = multi_name
+                    args = {
+                        "df": args.get("df"),
+                        "group_by": group_columns,
+                        "aggregations": normalized_aggs,
+                    }
+            elif normalized_aggs:
+                # 单分组 + 单指标：无论模型原先选 group_statistics 还是
+                # group_multi_statistics，都收敛到更精确的单指标 Tool。
+                first_column = next(iter(normalized_aggs))
+                first_functions = normalized_aggs[first_column]
+                single_name = self.registry.resolve_name("group_statistics")
+                if group_columns and first_functions and single_name is not None:
+                    if target != single_name:
+                        notes.append(f"{target} schema -> {single_name}")
+                    target = single_name
+                    args = {
+                        "df": args.get("df"),
+                        "group_by": group_columns[0],
+                        "target_column": first_column,
+                        "operation": first_functions[0],
+                    }
+                    notes.append("generic aggregation -> group_statistics signature")
+            elif target == "group_statistics":
+                if isinstance(args.get("group_by"), (list, tuple)):
+                    values = list(args["group_by"])
+                    if len(values) == 1:
+                        args["group_by"] = values[0]
+                        notes.append("single group_by list -> scalar")
+
+        return target, args, "; ".join(notes)
+
     def _decide_next_action(
         self,
         goal: str,
@@ -2579,9 +4738,32 @@ class AgentLoop:
         - 因此类似 Word 已经编辑并回读成功后，若模型某一轮输出格式异常，
           Agent 不会直接崩溃，也不会丢失已有 ExecutionContext。
         """
-        system_prompt = self._build_system_prompt(
-            finish_only=finish_only,
+        runtime_state = state.get("runtime_context", {}) if isinstance(state, dict) else {}
+        recovery_exhausted = bool(
+            isinstance(runtime_state, dict)
+            and runtime_state.get("_post_stage_acquisition_recovery_exhausted")
         )
+        excluded_tools: set[str] = set()
+        if recovery_exhausted:
+            excluded_tools = {
+                "search_web",
+                "read_webpage",
+                "download_data_file",
+                "download_document_file",
+            }
+
+        local_advisory_only = bool(
+            self._is_ollama_backend()
+            and self._goal_explicitly_requests_advisory_only(goal)
+        )
+
+        if local_advisory_only:
+            system_prompt = self._build_local_advisory_system_prompt()
+        else:
+            system_prompt = self._build_system_prompt(
+                finish_only=finish_only,
+                excluded_tools=excluded_tools,
+            )
 
         if finish_only:
             decision_instruction = (
@@ -2594,18 +4776,45 @@ class AgentLoop:
             )
         else:
             decision_instruction = "\n\n请决定下一步。"
+            if recovery_exhausted:
+                decision_instruction += (
+                    "\nAcquisition Recovery 已耗尽：本轮禁止调用 search_web、read_webpage、"
+                    "download_data_file、download_document_file。"
+                    "请仅使用现有结构化数据继续 Processing/Delivery，并明确无法验证的局限。"
+                )
 
-        base_user_prompt = (
-            f"用户最终目标：\n{goal}\n\n"
-            "当前真实执行状态：\n"
-            + json.dumps(
-                state,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
+        prompt_state = state
+        if self._is_ollama_backend() and isinstance(state, dict):
+            # 本地 9B 模型容易把 Skill 名误当成 Tool。Skill 已由 Python
+            # Selector 转换为方法指导，因此决策 Prompt 不再重复暴露 Skill 名。
+            prompt_state = dict(state)
+            prompt_state.pop("available_skills", None)
+            prompt_state.pop("selected_skills", None)
+            prompt_state.pop("skill_selection", None)
+
+            runtime_for_prompt = prompt_state.get("runtime_context")
+            if isinstance(runtime_for_prompt, dict):
+                runtime_for_prompt = dict(runtime_for_prompt)
+                runtime_for_prompt.pop("skill_selection", None)
+                prompt_state["runtime_context"] = runtime_for_prompt
+
+        if local_advisory_only:
+            base_user_prompt = (
+                f"用户问题：\n{goal}\n\n"
+                "请直接回答这个问题，并严格返回 finish JSON。"
             )
-            + decision_instruction
-        )
+        else:
+            base_user_prompt = (
+                f"用户最终目标：\n{goal}\n\n"
+                "当前真实执行状态：\n"
+                + json.dumps(
+                    prompt_state,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+                + decision_instruction
+            )
 
         max_format_attempts = 3
         last_error: Optional[Exception] = None
@@ -2625,27 +4834,36 @@ class AgentLoop:
                     "\n不要添加 Markdown、解释文字、代码围栏或第二个 JSON。"
                 )
 
+            request_kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                "temperature": 0.0,
+                "response_format": {
+                    "type": "json_object"
+                },
+            }
+
+            # Ollama + Qwen 的 thinking 模式可能把主要内容放入 reasoning，
+            # 导致 OpenAI-compatible message.content 为空或结构化 JSON 被污染。
+            # 本地 Agent 决策需要短、稳定、可解析的 JSON，因此强制关闭 thinking。
+            # 云端 DeepSeek 等后端保持原请求参数，不受影响。
+            if self._is_ollama_backend():
+                request_kwargs["reasoning_effort"] = "none"
+
             response = (
                 self.client
                 .chat
                 .completions
-                .create(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": system_prompt,
-                        },
-                        {
-                            "role": "user",
-                            "content": user_prompt,
-                        },
-                    ],
-                    temperature=0.0,
-                    response_format={
-                        "type": "json_object"
-                    },
-                )
+                .create(**request_kwargs)
             )
 
             content = (
@@ -2664,6 +4882,24 @@ class AgentLoop:
                 decision = self._extract_json_object(
                     content
                 )
+                decision = self._normalize_decision_contract(
+                    decision
+                )
+
+                if self._is_ollama_backend():
+                    decision = self._normalize_local_response_pseudo_action(
+                        decision
+                    )
+                    local_response_alias = str(
+                        (decision.get("_local_response_alias") or "")
+                        if isinstance(decision, dict)
+                        else ""
+                    ).strip()
+                    if local_response_alias:
+                        self.report_progress(
+                            "[Local Response Alias] "
+                            f"{local_response_alias} -> finish"
+                        )
 
                 if not isinstance(decision, dict):
                     raise TypeError(
@@ -2693,13 +4929,82 @@ class AgentLoop:
                             "tool 决策缺少工具名。"
                         )
 
+                    raw_arguments = decision.get("arguments", {})
+                    if raw_arguments is None:
+                        raw_arguments = {}
+
+                    # Response-Only Delivery Guard：用户明确只要分析结论、
+                    # TaskPlan 也没有交付文件时，本地小模型仍可能机械进入
+                    # delivery 并请求 write_file/save/export。若真实质量检查和
+                    # 分析 Observation 已满足目标，则确定性改为 finish，既不
+                    # 写文件，也不让未注册的 write_file 造成任务崩溃。
+                    if (
+                        self._is_ollama_backend()
+                        and self._looks_like_file_output_tool(tool_name)
+                        and self._response_only_analysis_ready(
+                            goal=goal,
+                            state=state,
+                        )
+                    ):
+                        final_answer = self._build_response_only_analysis_final_answer(
+                            goal=goal,
+                            state=state,
+                        )
+                        if final_answer:
+                            self.report_progress(
+                                "[Response-Only Guard] 用户未要求文件交付；"
+                                f"阻止 {tool_name}，基于现有真实 Observation 直接完成回答。"
+                            )
+                            return {
+                                "action_type": "finish",
+                                "final_answer": final_answer,
+                            }
+
+                    if self._is_ollama_backend():
+                        (
+                            resolved_local_name,
+                            resolved_local_arguments,
+                            local_alias_note,
+                        ) = self._resolve_local_tool_request(
+                            tool_name=tool_name,
+                            arguments=raw_arguments,
+                            state=state,
+                        )
+                        if local_alias_note:
+                            self.report_progress(
+                                "[Local Tool Alias] " + local_alias_note
+                            )
+                        tool_name = resolved_local_name
+                        raw_arguments = resolved_local_arguments
+                        decision["tool"] = tool_name
+                        decision["arguments"] = raw_arguments
+
                     canonical_name = self.registry.resolve_name(
                         tool_name
                     )
 
                     if canonical_name is None:
+                        skill_name = None
+                        try:
+                            if getattr(self, "skill_registry", None) is not None:
+                                skill_name = self.skill_registry.resolve_name(tool_name)
+                        except Exception:
+                            skill_name = None
+
+                        if skill_name is not None:
+                            raise ValueError(
+                                f"{tool_name} 是 Skill 方法名，不是可执行 Tool。"
+                                "禁止把 Skill 放进 tool 字段；请选择真实 Tool Registry "
+                                "中的工具，若用户只要求说明/计划且无需执行，则返回 finish。"
+                            )
+
                         raise ValueError(
                             f"Agent 选择了未注册工具：{tool_name}"
+                        )
+                    if canonical_name.lower() in excluded_tools:
+                        raise ValueError(
+                            "Acquisition Recovery 已耗尽，当前工具已被禁用："
+                            f"{canonical_name}。请选择 Processing/Delivery 工具。"
                         )
 
                     arguments = decision.get(
@@ -2723,6 +5028,9 @@ class AgentLoop:
                         "Agent 决策 JSON 格式纠错成功，继续执行。"
                     )
 
+                if isinstance(decision, dict):
+                    decision.pop("_local_response_alias", None)
+
                 return decision
 
             except (
@@ -2734,6 +5042,19 @@ class AgentLoop:
                 correction_message = (
                     f"{type(error).__name__}: {error}"
                 )
+
+                # 本地模型仍发生协议偏差时，输出一段受限原始响应，方便
+                # 精确诊断，而不是继续猜测模型到底用了哪个字段。只在失败
+                # 场景输出并截断长度，避免正常日志被模型文本淹没。
+                if self._is_ollama_backend() and content:
+                    raw_preview = re.sub(
+                        r"\s+",
+                        " ",
+                        str(content).strip(),
+                    )[:600]
+                    self.report_progress(
+                        "[Local Decision Raw] " + raw_preview
+                    )
 
                 if attempt >= max_format_attempts:
                     break
@@ -2817,11 +5138,208 @@ class AgentLoop:
             "Agent Loop 返回内容中没有找到合法 JSON 对象。"
         )
 
+
+    def _selected_skill_names(self) -> List[str]:
+        if not self._active_skill_selection:
+            return []
+        return list(
+            getattr(
+                self._active_skill_selection,
+                "selected_skills",
+                [],
+            )
+            or []
+        )
+
+    def _selected_skill_execution_guidance(self) -> str:
+        selected = set(self._selected_skill_names())
+        lines: List[str] = []
+
+        if "data_visualization" in selected:
+            lines.extend(
+                [
+                    "【Visualization Execution Guidance】",
+                    "当 selected_skills 包含 data_visualization 时：",
+                    "1. 如果用户要求图表、趋势图、可视化、PNG，或数据本身适合趋势/分布展示，必须把“生成图表”视为核心任务，而不是可选装饰。",
+                    "2. 在 finish 前，应确保至少已经执行过能够产生图表或图片交付物的真实工具，并把生成的 PNG / 图表文件纳入 deliverable_paths。",
+                    "3. 优先选择与图表、绘图、可视化、PNG 导出直接相关的真实 Tool；如果推荐工具名不在 available tools 中，不要直接臆造工具名，而是从 available tools 中选择最接近、且确实存在的图表/可视化工具。",
+                    "4. 如果用户同时要求 Excel、PNG、Word，则不要只生成 Excel / Word 后直接 finish；必须补齐图表交付物，再进入 finish。",
+                    "5. 如果数据包含时间字段与数值字段，优先考虑趋势图；如果变量是事件量/降水/计数量，优先考虑柱状图；如果是类别对比，优先考虑柱状图；如果是纯数值分布，优先考虑直方图。",
+                ]
+            )
+
+        if "excel_report_delivery" in selected:
+            lines.extend(
+                [
+                    "【Excel Delivery Guidance】",
+                    "当 selected_skills 包含 excel_report_delivery 时：",
+                    "1. 只有在真实分析结果已经形成后再生成最终 Excel。",
+                    "2. finish 前应确保最终 Excel 已生成，并已被回读或检查。",
+                ]
+            )
+
+        if "professional_word_delivery" in selected:
+            lines.extend(
+                [
+                    "【Word Delivery Guidance】",
+                    "当 selected_skills 包含 professional_word_delivery 时：",
+                    "1. 只有在真实分析结果与关键结论已经形成后再生成最终 Word 报告。",
+                    "2. finish 前应确保最终 Word 已生成，并已被检查或回读。",
+                ]
+            )
+
+        if not lines:
+            return ""
+
+        return "\n".join(lines) + "\n\n"
+
+    def _build_tool_catalog_text(
+        self,
+        *,
+        excluded_tools: Optional[set[str]] = None,
+    ) -> str:
+        excluded = {
+            str(name).strip().lower()
+            for name in (excluded_tools or set())
+            if str(name).strip()
+        }
+        tools = [
+            tool
+            for tool in self.registry.list_tools()
+            if tool.name.lower() not in excluded
+        ]
+        if not tools:
+            return "当前没有可用工具。"
+        blocks = []
+        for index, tool in enumerate(tools, start=1):
+            blocks.append(
+                "\n".join(
+                    [
+                        f"[工具 {index}]",
+                        f"名称：{tool.name}",
+                        f"类别：{tool.category}",
+                        f"用途：{tool.description}",
+                        f"参数：{tool.parameters}",
+                        f"返回：{tool.returns or '未特别说明'}",
+                    ]
+                )
+            )
+        return "\n\n".join(blocks)
+
+    def _build_local_system_prompt(
+        self,
+        finish_only: bool = False,
+        excluded_tools: Optional[set[str]] = None,
+    ) -> str:
+        """
+        Ollama / 本地中小模型专用的压缩决策协议。
+
+        云端模型继续使用完整系统提示；本地模型只保留执行决策所需的
+        硬约束、Stage 状态和真实 Tool Registry，避免 Skill Catalog 与
+        历史版本规则淹没 action schema。
+        """
+        catalog = self._build_tool_catalog_text(
+            excluded_tools=excluded_tools,
+        )
+
+        # 本地 9B 决策器不接收 Skill 细节。Skill 已由 Python 侧完成选择，
+        # 继续把 workflow/名称塞给中小模型反而容易把 Skill 或自然语言动作
+        # 误抄进 tool 字段。这里只保留真实 Tool Registry。
+        selected_guidance = (
+            "本地模式不暴露 Skill 细节；请只依据真实 Tool Registry、"
+            "TaskPlan、输入路径与 Observation 决策。"
+        )
+
+        finish_rule = (
+            "当前是最终完成判定：禁止真正执行新工具。若现有证据足够，返回 finish；"
+            "否则返回 tool 仅表示仍缺工具。"
+            if finish_only
+            else
+            "正常执行：一次只能选择一个真实 Tool，或直接 finish。"
+        )
+
+        return f"""
+你是 DataPilot 的本地 Workspace Agent 决策器。
+你的唯一任务：根据用户目标、TaskPlan、当前 Stage 和真实 Observation，
+返回一个且仅一个 JSON 对象。不要输出思考过程、Markdown 或解释文字。
+
+【最高优先级 JSON 协议】
+只能二选一：
+1. 调工具：
+{{"action_type":"tool","tool":"真实Tool名","arguments":{{}},"purpose":"简短原因"}}
+2. 完成：
+{{"action_type":"finish","final_answer":"直接给用户的最终回答"}}
+
+action_type 的值只能逐字为 "tool" 或 "finish"。
+不要返回 plan、analysis、respond、answer、skill 等其他 action_type。
+
+【Skill 与 Tool 严格分离】
+Skill 只是 Python 已选择的方法指导，不是工具，永远不能写入 tool 字段。
+只允许调用下面“真实 Tool Registry”中出现的名称。
+如果某个名字只出现在方法指导里、没有出现在 Tool Registry，它就不可执行。
+
+【无需执行时直接回答】
+如果用户只是询问“准备怎么做 / 如何处理 / 给出方案 / 解释流程”，并且明确说
+不需要联网、不需要读取真实文件、不需要生成文件或不需要实际执行，则直接返回 finish，
+在 final_answer 中说明方案；不要为了形式调用 Excel Skill 或任何工具。
+只有用户要求真实读取、修改、分析文件、联网取数或生成交付物时才调用工具。
+
+【本地 Excel/CSV 常用真实 Tool 名与参数】
+- 读取已选择的 CSV/Excel：read_office_data
+  例：{{"file_path":"真实路径"}}
+- 查看行列、字段、缺失值、重复情况：get_data_info
+  例：{{"df":{{"$ref":"step_1.output"}}}}
+- 处理缺失值：handle_missing_values
+- 删除重复记录：drop_duplicate_rows
+- 单字段/单指标分组统计：group_statistics
+  例：{{"df":{{"$ref":"step_1.output"}},"group_by":"城市","target_column":"销售额","operation":"sum"}}
+- 多字段/多指标统计：group_multi_statistics
+  例：{{"df":{{"$ref":"step_1.output"}},"group_by":["城市","月份"],"aggregations":{{"销售额":["sum"]}}}}
+不要写 read_file/read_excel/load_file。不要调用 pandas.read_excel、pd.read_excel、pandas.read_csv、
+pd.read_csv 或任何 pandas/Python 库 API；这些都不是 DataPilot Tool。
+read_office_data 只允许 file_path 和可选 sheet_name，不要传 engine/header/usecols 等 pandas 参数。
+DataFrame 引用必须严格写成 {{"df":{{"$ref":"step_N.output"}}}}；不要写成
+"step_N.output"、"$step_N.output"，也不要把 Observation 的 DataFrame 摘要 dict 塞进 df。
+若用户明确要求检查缺失值/重复值，读取后先调用 get_data_info，再决定是否清洗和统计。
+get_data_info 的 missing_values={{}} 且 duplicate_rows=0 表示无需清洗，应直接继续用户要求的统计；
+不要返回 analysis/continue 来描述“下一步”，而要直接返回 action_type=tool 并调用下一真实 Tool。
+统计时只使用用户目标或 TaskPlan 明确要求的分组字段与指标，不要擅自添加月份、部门、其他金额字段。
+
+【执行硬约束】
+- {finish_rule}
+- 服从 runtime_context.current_stage：Acquisition → Processing → Delivery → Verification。
+- TaskPlan 是任务合同；真实 Observation 是事实来源，不得编造工具成功、文件、数字或来源。
+- build_dataframe/create_dataframe 的事实数值必须来自已有成功 Observation；派生值优先用确定性工具计算。
+- 使用前一步 Python 对象时用 {{$ref: "step_N.output"}} 或真实子字段引用，不要把 DataFrame 全文抄入 JSON。
+- 用户要求最终文件时，必须生成到 deliverables_dir，并在最后一次写入后 read/inspect，再申请 finish。
+- 用户未要求文件时，不要主动生成文件。
+- 若 TaskPlan 的 deliverable_requirements 为空，且用户明确“只需要告诉我结果/只返回结论”，完成所需检查和统计后必须直接 finish；不要调用 write_file、save_file、export_*、to_csv、to_excel 或报告生成工具。
+- 用户明确“不需要联网”时，不得调用 search_web/read_webpage/download_*。
+- Acquisition Recovery 已耗尽时，不得继续联网；用现有数据降级完成并说明局限。
+- 工具失败后根据真实错误调整，不得原样无限重试。
+
+【当前方法指导】
+{selected_guidance}
+再次强调：上面的 Skill/Guidance 不是工具名。
+
+【真实 Tool Registry——tool 字段只能从这里选择】
+{catalog}
+""".strip()
+
     def _build_system_prompt(
         self,
         finish_only: bool = False,
+        excluded_tools: Optional[set[str]] = None,
     ) -> str:
-        catalog = self.registry.build_llm_catalog_text()
+        if self._is_ollama_backend():
+            return self._build_local_system_prompt(
+                finish_only=finish_only,
+                excluded_tools=excluded_tools,
+            )
+
+        catalog = self._build_tool_catalog_text(
+            excluded_tools=excluded_tools,
+        )
 
         if self._active_skill_selection is None:
             skill_catalog = (
@@ -2832,12 +5350,9 @@ class AgentLoop:
                 "为兼容直接 Prompt 测试，展示完整 Skill Catalog。"
             )
         else:
-            skill_catalog = (
-                self.skill_selector
-                .build_selected_catalog_text(
-                    self._active_skill_selection
-                )
-            )
+            # SkillSelector 负责选择，不负责生成 Catalog。
+            # 使用 SkillRegistry 提供的真实 Skill Catalog。
+            skill_catalog = self.skill_registry.build_llm_catalog_text()
             skill_selection_note = (
                 "本轮只展示 Skill Selector "
                 "针对当前用户目标 + TaskPlan 选出的相关 Skills。"
@@ -2894,6 +5409,17 @@ runtime_context.data_state 是跨 Stage 的权威结构化状态。
 Acquisition 不得反复执行相同搜索。已有足够来源证据后，应进入下载/读取，
 而不是继续用近义关键词无限搜索。
 
+【v6.4 Acquisition / Regression Intelligence】
+- 如果用户明确要求“回归、影响因素、驱动因素、预测”，且研究跨多个年度，Acquisition 应优先寻找月度或季度结构化数据；年度汇总只能作为背景或探索性回归的最低可用数据。
+- 仅当 runtime_context.current_stage=acquisition 时，runtime_context.acquisition_saturation_observation 才具有约束力；进入 processing/delivery/verification 后不得继续沿用上一阶段的 saturation instruction。Acquisition 阶段内一旦存在该 observation，必须遵守其中 instruction，不要通过换近义关键词继续 search_web/read_webpage 绕过智能停止。
+- Processing/Delivery 若通过 Evidence Grounding 发现关键事实确实缺少来源，可临时回补少量 search_web/read_webpage/download_data_file/download_document_file；这是 bounded acquisition recovery，不是重新开启无限搜索。runtime_context.acquisition_recovery_observation 存在时必须优先解决明确缺口，不得扩展无关研究面。
+- 如果 runtime_context._post_stage_acquisition_recovery_exhausted=True，说明后续来源回补预算已用尽；此后 Acquisition 工具不可再用。必须基于现有结构化数据继续 Processing/Delivery；回归样本不足时按 regression_exploratory 处理，无法由证据支持的“主要因素”必须明确写成局限，而不是终止整个任务或编造结论。
+- 如果已有网页证据能够覆盖核心对象与时间范围，可以进入 Processing 用 build_dataframe/create_dataframe 结构化，不需要为了形式额外下载无关数据文件。
+- runtime_context.processing_strategy_observation.sample_diagnostic.small_sample=True 时，回归只能视为探索性证据。不得把高 R² 直接解释为因果、主要驱动因素或可靠预测能力。
+- 不得为了追求更高 R² 反复换变量“挑模型”；模型选择必须同时考虑业务含义、样本量、共线性与可解释性。
+- build_dataframe/create_dataframe 中的事实数值必须来自此前真实 Tool Observation；不得凭记忆补齐某公司某年份的销量、份额、增长率等数字。缺失值应保持缺失并继续补证据。
+- 派生数值（份额、增速、差值、CAGR 等）应优先由确定性数据/计算工具生成，不要在 JSON 参数里心算后直接写入。runtime_context.evidence_grounding_observation 存在时，必须先解决其中未证实数值。
+
 Raw Download Lifecycle 只允许一个最终原始数据保留路径：
 优先下载到 temporary → 读取/验证 → 最终 promote 一次。
 如果原始文件已经存在于 deliverables，不得再次 promote 生成 *_2 等重复副本。
@@ -2928,11 +5454,14 @@ TaskPlan 要求的 Excel/Word/PDF/PNG/CSV 等最终成果必须由成功 Tool Ob
 14. 当前 web 能力包括：
     - search_web：根据关键词搜索互联网；
     - read_webpage：读取普通 HTML 网页正文；
-    - download_data_file：从明确 URL 下载数据文件。
+    - download_data_file：从明确 URL 下载 CSV / Excel 等结构化数据文件；若服务器实际返回纯文本，工具会保留文本扩展名，随后应使用 read_document。
+    - download_document_file：从明确 URL 下载 TXT / Markdown / PDF / DOCX 等文档来源，下载后使用 read_document 获取真实正文证据。
 15. 对联网研究任务，优先使用 search_web 获取候选来源，再根据 Observation 选择值得读取的 URL。
+15a. URL 类型必须按响应内容路由：普通 HTML → read_webpage；CSV/XLS/XLSX → download_data_file + read_office_data；TXT/MD/PDF/DOCX/raw text → download_document_file + read_document。若下载结果扩展名为 .txt/.md/.pdf/.docx，后续不得调用 read_office_data。
 16. 如果 search_web 连续失败 2 次，不要继续机械地重复相同搜索。应根据任务情况：
-    - 改用已知且高度可信的官方 URL 调用 read_webpage；
-    - 或在已有成功网页证据足以满足任务时继续完成任务；
+    - 改用已知且高度可信的普通 HTML URL 调用 read_webpage；
+    - 若已知 URL 指向 raw text / TXT / Markdown / PDF / DOCX，应使用 download_document_file，再用 read_document 读取；不要把纯文本原始文件强行当 CSV 解析；
+    - 或在已有成功网页/文档证据足以满足任务时继续完成任务；
     - 如果没有足够证据，则明确说明搜索失败，不得假装搜索成功。
 17. 如果 read_webpage 已经成功读取了满足用户核心要求的可靠网页，不要仅为了形式要求反复调用失败的 search_web。
 18. 不具备的能力不得假装完成。
@@ -3505,6 +6034,34 @@ Selected Office Skill Catalog（方法指导，不可直接执行）
                             "preview": value[:5],
                         }
                     )
+                elif isinstance(value, dict):
+                    # 数据质量等工具经常返回很小的嵌套 dict，例如
+                    # missing_values={"销售额": 1}。过去统一压成 <dict>，
+                    # 会让本地模型失去“究竟有没有缺失值”的关键事实。
+                    # 这里只保留小型、浅层、JSON-safe 的真实字典；大对象仍压缩。
+                    if len(value) <= 20:
+                        nested = {}
+                        for nested_key, nested_value in value.items():
+                            if isinstance(
+                                nested_value,
+                                (str, int, float, bool),
+                            ) or nested_value is None:
+                                nested[str(nested_key)] = nested_value
+                            elif isinstance(nested_value, list) and len(nested_value) <= 10:
+                                nested[str(nested_key)] = nested_value
+                            else:
+                                nested[str(nested_key)] = (
+                                    f"<{type(nested_value).__name__}>"
+                                )
+                        compact[str(key)] = nested
+                    else:
+                        compact[str(key)] = {
+                            "type": "dict",
+                            "length": len(value),
+                            "keys_preview": [
+                                str(item) for item in list(value.keys())[:10]
+                            ],
+                        }
                 else:
                     compact[str(key)] = (
                         f"<{type(value).__name__}>"
