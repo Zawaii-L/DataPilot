@@ -105,3 +105,11 @@ structure.txt
 # Temporary scripts
 cmp_docx.py
 reformat_docx.py
+# DataPilot local backups / diagnostic files
+archive/
+core_import_report.txt
+import_report.txt
+project_python_files.txt
+project_python_files_clean.txt
+py_size_report.txt
+verification_engine_readback_patch.py
