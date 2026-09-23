@@ -672,6 +672,50 @@ def create_default_skill_registry() -> SkillRegistry:
         ],
     )
 
+
+    registry.register(
+        "web_business_research",
+        (
+            "面向市场、竞争、行业、政策、就业、学校/B端机会等问题执行"
+            "联网研究与经营分析；强调候选来源发现、正文读取、来源质量分级、"
+            "事实/推断/建议分离，以及基于真实外部证据形成可追溯结论。"
+        ),
+        category="web_research",
+        use_when=[
+            "用户明确要求联网搜索、市场调研、竞品分析、行业研究或经营诊断。",
+            "任务需要政府、民航、行业协会、院校、招聘平台、企业官网等外部公开来源。",
+            "任务需要把宏观市场信息与具体业务可获得客户/订单的能力区分开。",
+        ],
+        recommended_tools=[
+            "search_web",
+            "read_webpage",
+        ],
+        workflow=[
+            "先根据用户问题拆分研究主题，使用 search_web 发现候选来源，而不是把搜索摘要直接当最终证据。",
+            "优先选择政府、监管机构、协会、院校、招聘平台、企业官网等高可信或一手来源，并使用 read_webpage 读取真实正文。",
+            "竞争机构价格、课程、位置和宣传卖点可使用机构官网或可靠培训平台，但应与政策/行业证据分层使用。",
+            "记录来源 URL、页面标题和可识别时间；重要外部事实必须能追溯到真实读取 Observation。",
+            "已有足够证据后停止扩展搜索，进入 Processing 综合分析，避免用近义词无限重复搜索。",
+            "最终分析明确区分：用户内部经营事实、外部来源事实、模型推断/判断、行动建议与预测假设。",
+        ],
+        verification=[
+            "搜索结果 snippet 只用于发现候选来源；关键事实优先由成功 read_webpage 正文 Observation 支撑。",
+            "用户要求高可信来源时，至少应尝试并优先读取相应权威来源；未取得时应明确说明来源质量限制。",
+            "不得无来源声称行业平均转化率、薪资水平、人才缺口、竞争机构咨询量等具体 benchmark。",
+            "预测与经营情景必须标明假设，不得把宏观行业增长直接等同于具体业务增长。",
+        ],
+        safety_rules=[
+            "不得伪造来源、发布日期、机构资质、价格、岗位数量或政策内容。",
+            "网页读取失败时不得把失败页面当成已验证来源；应换来源或明确局限。",
+            "Skill 只提供研究方法指导，真实联网执行仍必须经过 ToolExecutor、ToolPreflight 和 ToolRegistry。",
+        ],
+        aliases=[
+            "web_research",
+            "business_research",
+            "market_research",
+        ],
+    )
+
     registry.register(
         "cross_file_office_workflow",
         (

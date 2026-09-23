@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,7 +28,8 @@ class TaskPlan:
     - 最终交付物要求；
     - 执行要求；
     - 验收要求；
-    - 安全要求。
+    - 安全要求；
+    - Evidence Contract：Python 可执行的最终验收合同。
     """
 
     task_goal: str
@@ -38,6 +40,7 @@ class TaskPlan:
     verification_requirements: List[str] = field(default_factory=list)
     safety_requirements: List[str] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
+    evidence_contract: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -129,11 +132,21 @@ class TaskPlanner:
         client: Optional[OpenAI] = None,
         model: Optional[str] = None,
         max_plan_attempts: int = 2,
+        backend_retry_attempts: int = 3,
+        backend_retry_delay: float = 0.75,
     ):
         self.progress_callback = progress_callback
         self.max_plan_attempts = max(
             1,
             int(max_plan_attempts),
+        )
+        self.backend_retry_attempts = max(
+            1,
+            int(backend_retry_attempts),
+        )
+        self.backend_retry_delay = max(
+            0.0,
+            float(backend_retry_delay),
         )
 
         self.api_key = os.getenv("OPENAI_API_KEY")
@@ -171,6 +184,370 @@ class TaskPlanner:
             or "ollama" in base_url
         )
 
+    @staticmethod
+    def _is_retryable_backend_error(error: Exception) -> bool:
+        """
+        识别适合短暂重试的 OpenAI-compatible 后端错误。
+
+        重点覆盖本机 Ollama 偶发的 5xx/502、连接中断与超时。
+        4xx 参数/鉴权错误不会被错误吞掉。
+        """
+        status_code = getattr(error, "status_code", None)
+
+        try:
+            status_code = int(status_code)
+        except (TypeError, ValueError):
+            status_code = None
+
+        if status_code is not None:
+            if status_code == 429 or status_code >= 500:
+                return True
+            return False
+
+        name = error.__class__.__name__.lower()
+        return any(
+            token in name
+            for token in (
+                "connection",
+                "timeout",
+                "internalserver",
+                "ratelimit",
+            )
+        )
+
+    @staticmethod
+    def _should_use_local_fallback(error: Exception) -> bool:
+        """
+        只有 Ollama 已经返回 HTTP 429/5xx 时才允许 Planner 降级。
+
+        如果 Ollama 根本未启动、连接被拒绝或超时，则不继续进入
+        AgentLoop，避免把“模型不可用”伪装成“规划成功”。
+        """
+        status_code = getattr(error, "status_code", None)
+        try:
+            status_code = int(status_code)
+        except (TypeError, ValueError):
+            return False
+        return status_code == 429 or status_code >= 500
+
+    def _create_completion_with_backend_retry(
+        self,
+        request_kwargs: Dict[str, Any],
+    ):
+        """
+        对本机 Ollama 的临时 5xx/连接错误做有界重试。
+
+        云端保持单次请求语义，避免因为 Planner 层自动重试造成
+        不可预期的额外 API 消耗。
+        """
+        attempts = (
+            self.backend_retry_attempts
+            if self._is_ollama_backend()
+            else 1
+        )
+        last_error: Optional[Exception] = None
+
+        for backend_attempt in range(1, attempts + 1):
+            try:
+                return (
+                    self.client
+                    .chat
+                    .completions
+                    .create(**request_kwargs)
+                )
+            except Exception as error:
+                last_error = error
+
+                if (
+                    not self._is_ollama_backend()
+                    or not self._is_retryable_backend_error(error)
+                    or backend_attempt >= attempts
+                ):
+                    raise
+
+                self.report_progress(
+                    "Task Planner：本地模型调用暂时失败"
+                    f"（{backend_attempt}/{attempts}），"
+                    "正在短暂重试……"
+                )
+
+                delay = self.backend_retry_delay * backend_attempt
+                if delay > 0:
+                    time.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError("Task Planner 后端调用未返回结果。")
+
+    def _build_deterministic_fallback_plan(
+        self,
+        user_task: str,
+        context: Dict[str, Any],
+    ) -> TaskPlan:
+        """
+        本地 Planner 在连续 5xx 后使用的保守降级合同。
+
+        这里只把用户已经明确写出的约束转换成少量通用验收项，
+        不发明业务数字、不替用户补结论，也不自动切换 DeepSeek。
+        AgentLoop 仍会拿到完整原始 user_task 继续执行。
+        """
+        task = str(user_task or "").strip()
+        text = task.lower()
+
+        evidence: List[str] = [
+            "用户明确提供的内部经营事实必须按原始口径使用，不得擅自改写或补造。"
+        ]
+        sources: List[str] = []
+        deliverables: List[str] = []
+        execution: List[str] = [
+            "完整覆盖用户明确列出的分析事项，不得因 Planner 降级而省略任务要求。"
+        ]
+        verification: List[str] = [
+            "最终回答必须与用户明确提供的事实、数值和限制条件一致。"
+        ]
+        safety: List[str] = []
+        assumptions: List[str] = []
+
+        web_tokens = (
+            "联网", "搜索", "检索", "调研", "公开资料",
+            "外部数据", "官网", "招聘平台", "最新资料",
+        )
+        prediction_tokens = (
+            "预测", "情景", "未来", "保守", "基准", "乐观",
+        )
+
+        if any(token in text for token in web_tokens):
+            evidence.append(
+                "用户要求的外部市场、竞争、就业、教育或企业信息必须基于真实公开资料核验。"
+            )
+            sources.extend([
+                "优先使用用户明确指定的政府部门、行业机构、院校、招聘平台、企业官网及可靠公开资料。",
+                "关键外部事实需要保留来源与资料时间。",
+            ])
+            execution.append(
+                "先完成必要的外部资料检索与证据核验，再形成经营分析。"
+            )
+            verification.append(
+                "关键外部事实必须可追溯到真实来源；资料不足时明确标注，不得编造。"
+            )
+
+        if any(token in text for token in prediction_tokens):
+            evidence.append(
+                "预测所使用的基础数据、计算口径和假设必须明确且可追溯。"
+            )
+            execution.append(
+                "将历史事实、当前数据、模型假设和未来预测明确区分。"
+            )
+            verification.append(
+                "预测不得写成确定事实，并应说明关键假设和不确定性。"
+            )
+
+        if self._user_requests_direct_response(task):
+            deliverables.append("向用户直接给出分析结果和结论。")
+
+        if "统计周期" in text or "cac" in text:
+            assumptions.append(
+                "不同指标的统计周期如未确认一致，不得直接混算 CAC 或月度指标。"
+            )
+
+        raw_plan = {
+            "task_goal": task,
+            "evidence_requirements": evidence,
+            "source_requirements": sources,
+            "deliverable_requirements": deliverables,
+            "execution_requirements": execution,
+            "verification_requirements": verification,
+            "safety_requirements": safety,
+            "assumptions": assumptions,
+        }
+
+        return self._validate_plan(
+            user_task=task,
+            raw_plan=raw_plan,
+            context=context,
+        )
+
+    @classmethod
+    def _build_evidence_contract(
+        cls,
+        user_task: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        v6.6 Evidence Contract v1。
+
+        不把最终验收完全交给 Planner LLM。这里只从用户原始任务中
+        提取“Python 能确定性检查”的合同，避免小模型改写事实或漏掉
+        关键交付维度后仍被 Completion Gate 判为 PASS。
+
+        第一版只覆盖已经由真实运行暴露出的高价值风险：
+        1. 近似内部事实不得被擅自精确化；
+        2. 条件未满足时不得计算 CAC；
+        3. 外部数字/行业 benchmark 必须可追溯到真实网页正文；
+        4. 3/6/12 月 × 保守/基准/乐观情景必须完整并带假设；
+        5. “90 天只能做 3 件事”必须真的输出 3 个行动项。
+        """
+        task = str(user_task or "").strip()
+        lowered = task.lower()
+        contracts: List[Dict[str, Any]] = []
+
+        # 近似事实完整性：例如“80 多人咨询 / 80+ 咨询”。
+        approx_patterns = (
+            r"(?P<value>\d+)\s*\+\s*(?:人|个|名)?\s*(?P<subject>咨询|线索|报名|学员|客户)",
+            r"(?P<value>\d+)\s*多\s*(?:人|个|名)?\s*(?P<subject>咨询|线索|报名|学员|客户)",
+            r"(?P<value>\d+)\s*(?:人|个|名)?\s*以上\s*(?P<subject>咨询|线索|报名|学员|客户)",
+        )
+        seen_approx = set()
+        for pattern in approx_patterns:
+            for match in re.finditer(pattern, task, flags=re.IGNORECASE):
+                base_value = int(match.group("value"))
+                subject = str(match.group("subject"))
+                key = (base_value, subject)
+                if key in seen_approx:
+                    continue
+                seen_approx.add(key)
+
+                numerator = None
+                if subject in {"咨询", "线索"}:
+                    reg_match = re.search(
+                        r"(?:实际)?报名(?:人数)?[^\d]{0,8}(\d+)|"
+                        r"(\d+)\s*(?:人|名)?\s*(?:实际)?报名",
+                        task,
+                        flags=re.IGNORECASE,
+                    )
+                    if reg_match:
+                        raw_num = reg_match.group(1) or reg_match.group(2)
+                        try:
+                            numerator = int(raw_num)
+                        except (TypeError, ValueError):
+                            numerator = None
+
+                contracts.append({
+                    "id": f"approx_fact_{subject}_{base_value}",
+                    "type": "approximate_numeric_fidelity",
+                    "blocking": True,
+                    "description": (
+                        f"用户给出的{subject}约为 {base_value}+ / {base_value}多，"
+                        "不得擅自改写成未经提供的精确值。"
+                    ),
+                    "params": {
+                        "subject": subject,
+                        "base_value": base_value,
+                        "numerator": numerator,
+                    },
+                })
+
+        # 条件 CAC：只要用户明确要求“同周期才算 / 周期不清楚则不算”，
+        # 就把当前前置条件视为未确认，除非用户同时明确陈述周期一致。
+        cac_requested = "cac" in lowered or "获客成本" in task
+        cac_conditional = bool(re.search(
+            r"(?:如果|仅当|只有在).{0,55}(?:同一个|相同|一致).{0,15}(?:统计周期|周期).{0,35}(?:cac|获客成本|计算)|"
+            r"(?:如果|仅当|只有在).{0,55}(?:统计周期|周期).{0,25}(?:一致|相同).{0,35}(?:cac|获客成本|计算)|"
+            r"(?:统计周期|周期).{0,35}(?:不清楚|不一致|未明确|不明确).{0,35}(?:cac|获客成本|计算)",
+            task,
+            flags=re.IGNORECASE | re.DOTALL,
+        ))
+        explicit_same_period = bool(re.search(
+            r"(?:营销|投放|费用).{0,25}(?:咨询|报名).{0,25}(?:统计周期|周期).{0,15}(?:确认)?(?:一致|相同)",
+            task,
+            flags=re.IGNORECASE | re.DOTALL,
+        )) and not cac_conditional
+        if cac_requested and cac_conditional and not explicit_same_period:
+            contracts.append({
+                "id": "cac_requires_period_alignment",
+                "type": "conditional_calculation",
+                "blocking": True,
+                "description": (
+                    "营销费用与咨询/报名人数统计周期尚未确认一致，"
+                    "不得直接给出数值 CAC。"
+                ),
+                "params": {
+                    "metric": "CAC",
+                    "precondition_confirmed": False,
+                    "required_phrases": [
+                        "暂不能准确计算",
+                        "无法准确计算",
+                        "不能准确计算",
+                        "暂无法准确计算",
+                    ],
+                },
+            })
+
+        # 联网研究中的外部数字必须来自真实网页正文，而不是搜索摘要或模型常识。
+        web_requested = any(token in lowered for token in (
+            "联网", "搜索", "检索", "调研", "公开资料", "外部数据",
+            "官网", "招聘平台", "最新资料",
+        ))
+        if web_requested:
+            contracts.append({
+                "id": "external_numeric_claims_grounded",
+                "type": "external_numeric_grounding",
+                "blocking": True,
+                "description": (
+                    "行业、市场、招聘、薪资、缺口、产值、增长等外部数字"
+                    "必须能在真实 read_webpage Observation 或用户原始事实中找到证据。"
+                ),
+                "params": {
+                    "require_read_webpage": True,
+                },
+            })
+
+        # 经营情景矩阵。
+        scenarios = [item for item in ("保守", "基准", "乐观") if item in task]
+        horizons = [item for item in ("3 个月", "6 个月", "12 个月") if item in task]
+        if not horizons:
+            horizons = [item for item in ("3个月", "6个月", "12个月") if item in task]
+        metrics = []
+        for canonical, aliases in (
+            ("咨询", ("咨询人数", "咨询量", "咨询")),
+            ("报名", ("报名人数", "报名量", "报名")),
+            ("收入", ("收入", "营收")),
+            ("毛利", ("毛利",)),
+        ):
+            if any(alias in task for alias in aliases):
+                metrics.append(canonical)
+        if len(scenarios) == 3 and len(horizons) == 3 and len(metrics) >= 3:
+            contracts.append({
+                "id": "scenario_forecast_matrix_complete",
+                "type": "forecast_matrix",
+                "blocking": True,
+                "description": (
+                    "保守/基准/乐观三种情景必须分别覆盖 3/6/12 个月，"
+                    "且每个时间点都包含用户要求的经营指标，并列出假设。"
+                ),
+                "params": {
+                    "scenarios": ["保守", "基准", "乐观"],
+                    "horizons": ["3个月", "6个月", "12个月"],
+                    "metrics": metrics,
+                    "require_assumptions": True,
+                },
+            })
+
+        # 90 天 Top 3。
+        if (
+            "90" in task
+            and (
+                "只能做 3 件事" in task
+                or "只能做3件事" in task
+                or "top 3" in lowered
+                or "top3" in lowered
+                or "优先做哪 3 件" in task
+                or "优先做哪3件" in task
+            )
+        ):
+            contracts.append({
+                "id": "ninety_day_top3_complete",
+                "type": "required_action_count",
+                "blocking": True,
+                "description": "最终回答必须明确给出未来 90 天优先的 3 个行动项。",
+                "params": {
+                    "count": 3,
+                    "scope_keywords": ["90天", "90 天", "优先级", "Top 3", "TOP 3"],
+                },
+            })
+
+        return contracts
+
     def report_progress(self, message: str):
         if self.progress_callback:
             try:
@@ -206,16 +583,29 @@ class TaskPlanner:
             1,
             self.max_plan_attempts + 1,
         ):
+            is_local_ollama = self._is_ollama_backend()
+
             messages = [
                 {
                     "role": "system",
-                    "content": self._build_system_prompt(),
+                    "content": (
+                        self._build_local_system_prompt()
+                        if is_local_ollama
+                        else self._build_system_prompt()
+                    ),
                 },
                 {
                     "role": "user",
-                    "content": self._build_user_prompt(
-                        task,
-                        runtime_context,
+                    "content": (
+                        self._build_local_user_prompt(
+                            task,
+                            runtime_context,
+                        )
+                        if is_local_ollama
+                        else self._build_user_prompt(
+                            task,
+                            runtime_context,
+                        )
                     ),
                 },
             ]
@@ -248,12 +638,25 @@ class TaskPlanner:
                 if self._is_ollama_backend():
                     request_kwargs["reasoning_effort"] = "none"
 
-                response = (
-                    self.client
-                    .chat
-                    .completions
-                    .create(**request_kwargs)
-                )
+                try:
+                    response = self._create_completion_with_backend_retry(
+                        request_kwargs
+                    )
+                except Exception as error:
+                    if (
+                        is_local_ollama
+                        and self._should_use_local_fallback(error)
+                    ):
+                        self.report_progress(
+                            "Task Planner：本地 Ollama 连续返回服务端错误，"
+                            "已启用确定性降级任务合同；不会自动切换云端模型。"
+                        )
+                        plan = self._build_deterministic_fallback_plan(
+                            task,
+                            runtime_context,
+                        )
+                        break
+                    raise
 
                 content = (
                     response.choices[0].message.content
@@ -412,6 +815,52 @@ JSON 必须包含以下字段：
     除非用户在同一任务中另有独立、正向、明确的文件生成要求，否则不得添加文件交付、
     文件存在性验收或最终文件回读要求。
 """.strip()
+
+    def _build_local_system_prompt(self) -> str:
+        """
+        Ollama/Qwen 专用紧凑 Planner 提示词。
+
+        保留 TaskPlan 合同的核心约束，但减少本地模型的输入负担。
+        """
+        return """
+你是 DataPilot Task Planner。只制定任务合同，不执行任务。
+只输出一个合法 JSON 对象，不要 Markdown、不要解释。
+
+字段必须完整：
+task_goal, evidence_requirements, source_requirements,
+deliverable_requirements, execution_requirements,
+verification_requirements, safety_requirements, assumptions。
+除 task_goal 外，其余字段必须是字符串数组。
+
+规则：
+1. 不得编造用户未提供的数字、来源、结论。
+2. 用户要求联网/真实资料时，把真实来源核验写入 evidence/source/verification。
+3. 用户未明确要求生成文件时，不得擅自添加 Word/Excel/PDF 等交付物。
+4. “不要/不需要/无需生成文件”是禁止文件交付，不是文件生成要求。
+5. 用户要求计算、比较、排名或预测时，写入相应验证要求。
+6. 预测必须区分事实、假设与预测，数据不足时不得补造。
+7. Workspace 输入不得覆盖；仅在用户明确要求文件时要求最终文件进入 deliverables_dir。
+8. assumptions 只记录当前无法确定且会影响执行的口径/假设；没有则 []。
+""".strip()
+
+    def _build_local_user_prompt(
+        self,
+        user_task: str,
+        context: Dict[str, Any],
+    ) -> str:
+        safe_context = self._build_safe_context(context)
+        compact_context = json.dumps(
+            safe_context,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return (
+            "用户任务：\n"
+            f"{user_task}\n\n"
+            "运行上下文："
+            f"{compact_context}\n"
+            "输出 TaskPlan JSON。"
+        )
 
     def _build_user_prompt(
         self,
@@ -614,6 +1063,8 @@ JSON 必须包含以下字段：
                     ),
                 )
 
+        evidence_contract = self._build_evidence_contract(user_task)
+
         return TaskPlan(
             task_goal=task_goal,
             evidence_requirements=normalized[
@@ -635,6 +1086,7 @@ JSON 必须包含以下字段：
                 "safety_requirements"
             ],
             assumptions=normalized["assumptions"],
+            evidence_contract=evidence_contract,
         )
 
     @classmethod

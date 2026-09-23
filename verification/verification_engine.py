@@ -549,6 +549,23 @@ class VerificationEngine:
             if requirement not in pending:
                 pending.append(requirement)
 
+        evidence_contract_checks = self._verify_evidence_contract(
+            contracts=plan.get("evidence_contract") or [],
+            goal=str(getattr(loop_result, "goal", "") or ""),
+            final_answer=str(getattr(loop_result, "final_answer", "") or ""),
+            tool_results=tool_results,
+        )
+        for contract_check in evidence_contract_checks:
+            self._add_check(
+                checks,
+                failures,
+                check_id=str(contract_check.get("check_id") or "evidence_contract"),
+                category="evidence_contract",
+                passed=bool(contract_check.get("passed", False)),
+                message=str(contract_check.get("message") or "Evidence Contract 未通过。"),
+                evidence=contract_check.get("evidence") or [],
+            )
+
         reporting_audit = self._audit_final_reporting_content(
             tool_results=tool_results,
             deliverables=deliverables,
@@ -629,6 +646,529 @@ class VerificationEngine:
             failures=failures,
             deliverables=deliverables,
             successful_tools=successful_tools,
+        )
+
+    @classmethod
+    def _verify_evidence_contract(
+        cls,
+        *,
+        contracts: List[Dict[str, Any]],
+        goal: str,
+        final_answer: str,
+        tool_results: List[ToolExecutionResult],
+    ) -> List[Dict[str, Any]]:
+        """执行 v6.6 Evidence Contract v1 的确定性最终答案验收。"""
+        checks: List[Dict[str, Any]] = []
+        for item in contracts or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("blocking", True) is False:
+                continue
+            contract_type = str(item.get("type") or "").strip()
+            contract_id = str(item.get("id") or contract_type or "contract")
+            params = item.get("params") if isinstance(item.get("params"), dict) else {}
+
+            if contract_type == "approximate_numeric_fidelity":
+                passed, message, evidence = cls._check_approximate_numeric_fidelity(
+                    params=params,
+                    final_answer=final_answer,
+                )
+            elif contract_type == "conditional_calculation":
+                passed, message, evidence = cls._check_conditional_calculation(
+                    params=params,
+                    final_answer=final_answer,
+                )
+            elif contract_type == "external_numeric_grounding":
+                passed, message, evidence = cls._check_external_numeric_grounding(
+                    goal=goal,
+                    final_answer=final_answer,
+                    tool_results=tool_results,
+                )
+            elif contract_type == "forecast_matrix":
+                passed, message, evidence = cls._check_forecast_matrix(
+                    params=params,
+                    final_answer=final_answer,
+                )
+            elif contract_type == "required_action_count":
+                passed, message, evidence = cls._check_required_action_count(
+                    params=params,
+                    final_answer=final_answer,
+                )
+            else:
+                continue
+
+            checks.append({
+                "check_id": f"evidence_contract_{contract_id}",
+                "passed": bool(passed),
+                "message": message,
+                "evidence": evidence,
+            })
+        return checks
+
+    @staticmethod
+    def _first_section_before_forecast(text: str) -> str:
+        value = str(text or "")
+        markers = ("经营情景预测", "情景预测", "未来 3", "未来3")
+        indices = [value.find(marker) for marker in markers if value.find(marker) >= 0]
+        scenario_match = re.search(
+            r"(?im)^\s*(?:#{1,6}\s*)?(?:情景\s*[A-CＡ-Ｃ]?\s*[:：-]?\s*)?保守(?:情景)?",
+            value,
+        )
+        if scenario_match:
+            indices.append(scenario_match.start())
+        if not indices:
+            return value[:5000]
+        return value[:min(indices)]
+
+    @classmethod
+    def _check_approximate_numeric_fidelity(
+        cls,
+        *,
+        params: Dict[str, Any],
+        final_answer: str,
+    ) -> tuple[bool, str, List[str]]:
+        subject = str(params.get("subject") or "").strip()
+        try:
+            base_value = int(params.get("base_value"))
+        except (TypeError, ValueError):
+            return True, "近似数值合同参数不完整，跳过阻塞。", []
+        numerator = params.get("numerator")
+        try:
+            numerator = int(numerator) if numerator is not None else None
+        except (TypeError, ValueError):
+            numerator = None
+
+        diagnostic = cls._first_section_before_forecast(final_answer)
+        problems: List[str] = []
+
+        # 典型错误：“80+”被模型自行变成“取近似值 85”。
+        for match in re.finditer(
+            r"(?:取|按|以)\s*(?:近似值|估计值|估值|约数)?\s*(\d+)",
+            diagnostic,
+            flags=re.IGNORECASE,
+        ):
+            value = int(match.group(1))
+            window = diagnostic[max(0, match.start()-100):match.end()+100]
+            if subject and subject not in window:
+                continue
+            if value != base_value and base_value <= value <= base_value + max(20, int(base_value * 0.5)):
+                problems.append(f"将 {base_value}+ / {base_value}多 擅自精确化为 {value}")
+
+        # 如果存在明确“咨询人数/咨询量：85”一类字段，也不能改写原始近似事实。
+        if subject:
+            field_pattern = rf"{re.escape(subject)}(?:人数|数量|量)?\s*[:：=]?\s*(\d+)\s*(?:人|名|个)?"
+            for match in re.finditer(field_pattern, diagnostic, flags=re.IGNORECASE):
+                value = int(match.group(1))
+                tail = diagnostic[match.end():match.end()+3]
+                if value != base_value and "+" not in tail and "多" not in tail:
+                    if base_value <= value <= base_value + max(20, int(base_value * 0.5)):
+                        problems.append(f"{subject}被写成未经提供的精确值 {value}")
+
+        # 转化率分母必须使用用户给出的近似下界，而不是自造 85/90 等分母。
+        if numerator is not None:
+            ratio_pattern = rf"{numerator}\s*(?:/|÷)\s*(\d+)"
+            for match in re.finditer(ratio_pattern, diagnostic):
+                denominator = int(match.group(1))
+                if denominator != base_value:
+                    problems.append(
+                        f"转化率使用未经提供的分母 {denominator}；原始事实仅支持 {base_value}+"
+                    )
+
+        if problems:
+            unique = list(dict.fromkeys(problems))
+            return (
+                False,
+                "Evidence Contract FAIL：用户给出的近似内部事实被擅自精确化。",
+                unique[:8],
+            )
+        return (
+            True,
+            "Evidence Contract PASS：未发现将用户近似内部事实擅自改成精确值。",
+            [f"{subject}: {base_value}+ / {base_value}多"],
+        )
+
+    @staticmethod
+    def _check_conditional_calculation(
+        *,
+        params: Dict[str, Any],
+        final_answer: str,
+    ) -> tuple[bool, str, List[str]]:
+        metric = str(params.get("metric") or "").strip().upper()
+        if metric != "CAC" or params.get("precondition_confirmed") is not False:
+            return True, "条件计算合同当前不要求阻塞。", []
+
+        text = str(final_answer or "")
+        required_phrases = [
+            str(item) for item in (params.get("required_phrases") or []) if str(item).strip()
+        ]
+        has_uncertain_label = any(phrase in text for phrase in required_phrases)
+
+        cac_windows = []
+        for match in re.finditer(r"CAC|获客成本", text, flags=re.IGNORECASE):
+            cac_windows.append(text[max(0, match.start()-80):match.end()+220])
+        joined = "\n".join(cac_windows)
+
+        numeric_cac = bool(re.search(
+            r"(?:CAC|获客成本)[^\n。；]{0,120}(?:=|≈|约为|约)?\s*[￥¥]?\s*\d+(?:\.\d+)?\s*元(?:/人)?|"
+            r"\d+(?:\.\d+)?\s*(?:/|÷)\s*\d+(?:\.\d+)?\s*(?:=|≈)\s*[￥¥]?\s*\d+(?:\.\d+)?\s*元",
+            joined,
+            flags=re.IGNORECASE,
+        ))
+
+        if numeric_cac:
+            return (
+                False,
+                "Evidence Contract FAIL：CAC 的统计周期前置条件未确认，却输出了数值计算结果。",
+                [joined[:500]],
+            )
+        if not has_uncertain_label:
+            return (
+                False,
+                "Evidence Contract FAIL：统计周期未确认时，CAC 必须明确标注“暂不能准确计算”。",
+                [],
+            )
+        return (
+            True,
+            "Evidence Contract PASS：CAC 未在统计周期不明时被直接计算。",
+            [phrase for phrase in required_phrases if phrase in text][:3],
+        )
+
+    @staticmethod
+    def _numeric_tokens(text: str) -> List[str]:
+        value = str(text or "")
+        tokens = re.findall(
+            r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?:\s*[-~—–至]\s*\d+(?:\.\d+)?)?\s*(?:%|k|K|万|亿|元|人|家|个|名|年|月)?",
+            value,
+        )
+        normalized = []
+        for token in tokens:
+            compact = re.sub(r"\s+", "", token).replace("—", "-").replace("–", "-").replace("~", "-").replace("至", "-")
+            if compact:
+                normalized.append(compact.lower())
+        return normalized
+
+    @classmethod
+    def _check_external_numeric_grounding(
+        cls,
+        *,
+        goal: str,
+        final_answer: str,
+        tool_results: List[ToolExecutionResult],
+    ) -> tuple[bool, str, List[str]]:
+        evidence_parts: List[str] = []
+        evidence_labels: List[str] = []
+
+        # 外部数字可以来自两类真实证据：
+        # 1. 网页正文 read_webpage；
+        # 2. 确定性的结构化外部数据 Tool + 其下游分析 Observation。
+        #
+        # 不把写报告/最终回答本身作为证据，避免“自己证明自己”。
+        structured_numeric_evidence_tools = {
+            "fetch_weather_dataset",
+            "analyze_weather_dataset",
+            "read_office_data",
+            "get_data_info",
+            "group_statistics",
+            "group_multi_statistics",
+            "create_pivot_summary",
+            "analyze_time_series",
+            "regression_analysis",
+            "regression_predict",
+        }
+
+        for result in tool_results:
+            if not getattr(result, "success", False):
+                continue
+
+            name = str(
+                getattr(
+                    result,
+                    "tool_name",
+                    "",
+                )
+                or ""
+            ).strip().lower()
+
+            if (
+                name != "read_webpage"
+                and name
+                not in structured_numeric_evidence_tools
+            ):
+                continue
+
+            output = getattr(
+                result,
+                "output",
+                None,
+            )
+
+            if output is None:
+                continue
+
+            # 对 fetch_weather_dataset 额外要求 metadata 中存在真实 provider
+            # 与 http(s) request URL，避免任意自造 dict 冒充外部数据源。
+            if name == "fetch_weather_dataset":
+                if not isinstance(
+                    output,
+                    dict,
+                ):
+                    continue
+
+                metadata = output.get(
+                    "metadata"
+                )
+                if not isinstance(
+                    metadata,
+                    dict,
+                ):
+                    continue
+
+                provider = str(
+                    metadata.get(
+                        "provider"
+                    )
+                    or ""
+                ).strip()
+
+                request_urls = [
+                    str(value).strip()
+                    for key, value in metadata.items()
+                    if str(key).lower().endswith(
+                        "_request_url"
+                    )
+                    and isinstance(
+                        value,
+                        str,
+                    )
+                    and value.strip().startswith(
+                        (
+                            "http://",
+                            "https://",
+                        )
+                    )
+                ]
+
+                if (
+                    not provider
+                    or not request_urls
+                ):
+                    continue
+
+            evidence_parts.append(
+                repr(output)
+            )
+            evidence_labels.append(
+                name
+            )
+
+        if not evidence_parts:
+            return (
+                False,
+                (
+                    "Evidence Contract FAIL：联网研究包含外部数字要求，"
+                    "但没有真实网页正文或可追溯结构化数据 Tool Observation。"
+                ),
+                [],
+            )
+
+        evidence_text = "\n".join(evidence_parts).lower()
+        goal_text = str(goal or "").lower()
+        external_cues = (
+            "行业", "市场", "招聘", "薪资", "工资", "职位", "缺口", "产值",
+            "增长", "政策", "企业", "通常", "普遍", "平均", "数据显示",
+            "资料显示", "公开数据", "报告显示", "就业率", "通过率",
+        )
+        forecast_cues = (
+            "预测", "情景", "假设", "预算", "投入", "继续条件", "停止条件",
+            "3个月", "3 个月", "6个月", "6 个月", "12个月", "12 个月",
+            "目标", "建议", "实验",
+        )
+
+        unsupported: List[str] = []
+        lines = [line.strip() for line in re.split(r"[\n。！？]", str(final_answer or "")) if line.strip()]
+        for line in lines:
+            lowered = line.lower()
+            if not any(cue in lowered for cue in external_cues):
+                continue
+            if any(cue in lowered for cue in forecast_cues):
+                continue
+            tokens = cls._numeric_tokens(line)
+            if not tokens:
+                continue
+            missing = []
+            for token in tokens:
+                raw_number = re.match(r"\d+(?:\.\d+)?", token)
+                if not raw_number:
+                    continue
+                number = raw_number.group(0)
+                # 用户自己提供的内部数字不需要外部网页重复证明。
+                if token in goal_text or number in goal_text:
+                    continue
+                if token in evidence_text:
+                    continue
+                # 对范围表达，至少要求范围两端都能在正文中出现。
+                if "-" in token:
+                    nums = re.findall(r"\d+(?:\.\d+)?", token)
+                    if nums and all(num in evidence_text for num in nums):
+                        continue
+                # 年份本身不单独视为 benchmark。
+                if len(number) == 4 and number.startswith("20"):
+                    continue
+                missing.append(token)
+            if missing:
+                unsupported.append(f"{line[:180]} | 缺少正文证据数字：{', '.join(missing)}")
+
+        if unsupported:
+            return (
+                False,
+                "Evidence Contract FAIL：最终回答存在无法从真实网页正文或用户原始事实追溯的外部数字。",
+                unsupported[:8],
+            )
+        label_summary = {}
+        for label in evidence_labels:
+            label_summary[
+                label
+            ] = (
+                label_summary.get(
+                    label,
+                    0,
+                )
+                + 1
+            )
+
+        return (
+            True,
+            "Evidence Contract PASS：未发现无法追溯的高风险外部数字断言。",
+            [
+                (
+                    "numeric evidence tools="
+                    + ", ".join(
+                        f"{name}:{count}"
+                        for name, count
+                        in sorted(
+                            label_summary.items()
+                        )
+                    )
+                )
+            ],
+        )
+
+    @staticmethod
+    def _normalize_horizon(text: str) -> str:
+        return re.sub(r"\s+", "", str(text or ""))
+
+    @classmethod
+    def _check_forecast_matrix(
+        cls,
+        *,
+        params: Dict[str, Any],
+        final_answer: str,
+    ) -> tuple[bool, str, List[str]]:
+        text = str(final_answer or "")
+        scenarios = [str(item) for item in (params.get("scenarios") or [])]
+        horizons = [cls._normalize_horizon(item) for item in (params.get("horizons") or [])]
+        metrics = [str(item) for item in (params.get("metrics") or [])]
+        require_assumptions = bool(params.get("require_assumptions", False))
+        missing: List[str] = []
+
+        # 定位每个情景的文本区间。
+        positions = []
+        for scenario in scenarios:
+            matches = list(re.finditer(rf"(?im)^.*{re.escape(scenario)}.*$", text))
+            if matches:
+                positions.append((scenario, matches[0].start()))
+            else:
+                missing.append(f"缺少{scenario}情景")
+        positions.sort(key=lambda x: x[1])
+
+        segments: Dict[str, str] = {}
+        for index, (scenario, start) in enumerate(positions):
+            end = positions[index + 1][1] if index + 1 < len(positions) else len(text)
+            segments[scenario] = text[start:end]
+
+        metric_aliases = {
+            "咨询": ("咨询",),
+            "报名": ("报名",),
+            "收入": ("收入", "营收"),
+            "毛利": ("毛利",),
+        }
+
+        for scenario in scenarios:
+            segment = segments.get(scenario, "")
+            if not segment:
+                continue
+            if require_assumptions and "假设" not in segment[:1000]:
+                missing.append(f"{scenario}情景缺少明确假设")
+
+            for horizon in horizons:
+                horizon_pattern = re.escape(horizon).replace("个月", r"\s*个?\s*月")
+                match = re.search(horizon_pattern, segment, flags=re.IGNORECASE)
+                if not match:
+                    missing.append(f"{scenario}情景缺少{horizon}")
+                    continue
+                # 只检查该时间点到下一个时间点/段落前的小窗口，避免用同一情景
+                # 其他月份的“毛利”等词替当前时间点兜底。
+                tail = segment[match.start():]
+                next_match = re.search(
+                    r"(?m)(?:^|\n).{0,20}(?:3\s*个?\s*月|6\s*个?\s*月|12\s*个?\s*月)",
+                    tail[max(1, len(match.group(0))):],
+                )
+                if next_match:
+                    window = tail[:max(180, next_match.start() + len(match.group(0)))]
+                else:
+                    window = tail[:500]
+
+                for metric in metrics:
+                    aliases = metric_aliases.get(metric, (metric,))
+                    if not any(alias in window for alias in aliases):
+                        missing.append(f"{scenario}-{horizon} 缺少{metric}")
+
+        if missing:
+            unique = list(dict.fromkeys(missing))
+            return (
+                False,
+                "Evidence Contract FAIL：经营情景预测矩阵不完整。",
+                unique[:20],
+            )
+        return (
+            True,
+            "Evidence Contract PASS：三种经营情景的 3/6/12 月预测维度和假设完整。",
+            [],
+        )
+
+    @staticmethod
+    def _check_required_action_count(
+        *,
+        params: Dict[str, Any],
+        final_answer: str,
+    ) -> tuple[bool, str, List[str]]:
+        try:
+            required_count = int(params.get("count") or 0)
+        except (TypeError, ValueError):
+            required_count = 0
+        if required_count <= 0:
+            return True, "行动项合同参数为空，跳过。", []
+
+        text = str(final_answer or "")
+        scope_keywords = [str(item) for item in (params.get("scope_keywords") or [])]
+        starts = [text.lower().rfind(item.lower()) for item in scope_keywords if item and text.lower().rfind(item.lower()) >= 0]
+        section = text[max(starts) if starts else 0:]
+
+        ordinal_hits = [token for token in ("第一", "第二", "第三") if token in section]
+        numbered_hits = set(re.findall(r"(?m)^\s*([123])\s*[\.、）\)]", section))
+        heading_hits = set(re.findall(r"(?im)^\s*#{1,6}\s*(?:行动|优先级|事项)?\s*([123])\b", section))
+        count = max(len(ordinal_hits), len(numbered_hits), len(heading_hits))
+
+        if count < required_count:
+            return (
+                False,
+                f"Evidence Contract FAIL：最终回答要求 {required_count} 个优先行动项，但只识别到 {count} 个。",
+                [section[:700]],
+            )
+        return (
+            True,
+            f"Evidence Contract PASS：识别到至少 {required_count} 个明确优先行动项。",
+            [],
         )
 
     @classmethod
@@ -816,7 +1356,7 @@ class VerificationEngine:
                 "task_plan 必须是 TaskPlan、dict 或 None。"
             )
 
-        result: Dict[str, List[str]] = {}
+        result: Dict[str, Any] = {}
 
         for key in (
             "evidence_requirements",
@@ -839,6 +1379,15 @@ class VerificationEngine:
                 for item in value
                 if str(item).strip()
             ]
+
+        evidence_contract = raw.get("evidence_contract") or []
+        if not isinstance(evidence_contract, list):
+            raise TypeError("task_plan.evidence_contract 必须是 list。")
+        result["evidence_contract"] = [
+            dict(item)
+            for item in evidence_contract
+            if isinstance(item, dict)
+        ]
 
         return result
 
@@ -992,6 +1541,127 @@ class VerificationEngine:
 
         for deliverable in deliverables:
             target_key = cls._path_key(deliverable)
+
+            # v6.6 fix39：
+            # 某些专业 Delivery Tool 会在同一次确定性调用内部完成
+            # “写文件 -> 重新打开 Excel/Word/PNG -> 验证结构”。
+            # 若 Observation 明确返回 deliverable_paths + verification，
+            # 这是真实 Python readback，不要求为了形式再执行一次外部 inspect。
+            internal_readback_found = False
+
+            for result in tool_results:
+                if not getattr(
+                    result,
+                    "success",
+                    False,
+                ):
+                    continue
+
+                output = getattr(
+                    result,
+                    "output",
+                    None,
+                )
+
+                if not isinstance(
+                    output,
+                    dict,
+                ):
+                    continue
+
+                verification = output.get(
+                    "verification"
+                )
+                delivered = output.get(
+                    "deliverable_paths"
+                )
+
+                if (
+                    not isinstance(
+                        verification,
+                        dict,
+                    )
+                    or not isinstance(
+                        delivered,
+                        (list, tuple),
+                    )
+                ):
+                    continue
+
+                delivered_keys = {
+                    cls._path_key(
+                        item
+                    )
+                    for item in delivered
+                    if isinstance(
+                        item,
+                        str,
+                    )
+                    and item.strip()
+                }
+
+                if target_key not in delivered_keys:
+                    continue
+
+                if not bool(
+                    verification.get(
+                        "all_files_exist"
+                    )
+                ):
+                    continue
+
+                suffix = Path(
+                    deliverable
+                ).suffix.lower()
+
+                if suffix in {
+                    ".xlsx",
+                    ".xls",
+                }:
+                    internal_readback_found = (
+                        int(
+                            verification.get(
+                                "excel_sheet_count"
+                            )
+                            or 0
+                        )
+                        > 0
+                    )
+                elif suffix in {
+                    ".docx",
+                    ".doc",
+                }:
+                    internal_readback_found = bool(
+                        verification.get(
+                            "word_readable"
+                        )
+                    )
+                elif suffix in {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                }:
+                    internal_readback_found = (
+                        int(
+                            verification.get(
+                                "png_readable_count"
+                            )
+                            or 0
+                        )
+                        > 0
+                    )
+                else:
+                    internal_readback_found = True
+
+                if internal_readback_found:
+                    break
+
+            if internal_readback_found:
+                evidence[
+                    deliverable
+                ] = True
+                continue
+
             last_write_index = -1
 
             for index, result in enumerate(
@@ -1811,6 +2481,131 @@ class VerificationEngine:
 
         这仍然只是“证据链存在”的确定性证明，不让 LLM 自己宣布一致。
         """
+        # v6.6 fix41：
+        # 专业 Delivery Tool 可以在同一次确定性 Python 调用内部完成：
+        #   source analysis -> 写 Excel/Word/PNG -> 重新读取 -> 字段/数字比较。
+        # 若它明确返回 cross_deliverable_consistency.passed=True，
+        # 且 deliverable_paths 覆盖至少两个真实最终交付物，
+        # 这比“两个 inspect 输出偶然共享几个数字”更强。
+        for index, item in enumerate(
+            successful,
+            start=1,
+        ):
+            output = getattr(
+                item,
+                "output",
+                None,
+            )
+
+            if not isinstance(
+                output,
+                dict,
+            ):
+                continue
+
+            if output.get(
+                "delivery_complete"
+            ) is not True:
+                continue
+
+            verification = output.get(
+                "verification"
+            )
+            if not isinstance(
+                verification,
+                dict,
+            ):
+                continue
+
+            consistency = verification.get(
+                "cross_deliverable_consistency"
+            )
+            if not isinstance(
+                consistency,
+                dict,
+            ):
+                continue
+
+            if consistency.get(
+                "passed"
+            ) is not True:
+                continue
+
+            delivered = output.get(
+                "deliverable_paths"
+            )
+            if not isinstance(
+                delivered,
+                (list, tuple),
+            ):
+                continue
+
+            delivered_keys = {
+                cls._path_key(
+                    path
+                )
+                for path in delivered
+                if isinstance(
+                    path,
+                    str,
+                )
+                and path.strip()
+            }
+
+            covered = (
+                delivered_keys
+                .intersection(
+                    deliverable_keys
+                )
+            )
+
+            if len(covered) < 2:
+                continue
+
+            tool_name = str(
+                getattr(
+                    item,
+                    "tool_name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            evidence = [
+                cls._summarize_tool_evidence(
+                    index=index,
+                    tool_name=tool_name,
+                    observation={
+                        "covered_deliverables": sorted(
+                            covered
+                        ),
+                        "cross_deliverable_consistency": (
+                            consistency
+                        ),
+                    },
+                )
+            ]
+
+            for evidence_item in (
+                consistency.get(
+                    "evidence"
+                )
+                or []
+            ):
+                text = str(
+                    evidence_item
+                    or ""
+                ).strip()
+                if text:
+                    evidence.append(
+                        text
+                    )
+
+            return {
+                "resolved": True,
+                "evidence": evidence,
+            }
+
         reads_by_path: Dict[str, tuple[int, ToolExecutionResult]] = {}
         data_evidence: List[tuple[int, ToolExecutionResult]] = []
 
@@ -2238,32 +3033,125 @@ class VerificationEngine:
         tool_results: List[ToolExecutionResult],
     ) -> List[str]:
         """
-        同一工具后续成功执行，视为该工具此前失败已恢复。
+        返回“最终仍未恢复”的工具失败，而不是历史上出现过的所有失败。
 
-        与 AgentLoop 的 Observation → 自纠错机制保持一致。
+        恢复语义：
+        1. 同一工具后续成功 -> 此前失败已恢复；
+        2. 后续确定性专业 Tool 返回 processing_complete=True ->
+           其之前为到达 Processing 完成态而发生的失败尝试视为已被替代路径恢复；
+        3. 后续确定性专业 Tool 返回 delivery_complete=True，且内部 verification
+           证明交付物真实存在 -> 其之前的失败尝试视为已被最终交付路径恢复；
+        4. 阶段完成信号之后新发生的失败仍然必须阻塞 Completion Gate。
 
-        增强：
-        1. 支持工具目录重构后的名称变化；
-        2. 同名工具只保留最后一次状态；
-        3. 后续成功执行覆盖此前失败。
+        这避免“先试错一次、后来完整成功”仍被永久判 FAIL，
+        同时不会吞掉最终阶段之后出现的新失败。
         """
-        last_status: Dict[str, ToolExecutionResult] = {}
+        indexed_results = list(
+            enumerate(
+                tool_results or []
+            )
+        )
 
-        for result in tool_results:
+        last_status: Dict[
+            str,
+            tuple[int, ToolExecutionResult],
+        ] = {}
+
+        for index, result in indexed_results:
             name = cls._normalize_tool_name(
-                getattr(result, "tool_name", "")
+                getattr(
+                    result,
+                    "tool_name",
+                    "",
+                )
             )
 
             if not name:
                 continue
 
-            last_status[name] = result
+            last_status[name] = (
+                index,
+                result,
+            )
 
-        failures = []
+        processing_complete_indices: List[int] = []
+        delivery_complete_indices: List[int] = []
 
-        for name, result in last_status.items():
+        for index, result in indexed_results:
+            if not getattr(
+                result,
+                "success",
+                False,
+            ):
+                continue
 
-            if getattr(result, "success", False):
+            output = getattr(
+                result,
+                "output",
+                None,
+            )
+
+            if not isinstance(
+                output,
+                dict,
+            ):
+                continue
+
+            if output.get(
+                "processing_complete"
+            ) is True:
+                processing_complete_indices.append(
+                    index
+                )
+
+            if output.get(
+                "delivery_complete"
+            ) is True:
+                verification = output.get(
+                    "verification"
+                )
+
+                # delivery_complete 只有在内部验证也成立时，
+                # 才能作为“前序失败已被完整交付路径恢复”的证据。
+                if (
+                    isinstance(
+                        verification,
+                        dict,
+                    )
+                    and verification.get(
+                        "all_files_exist"
+                    )
+                    is True
+                ):
+                    delivery_complete_indices.append(
+                        index
+                    )
+
+        failures: List[str] = []
+
+        for name, (
+            failure_index,
+            result,
+        ) in last_status.items():
+
+            if getattr(
+                result,
+                "success",
+                False,
+            ):
+                continue
+
+            superseded = any(
+                index > failure_index
+                for index
+                in processing_complete_indices
+            ) or any(
+                index > failure_index
+                for index
+                in delivery_complete_indices
+            )
+
+            if superseded:
                 continue
 
             message = str(

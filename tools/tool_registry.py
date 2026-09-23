@@ -407,6 +407,11 @@ def create_default_tool_registry() -> ToolRegistry:
         download_document_file,
     )
     from tools.business.web.web_search_tools import search_web, read_webpage
+    from tools.business.data.weather_data_tools import (
+        fetch_weather_dataset,
+        analyze_weather_dataset,
+        create_weather_analysis_package,
+    )
     from tools.business.office.office_report_tools import generate_office_deliverables
     from time_series_tool import analyze_time_series
     from tools.business.file.file_discovery_tools import (
@@ -1128,6 +1133,82 @@ def create_default_tool_registry() -> ToolRegistry:
             "timeout": "可选，请求超时秒数，默认 30",
         },
         returns="下载后的本地文档路径",
+    )
+
+    registry.register(
+        "fetch_weather_dataset",
+        fetch_weather_dataset,
+        (
+            "获取指定经纬度的结构化近期历史天气和未来天气预报。"
+            "当任务需要最近 N 天气象数据、未来 M 天预报、天气统计分析、"
+            "气象 Excel/PNG/Word 报告时，应优先使用本工具，"
+            "不要先 search_web 寻找 API，也不要让 LLM 手工拼 Open-Meteo URL。"
+            "本工具会确定性拆分 Historical Weather API 与 Forecast API，"
+            "并直接返回 historical / forecast / combined 三个 pandas DataFrame。"
+        ),
+        category="weather",
+        parameters={
+            "latitude": "WGS84 纬度",
+            "longitude": "WGS84 经度",
+            "historical_days": "最近完整历史自然日数量，默认 30，范围 1-366",
+            "forecast_days": "未来预报天数，默认 7，范围 1-16",
+            "timezone": "IANA 时区，默认 Asia/Shanghai",
+            "reference_date": "可选 YYYY-MM-DD；省略则按 timezone 当前日期",
+            "timeout": "HTTP 超时秒数，默认 30",
+            "output_dir": (
+                "可选目录；提供后额外保存历史 CSV、预报 CSV 和 metadata JSON"
+            ),
+        },
+        returns=(
+            "dict：historical / forecast / combined 为 pandas DataFrame；"
+            "metadata 包含来源、时间范围、请求 URL、获取时间和单位信息"
+        ),
+    )
+
+    registry.register(
+        "analyze_weather_dataset",
+        analyze_weather_dataset,
+        (
+            "对 fetch_weather_dataset 的历史与未来 DataFrame 进行确定性气象分析。"
+            "会严格区分历史段与未来预报段，检查缺失、重复、时间连续性和明显异常值，"
+            "记录清洗方法，计算历史统计，并生成未来逐日高温、强降雨、大风、"
+            "高湿闷热及综合风险。天气任务进入 Processing 后应优先使用本工具，"
+            "不要把历史30天和未来7天混在一起做同一统计。"
+        ),
+        category="weather_analysis",
+        parameters={
+            "historical": "fetch_weather_dataset 返回的 historical DataFrame",
+            "forecast": "fetch_weather_dataset 返回的 forecast DataFrame",
+            "metadata": "可选；fetch_weather_dataset 返回的 metadata",
+        },
+        returns=(
+            "dict：dataframe、raw_data、cleaned_data、quality_report、"
+            "statistics_report、forecast_report、risk_report、summary、metadata"
+        ),
+    )
+
+    registry.register(
+        "create_weather_analysis_package",
+        create_weather_analysis_package,
+        (
+            "把 analyze_weather_dataset 的真实结果一次性生成完整气象办公交付包："
+            "4 张独立 PNG、6 Sheet Excel、插入 PNG 的 Word 报告，并执行写后验证。"
+            "天气任务明确要求 Excel+PNG+Word 时，Delivery 应优先使用本工具，"
+            "不要使用 generate_regression_visualizations 绘制普通时间序列图，"
+            "也不要让本地模型把整份 Word 正文塞进超长 JSON。"
+        ),
+        category="weather_delivery",
+        parameters={
+            "analysis_result": "analyze_weather_dataset 的完整返回字典",
+            "output_dir": "最终交付目录，Workspace 任务应使用 deliverables_dir",
+            "excel_filename": "可选 Excel 文件名",
+            "word_filename": "可选 Word 文件名",
+            "report_title": "可选报告标题",
+        },
+        returns=(
+            "dict：excel_path、word_path、chart_paths、deliverable_paths、"
+            "verification、summary、metadata"
+        ),
     )
 
     # ------------------------------------------------------------
